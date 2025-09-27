@@ -12,12 +12,7 @@ header("Content-Type: application/json");
 if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
     exit(0);
 }
-
-// Database connection
-$host = "localhost";
-$user = "root";
-$password = "";
-$database = "spcc_scheduling_system";
+include 'connect.php';
 
 $conn = new mysqli($host, $user, $password, $database);
 
@@ -606,49 +601,75 @@ function updateSection($conn, $id, $data) {
 
 // Function to delete a section
 function deleteSection($conn, $id) {
-    $conn->begin_transaction();
-    
-    try {
-        // Check if section exists
-        $checkStmt = $conn->prepare("SELECT section_id FROM sections WHERE section_id = ?");
-        $checkStmt->bind_param("i", $id);
-        $checkStmt->execute();
-        $checkResult = $checkStmt->get_result();
-        
-        if ($checkResult->num_rows === 0) {
-            throw new Exception("Section not found");
-        }
-        $checkStmt->close();
-        
-        // Delete room assignments first
-        $deleteAssignStmt = $conn->prepare("DELETE FROM section_room_assignments WHERE section_id = ?");
-        $deleteAssignStmt->bind_param("i", $id);
-        if (!$deleteAssignStmt->execute()) {
-            throw new Exception("Failed to delete room assignments");
-        }
-        $deleteAssignStmt->close();
-        
-        // Delete section
-        $deleteStmt = $conn->prepare("DELETE FROM sections WHERE section_id = ?");
-        $deleteStmt->bind_param("i", $id);
-        if (!$deleteStmt->execute()) {
-            throw new Exception("Failed to delete section");
-        }
-        $deleteStmt->close();
-        
-        // Commit transaction
-        $conn->commit();
-        
+    $cascade = isset($_GET['cascade']) && $_GET['cascade'] == '1';
+
+    // Does the section exist?
+    $checkStmt = $conn->prepare("SELECT section_id FROM sections WHERE section_id = ?");
+    $checkStmt->bind_param("i", $id);
+    $checkStmt->execute();
+    $exists = $checkStmt->get_result()->num_rows > 0;
+    $checkStmt->close();
+
+    if (!$exists) {
+        http_response_code(404);
+        echo json_encode(["success" => false, "status" => "error", "message" => "Section not found"]);
+        return;
+    }
+
+    // How many schedules reference this section?
+    $cntStmt = $conn->prepare("SELECT COUNT(*) AS c FROM schedules WHERE section_id = ?");
+    $cntStmt->bind_param("i", $id);
+    $cntStmt->execute();
+    $c = (int)($cntStmt->get_result()->fetch_assoc()['c'] ?? 0);
+    $cntStmt->close();
+
+    if ($c > 0 && !$cascade) {
+        http_response_code(409);
         echo json_encode([
-            "status" => "success",
-            "message" => "Section deleted successfully"
+            "success" => false,
+            "status"  => "error",
+            "message" => "This section is referenced by $c schedule(s). Delete them first or pass cascade=1."
         ]);
-        
-    } catch (Exception $e) {
-        // Rollback transaction on error
+        return;
+    }
+
+    $conn->begin_transaction();
+    try {
+        if ($c > 0) {
+            // delete children in the right order
+            // 1) schedule_days → depends on schedules
+            $sdStmt = $conn->prepare("DELETE sd FROM schedule_days sd
+                                      INNER JOIN schedules s ON s.schedule_id = sd.schedule_id
+                                      WHERE s.section_id = ?");
+            $sdStmt->bind_param("i", $id);
+            $sdStmt->execute();
+            $sdStmt->close();
+
+            // 2) schedules
+            $schStmt = $conn->prepare("DELETE FROM schedules WHERE section_id = ?");
+            $schStmt->bind_param("i", $id);
+            $schStmt->execute();
+            $schStmt->close();
+        }
+
+        // 3) room assignments
+        $delAssign = $conn->prepare("DELETE FROM section_room_assignments WHERE section_id = ?");
+        $delAssign->bind_param("i", $id);
+        $delAssign->execute();
+        $delAssign->close();
+
+        // 4) section
+        $delSec = $conn->prepare("DELETE FROM sections WHERE section_id = ?");
+        $delSec->bind_param("i", $id);
+        $delSec->execute();
+        $delSec->close();
+
+        $conn->commit();
+        echo json_encode(["success" => true, "status" => "success", "message" => "Section deleted successfully"]);
+    } catch (Throwable $e) {
         $conn->rollback();
         http_response_code(500);
-        echo json_encode(["status" => "error", "message" => "Error: " . $e->getMessage()]);
+        echo json_encode(["success" => false, "status" => "error", "message" => "Error: " . $e->getMessage()]);
     }
 }
 

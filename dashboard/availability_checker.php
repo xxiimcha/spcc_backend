@@ -9,7 +9,6 @@ require_once '../connect.php';
 $action = isset($_GET['action']) ? strtolower(trim($_GET['action'])) : 'all';
 
 function teachers_without_subjects(mysqli $conn): array {
-    // Professors with no schedules at all
     $sql = "
         SELECT p.prof_id   AS id,
                p.prof_name AS name,
@@ -35,8 +34,6 @@ function teachers_without_subjects(mysqli $conn): array {
 }
 
 function subjects_without_rooms(mysqli $conn): array {
-    // Subjects with no schedules that have a room assigned
-    // (either no schedules at all OR all schedules have NULL room_id)
     $sql = "
         SELECT s.subj_id   AS id,
                s.subj_code AS code,
