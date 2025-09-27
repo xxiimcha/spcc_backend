@@ -1,0 +1,7 @@
+{
+  "require": {
+    "kreait/firebase-php": "^7.0",
+    "phpoffice/phpspreadsheet": "*",
+    "ralouphie/getallheaders": "3"
+  }
+}
