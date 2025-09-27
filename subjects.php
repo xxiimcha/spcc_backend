@@ -3,11 +3,7 @@
 include 'cors_helper.php';
 handleCORS();
 
-// Database connection
-$host = "localhost";
-$user = "root";
-$password = "";
-$database = "spcc_scheduling_system";
+include 'connect.php';
 
 $conn = new mysqli($host, $user, $password, $database);
 
@@ -179,98 +175,86 @@ function getSubject($conn, $id){
     }
     $stmt->close();
 }
-
 function createSubject($conn, $data){
-    // Validate required fields
-    $requiredFields = ['code', 'name'];
-    foreach($requiredFields as $field){
-        if(!isset($data[$field]) || empty($data[$field])){
-            http_response_code(400);
-            echo json_encode(['status' => 'error', 'message' => "Missing required field: $field"]);
-            exit();
-        }
-    }
+    // Accept both naming styles
+    $code = $data['code'] ?? $data['subj_code'] ?? null;
+    $name = $data['name'] ?? $data['subj_name'] ?? null;
+    $description = $data['description'] ?? $data['subj_description'] ?? '';
 
-    $code = $data["code"];
-    $name = $data["name"];
-    $description = isset($data["description"]) ? $data["description"] : '';
+    $code = $conn->real_escape_string(trim((string)$code));
+    $name = $conn->real_escape_string(trim((string)$name));
+    $description = $conn->real_escape_string(trim((string)$description));
+
+    if (!$code) {
+        http_response_code(400);
+        echo json_encode(["success"=>false,"status"=>"error","message"=>"Missing required field: code"]);
+        exit();
+    }
+    if (!$name) {
+        http_response_code(400);
+        echo json_encode(["success"=>false,"status"=>"error","message"=>"Missing required field: name"]);
+        exit();
+    }
 
     $sql = "INSERT INTO subjects (subj_code, subj_name, subj_description)
-            VALUES (?, ?, ?)";
-    $stmt = $conn->prepare($sql);
-    if($stmt === false){
-        http_response_code(500);
-        echo json_encode(["status" => "error", "message" => "Failed to prepare SQL statement: " . $conn->error]);
-        exit();
-    }
-
-    $stmt->bind_param("sss", $code, $name, $description);
-
-    if($stmt->execute()){
-        $id = $conn->insert_id;
+            VALUES ('$code', '$name', '$description')";
+    if ($conn->query($sql)) {
         http_response_code(201);
-        echo json_encode(["status" => "success", "message" => "Subject added successfully.", "id" => $id]);    
+        echo json_encode([
+            "success" => true,
+            "status" => "success",
+            "message" => "Subject added successfully.",
+            "id" => $conn->insert_id
+        ]);
     } else {
         http_response_code(500);
-        echo json_encode(["status" => "error", "message" => "ERROR: " . $stmt->error]);
+        echo json_encode(["success"=>false,"status"=>"error","message"=>"ERROR: ".$conn->error]);
     }
-    $stmt->close();
 }
 
-// Function to update a subject
 function updateSubject($conn, $id, $data){
-    // Check if the subject exists
-    $checkStmt = $conn->prepare("SELECT subj_id FROM subjects WHERE subj_id = ?");
-    $checkStmt->bind_param("i", $id);
-    $checkStmt->execute();
-    $checkResult = $checkStmt->get_result();
+    $id = (int)$id;
 
-    if($checkResult->num_rows === 0){
+    // Check if subject exists
+    $check = $conn->query("SELECT subj_id FROM subjects WHERE subj_id = $id");
+    if (!$check || $check->num_rows === 0) {
         http_response_code(404);
-        echo json_encode(["status" => "error", "message" => "Subject not found"]);
-        $checkStmt->close();
-        exit();
-    }
-    $checkStmt->close();
-
-    // Validate required fields
-    $requiredFields = ['code', 'name'];
-    foreach($requiredFields as $field){
-        if(!isset($data[$field]) || empty($data[$field])){
-            http_response_code(400);
-            echo json_encode(['status' => 'error', 'message' => "Missing required field: $field"]);
-            exit();
-        }
-    }
-
-    // Prepare values
-    $code = $data["code"];
-    $name = $data["name"];
-    $description = isset($data["description"]) ? $data["description"] : '';
-
-    $sql = "UPDATE subjects SET
-            subj_code = ?,
-            subj_name = ?,
-            subj_description = ?
-            WHERE subj_id = ?";
-    
-    $stmt = $conn->prepare($sql);
-    if($stmt === false){
-        http_response_code(500);
-        echo json_encode(["status" => "error", "message" => "Failed to prepare SQL statement: " . $conn->error]);
+        echo json_encode(["success"=>false,"status"=>"error","message"=>"Subject not found"]);
         exit();
     }
 
-    $stmt->bind_param("sssi", $code, $name, $description, $id);
+    $code = $data['code'] ?? $data['subj_code'] ?? null;
+    $name = $data['name'] ?? $data['subj_name'] ?? null;
+    $description = $data['description'] ?? $data['subj_description'] ?? '';
 
-    if($stmt->execute()){
+    $code = $conn->real_escape_string(trim((string)$code));
+    $name = $conn->real_escape_string(trim((string)$name));
+    $description = $conn->real_escape_string(trim((string)$description));
+
+    if (!$code) {
+        http_response_code(400);
+        echo json_encode(["success"=>false,"status"=>"error","message"=>"Missing required field: code"]);
+        exit();
+    }
+    if (!$name) {
+        http_response_code(400);
+        echo json_encode(["success"=>false,"status"=>"error","message"=>"Missing required field: name"]);
+        exit();
+    }
+
+    $sql = "UPDATE subjects 
+            SET subj_code = '$code',
+                subj_name = '$name',
+                subj_description = '$description'
+            WHERE subj_id = $id";
+
+    if ($conn->query($sql)) {
         http_response_code(200);
-        echo json_encode(["status" => "success", "message" => "Subject updated successfully"]);
+        echo json_encode(["success"=>true,"status"=>"success","message"=>"Subject updated successfully"]);
     } else {
         http_response_code(500);
-        echo json_encode(["status" => "error", "message" => "ERROR: " . $stmt->error]);
+        echo json_encode(["success"=>false,"status"=>"error","message"=>"ERROR: ".$conn->error]);
     }
-    $stmt->close();
 }
 
 // Function to delete a subject
