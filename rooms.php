@@ -14,10 +14,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
 }
 
 // Database connection
-$host = "localhost";
-$user = "root";
-$password = "";
-$database = "spcc_scheduling_system";
+include 'connect.php';
 
 $conn = new mysqli($host, $user, $password, $database);
 
