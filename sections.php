@@ -1,678 +1,469 @@
 <?php
-// sections.php - API endpoint for section management
+// sections.php - API endpoint for section management (MySQLi, NO prepared stmts)
 
-// Enable CORS
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
 header("Access-Control-Allow-Headers: Content-Type, Authorization");
 header("Access-Control-Allow-Credentials: true");
 header("Content-Type: application/json");
 
-// Handle OPTIONS preflight request
-if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
-    exit(0);
-}
+if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') { exit(0); }
+
 include 'connect.php';
-
 $conn = new mysqli($host, $user, $password, $database);
-
 if ($conn->connect_error) {
-    http_response_code(500);
-    echo json_encode(["status" => "error", "message" => "Database connection failed: " . $conn->connect_error]);
-    exit();
+  http_response_code(500);
+  echo json_encode(["status" => "error", "message" => "Database connection failed: ".$conn->connect_error]);
+  exit();
+}
+mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+
+function esc(mysqli $c, $v) {
+  return "'".$c->real_escape_string($v)."'";
 }
 
-// Handle different HTTP methods
 $method = $_SERVER['REQUEST_METHOD'];
 
 switch ($method) {
-    case 'GET':
-        // Get all sections or a specific section
-        if (isset($_GET['id'])) {
-            getSection($conn, $_GET['id']);
-        } else {
-            getAllSections($conn);
-        }
-        break;
-    
-    case 'POST':
-        // Create a new section
-        $data = json_decode(file_get_contents('php://input'), true);
-        if (!$data) {
-            http_response_code(400);
-            echo json_encode(["status" => "error", "message" => "Invalid JSON data"]);
-            exit();
-        }
-        createSection($conn, $data);
-        break;
-    
-    case 'PUT':
-        // Update an existing section
-        if (!isset($_GET['id'])) {
-            http_response_code(400);
-            echo json_encode(["status" => "error", "message" => "Section ID is required"]);
-            exit();
-        }
-        
-        $data = json_decode(file_get_contents('php://input'), true);
-        if (!$data) {
-            http_response_code(400);
-            echo json_encode(["status" => "error", "message" => "Invalid JSON data"]);
-            exit();
-        }
-        
-        updateSection($conn, $_GET['id'], $data);
-        break;
-    
-    case 'DELETE':
-        // Delete a section
-        if (!isset($_GET['id'])) {
-            http_response_code(400);
-            echo json_encode(["status" => "error", "message" => "Section ID is required"]);
-            exit();
-        }
-        
-        deleteSection($conn, $_GET['id']);
-        break;
-    
-    default:
-        http_response_code(405);
-        echo json_encode(["status" => "error", "message" => "Method not allowed"]);
-        break;
-}
-
-// Function to get all sections with room information and schedule count
-function getAllSections($conn): void {
-    // Get all sections with room information and schedule count
-    $sql = "SELECT s.*, 
-            (SELECT COUNT(*) FROM schedules WHERE section_id = s.section_id) as schedule_count,
-            GROUP_CONCAT(DISTINCT r.room_id, ':', r.room_number, ':', r.room_type, ':', r.room_capacity) as rooms,
-            MIN(r.room_id) as primary_room_id
-            FROM sections s
-            LEFT JOIN section_room_assignments sra ON s.section_id = sra.section_id
-            LEFT JOIN rooms r ON sra.room_id = r.room_id
-            GROUP BY s.section_id
-            ORDER BY s.grade_level, s.strand, s.section_name";
-    
-    $stmt = $conn->prepare($sql);
-    $stmt->execute();
-    $result = $stmt->get_result();
-    
-    if ($result) {
-        $sections = [];
-        while ($row = $result->fetch_assoc()) {
-            $rooms = [];
-            if ($row['rooms']) {
-                $roomData = explode(',', $row['rooms']);
-                foreach ($roomData as $room) {
-                    list($id, $number, $type, $capacity) = explode(':', $room);
-                    $rooms[] = [
-                        'id' => (int)$id,
-                        'number' => (int)$number,
-                        'type' => $type,
-                        'capacity' => (int)$capacity
-                    ];
-                }
-            }
-            
-            $section = [
-                'section_id' => (int)$row['section_id'],
-                'section_name' => $row['section_name'],
-                'grade_level' => $row['grade_level'],
-                'strand' => $row['strand'],
-                'number_of_students' => (int)$row['number_of_students'],
-                'schedule_count' => (int)$row['schedule_count'],
-                'primary_room_id' => $row['primary_room_id'] ? (int)$row['primary_room_id'] : null,
-                'rooms' => $rooms
-            ];
-            
-            $sections[] = $section;
-        }
-        
-        echo json_encode([
-            "success" => true,
-            "data" => $sections
-        ]);
+  case 'GET':
+    if (isset($_GET['id'])) {
+      getSection($conn, (int)$_GET['id']);
     } else {
-        http_response_code(500);
-        echo json_encode([
-            "success" => false,
-            "message" => "Failed to fetch sections"
-        ]);
+      getAllSections($conn);
     }
-    
-    $stmt->close();
+    break;
+
+  case 'POST':
+    $data = json_decode(file_get_contents('php://input'), true);
+    if (!$data) {
+      http_response_code(400);
+      echo json_encode(["status" => "error", "message" => "Invalid JSON data"]);
+      exit();
+    }
+    createSection($conn, $data);
+    break;
+
+  case 'PUT':
+    if (!isset($_GET['id'])) {
+      http_response_code(400);
+      echo json_encode(["status" => "error", "message" => "Section ID is required"]);
+      exit();
+    }
+    $data = json_decode(file_get_contents('php://input'), true);
+    if (!$data) {
+      http_response_code(400);
+      echo json_encode(["status" => "error", "message" => "Invalid JSON data"]);
+      exit();
+    }
+    updateSection($conn, (int)$_GET['id'], $data);
+    break;
+
+  case 'DELETE':
+    if (!isset($_GET['id'])) {
+      http_response_code(400);
+      echo json_encode(["status" => "error", "message" => "Section ID is required"]);
+      exit();
+    }
+    deleteSection($conn, (int)$_GET['id']);
+    break;
+
+  default:
+    http_response_code(405);
+    echo json_encode(["status" => "error", "message" => "Method not allowed"]);
+    break;
 }
 
-// Function to get a specific section
-function getSection($conn, $id) {
-    $sql = "SELECT s.*, 
-            (SELECT COUNT(*) FROM schedules WHERE section_id = s.section_id) as schedule_count,
-            GROUP_CONCAT(DISTINCT r.room_id, ':', r.room_number, ':', r.room_type, ':', r.room_capacity) as rooms,
-            MIN(r.room_id) as primary_room_id
-            FROM sections s
-            LEFT JOIN section_room_assignments sra ON s.section_id = sra.section_id
-            LEFT JOIN rooms r ON sra.room_id = r.room_id
-            WHERE s.section_id = ?
-            GROUP BY s.section_id";
-    
-    $stmt = $conn->prepare($sql);
-    $stmt->bind_param("i", $id);
-    $stmt->execute();
-    $result = $stmt->get_result();
-    
-    if ($result && $row = $result->fetch_assoc()) {
-        $rooms = [];
-        if ($row['rooms']) {
-            $roomData = explode(',', $row['rooms']);
-            foreach ($roomData as $room) {
-                list($id, $number, $type, $capacity) = explode(':', $room);
-                $rooms[] = [
-                    'id' => (int)$id,
-                    'number' => (int)$number,
-                    'type' => $type,
-                    'capacity' => (int)$capacity
-                ];
-            }
-        }
-        
-        $section = [
-            'section_id' => (int)$row['section_id'],
-            'section_name' => $row['section_name'],
-            'grade_level' => $row['grade_level'],
-            'strand' => $row['strand'],
-            'number_of_students' => (int)$row['number_of_students'],
-            'schedule_count' => (int)$row['schedule_count'],
-            'primary_room_id' => $row['primary_room_id'] ? (int)$row['primary_room_id'] : null,
-            'rooms' => $rooms
+function getAllSections(mysqli $conn): void {
+  $sql = "SELECT s.*,
+          (SELECT COUNT(*) FROM schedules WHERE section_id = s.section_id) AS schedule_count,
+          GROUP_CONCAT(DISTINCT r.room_id, ':', r.room_number, ':', r.room_type, ':', r.room_capacity) AS rooms,
+          MIN(r.room_id) AS primary_room_id
+          FROM sections s
+          LEFT JOIN section_room_assignments sra ON s.section_id = sra.section_id
+          LEFT JOIN rooms r ON sra.room_id = r.room_id
+          GROUP BY s.section_id
+          ORDER BY s.grade_level, s.strand, s.section_name";
+
+  $result = $conn->query($sql);
+  $sections = [];
+  while ($row = $result->fetch_assoc()) {
+    $rooms = [];
+    if (!empty($row['rooms'])) {
+      foreach (explode(',', $row['rooms']) as $room) {
+        [$id, $number, $type, $capacity] = explode(':', $room);
+        $rooms[] = [
+          'id' => (int)$id,
+          'number' => (int)$number,
+          'type' => $type,
+          'capacity' => (int)$capacity
         ];
-        
-        // Get current schedules for this section
-        $schedules_sql = "SELECT s.*, subj.subj_code, subj.subj_name, 
-                         p.prof_name as professor_name, p.subj_count as professor_subject_count,
-                         r.room_number, r.room_type, r.room_capacity
-                         FROM schedules s
-                         JOIN subjects subj ON s.subj_id = subj.subj_id
-                         JOIN professors p ON s.prof_id = p.prof_id
-                         LEFT JOIN rooms r ON s.room_id = r.room_id
-                         WHERE s.section_id = ?";
-        
-        $schedules_stmt = $conn->prepare($schedules_sql);
-        $schedules_stmt->bind_param("i", $id);
-        $schedules_stmt->execute();
-        $schedules_result = $schedules_stmt->get_result();
-        
-        $schedules = [];
-        while ($schedule_row = $schedules_result->fetch_assoc()) {
-            // Get days for this schedule
-            $days_sql = "SELECT d.day_name 
-                        FROM schedule_days sd 
-                        JOIN days d ON sd.day_id = d.day_id 
-                        WHERE sd.schedule_id = ?";
-            $days_stmt = $conn->prepare($days_sql);
-            $days_stmt->bind_param("i", $schedule_row['schedule_id']);
-            $days_stmt->execute();
-            $days_result = $days_stmt->get_result();
-            
-            $days = [];
-            while ($day_row = $days_result->fetch_assoc()) {
-                $days[] = $day_row['day_name'];
-            }
-            
-            $schedules[] = [
-                'schedule_id' => (int)$schedule_row['schedule_id'],
-                'subject' => [
-                    'id' => (int)$schedule_row['subj_id'],
-                    'code' => $schedule_row['subj_code'],
-                    'name' => $schedule_row['subj_name']
-                ],
-                'professor' => [
-                    'id' => (int)$schedule_row['prof_id'],
-                    'name' => $schedule_row['professor_name'],
-                    'subject_count' => (int)$schedule_row['professor_subject_count']
-                ],
-                'room' => $schedule_row['room_id'] ? [
-                    'id' => (int)$schedule_row['room_id'],
-                    'number' => (int)$schedule_row['room_number'],
-                    'type' => $schedule_row['room_type'],
-                    'capacity' => (int)$schedule_row['room_capacity']
-                ] : null,
-                'schedule_type' => $schedule_row['schedule_type'],
-                'start_time' => $schedule_row['start_time'],
-                'end_time' => $schedule_row['end_time'],
-                'days' => $days
-            ];
-            
-            $days_stmt->close();
-        }
-        
-        $section['schedules'] = $schedules;
-        
-        echo json_encode([
-            "success" => true,
-            "data" => $section
-        ]);
-        
-        $schedules_stmt->close();
-    } else {
-        http_response_code(404);
-        echo json_encode([
-            "success" => false,
-            "message" => "Section not found"
-        ]);
+      }
     }
-    
-    $stmt->close();
+
+    $subject_ids_raw = $row['subject_ids'] ?? null;
+    $subject_ids = [];
+    if ($subject_ids_raw !== null && $subject_ids_raw !== '') {
+      $tmp = json_decode($subject_ids_raw, true);
+      if (is_array($tmp)) $subject_ids = array_values(array_map('intval', $tmp));
+    }
+
+    $sections[] = [
+      'section_id' => (int)$row['section_id'],
+      'section_name' => $row['section_name'],
+      'grade_level' => $row['grade_level'],
+      'strand' => $row['strand'],
+      'number_of_students' => (int)$row['number_of_students'],
+      'schedule_count' => (int)$row['schedule_count'],
+      'primary_room_id' => $row['primary_room_id'] ? (int)$row['primary_room_id'] : null,
+      'rooms' => $rooms,
+      'subject_ids_raw' => $subject_ids_raw,
+      'subject_ids' => $subject_ids
+    ];
+  }
+
+  echo json_encode(["success" => true, "data" => $sections]);
 }
 
-// Function to create a new section
-function createSection($conn, $data) {
-    $conn->begin_transaction();
-    
+function getSection(mysqli $conn, int $id) {
+  $sql = "SELECT s.*,
+          (SELECT COUNT(*) FROM schedules WHERE section_id = s.section_id) AS schedule_count,
+          GROUP_CONCAT(DISTINCT r.room_id, ':', r.room_number, ':', r.room_type, ':', r.room_capacity) AS rooms,
+          MIN(r.room_id) AS primary_room_id
+          FROM sections s
+          LEFT JOIN section_room_assignments sra ON s.section_id = sra.section_id
+          LEFT JOIN rooms r ON sra.room_id = r.room_id
+          WHERE s.section_id = $id
+          GROUP BY s.section_id";
+  $result = $conn->query($sql);
+
+  if ($row = $result->fetch_assoc()) {
+    $rooms = [];
+    if (!empty($row['rooms'])) {
+      foreach (explode(',', $row['rooms']) as $room) {
+        [$rid, $number, $type, $capacity] = explode(':', $room);
+        $rooms[] = [
+          'id' => (int)$rid,
+          'number' => (int)$number,
+          'type' => $type,
+          'capacity' => (int)$capacity
+        ];
+      }
+    }
+
+    $section = [
+      'section_id' => (int)$row['section_id'],
+      'section_name' => $row['section_name'],
+      'grade_level' => $row['grade_level'],
+      'strand' => $row['strand'],
+      'number_of_students' => (int)$row['number_of_students'],
+      'schedule_count' => (int)$row['schedule_count'],
+      'primary_room_id' => $row['primary_room_id'] ? (int)$row['primary_room_id'] : null,
+      'rooms' => $rooms
+    ];
+
+    $schedules_sql = "SELECT s.*, subj.subj_code, subj.subj_name,
+                      p.prof_name AS professor_name, p.subj_count AS professor_subject_count,
+                      r.room_number, r.room_type, r.room_capacity
+                      FROM schedules s
+                      JOIN subjects subj ON s.subj_id = subj.subj_id
+                      JOIN professors p ON s.prof_id = p.prof_id
+                      LEFT JOIN rooms r ON s.room_id = r.room_id
+                      WHERE s.section_id = $id";
+    $schedules_result = $conn->query($schedules_sql);
+
+    $schedules = [];
+    while ($sr = $schedules_result->fetch_assoc()) {
+      $days_sql = "SELECT d.day_name
+                   FROM schedule_days sd
+                   JOIN days d ON sd.day_id = d.day_id
+                   WHERE sd.schedule_id = ".(int)$sr['schedule_id'];
+      $days_result = $conn->query($days_sql);
+      $days = [];
+      while ($dr = $days_result->fetch_assoc()) {
+        $days[] = $dr['day_name'];
+      }
+
+      $schedules[] = [
+        'schedule_id' => (int)$sr['schedule_id'],
+        'subject' => [
+          'id' => (int)$sr['subj_id'],
+          'code' => $sr['subj_code'],
+          'name' => $sr['subj_name']
+        ],
+        'professor' => [
+          'id' => (int)$sr['prof_id'],
+          'name' => $sr['professor_name'],
+          'subject_count' => (int)$sr['professor_subject_count']
+        ],
+        'room' => $sr['room_id'] ? [
+          'id' => (int)$sr['room_id'],
+          'number' => (int)$sr['room_number'],
+          'type' => $sr['room_type'],
+          'capacity' => (int)$sr['room_capacity']
+        ] : null,
+        'schedule_type' => $sr['schedule_type'],
+        'start_time' => $sr['start_time'],
+        'end_time' => $sr['end_time'],
+        'days' => $days
+      ];
+    }
+
+    $subject_ids_raw = $row['subject_ids'] ?? null;
+    $subject_ids = [];
+    if ($subject_ids_raw !== null && $subject_ids_raw !== '') {
+      $tmp = json_decode($subject_ids_raw, true);
+      if (is_array($tmp)) $subject_ids = array_values(array_map('intval', $tmp));
+    }
+    $section['subject_ids_raw'] = $subject_ids_raw;
+    $section['subject_ids'] = $subject_ids;
+    $section['schedules'] = $schedules;
+
+    echo json_encode(["success" => true, "data" => $section]);
+  } else {
+    http_response_code(404);
+    echo json_encode(["success" => false, "message" => "Section not found"]);
+  }
+}
+
+function createSection(mysqli $conn, array $data) {
+  $conn->begin_transaction();
+  try {
+    $name = $data['section_name'];
+    $gradeLevel = isset($data['grade_level']) ? $data['grade_level'] : null;
+    $numberOfStudents = isset($data['number_of_students']) ? (int)$data['number_of_students'] : null;
+    $strand = isset($data['strand']) ? $data['strand'] : null;
+    $roomIds = isset($data['room_ids']) ? $data['room_ids'] : [];
+
+    if (isset($data['number_of_students']) && (!is_numeric($data['number_of_students']) || $data['number_of_students'] < 0)) {
+      throw new Exception("Number of students must be a non-negative integer");
+    }
+
+    if (isset($data['room_ids'])) {
+      if (!is_array($data['room_ids'])) throw new Exception("room_ids must be an array");
+      $roomIds = array_values(array_unique(array_map('intval', $data['room_ids'])));
+      if (count($roomIds) > 0) {
+        $in = implode(',', $roomIds);
+        $rc = $conn->query("SELECT room_id FROM rooms WHERE room_id IN ($in)")->num_rows;
+        if ($rc !== count($roomIds)) throw new Exception("One or more room IDs do not exist");
+      }
+    }
+
+    $sql = "INSERT INTO sections (section_name, grade_level, number_of_students, strand)
+            VALUES (".esc($conn,$name).",".($gradeLevel===null?"NULL":esc($conn,$gradeLevel)).",".
+            ($numberOfStudents===null?"NULL":(int)$numberOfStudents).",".
+            ($strand===null?"NULL":esc($conn,$strand)).")";
+    $conn->query($sql);
+    $sectionId = (int)$conn->insert_id;
+
+    if (!empty($roomIds)) {
+      foreach ($roomIds as $rid) {
+        $conn->query("INSERT INTO section_room_assignments (section_id, room_id) VALUES ($sectionId, ".(int)$rid.")");
+      }
+    }
+
+    $sql = "SELECT s.*,
+            GROUP_CONCAT(DISTINCT r.room_id, ':', r.room_number, ':', r.room_type, ':', r.room_capacity) AS rooms
+            FROM sections s
+            LEFT JOIN section_room_assignments sra ON s.section_id = sra.section_id
+            LEFT JOIN rooms r ON sra.room_id = r.room_id
+            WHERE s.section_id = $sectionId
+            GROUP BY s.section_id";
+    $row = $conn->query($sql)->fetch_assoc();
+
+    $rooms = [];
+    if (!empty($row['rooms'])) {
+      foreach (explode(',', $row['rooms']) as $room) {
+        [$id, $number, $type, $capacity] = explode(':', $room);
+        $rooms[] = [
+          'id' => (int)$id,
+          'number' => (int)$number,
+          'type' => $type,
+          'capacity' => (int)$capacity
+        ];
+      }
+    }
+
+    $section = [
+      'section_id' => (int)$row['section_id'],
+      'section_name' => $row['section_name'],
+      'grade_level' => $row['grade_level'],
+      'strand' => $row['strand'],
+      'number_of_students' => (int)$row['number_of_students'],
+      'rooms' => $rooms
+    ];
+
+    $conn->commit();
+
     try {
-        // Prepare values
-        $name = $data['section_name'];
-        $gradeLevel = isset($data['grade_level']) ? $data['grade_level'] : null;
-        $numberOfStudents = isset($data['number_of_students']) ? (int)$data['number_of_students'] : null;
-        $strand = isset($data['strand']) ? $data['strand'] : null;
-        $roomIds = isset($data['room_ids']) ? $data['room_ids'] : [];
-        
-        // Validate number of students if provided
-        if (isset($data['number_of_students']) && (!is_numeric($data['number_of_students']) || $data['number_of_students'] < 0)) {
-            throw new Exception("Number of students must be a non-negative integer");
-        }
-        
-        // Validate room_ids if provided
-        if (isset($data['room_ids'])) {
-            if (!is_array($data['room_ids'])) {
-                throw new Exception("room_ids must be an array");
-            }
-            
-            // Check if all rooms exist
-            $roomIds = array_map('intval', $data['room_ids']);
-            $placeholders = str_repeat('?,', count($roomIds) - 1) . '?';
-            $roomCheckStmt = $conn->prepare("SELECT room_id FROM rooms WHERE room_id IN ($placeholders)");
-            $roomCheckStmt->bind_param(str_repeat('i', count($roomIds)), ...$roomIds);
-            $roomCheckStmt->execute();
-            $roomCheckResult = $roomCheckStmt->get_result();
-            
-            if ($roomCheckResult->num_rows !== count($roomIds)) {
-                throw new Exception("One or more room IDs do not exist");
-            }
-            $roomCheckStmt->close();
-        }
-        
-        // Insert section
-        $sql = "INSERT INTO sections (section_name, grade_level, number_of_students, strand)
-                VALUES (?, ?, ?, ?)";
-        
-        $stmt = $conn->prepare($sql);
-        if ($stmt === false) {
-            throw new Exception("Failed to prepare SQL statement");
-        }
-        
-        $stmt->bind_param("ssis", $name, $gradeLevel, $numberOfStudents, $strand);
-        
-        if (!$stmt->execute()) {
-            throw new Exception("Failed to create section");
-        }
-        
-        $sectionId = $conn->insert_id;
-        $stmt->close();
-
-        // Insert room assignments if any
-        if (!empty($roomIds)) {
-            $assignSql = "INSERT INTO section_room_assignments (section_id, room_id) VALUES (?, ?)";
-            $assignStmt = $conn->prepare($assignSql);
-            
-            foreach ($roomIds as $roomId) {
-                $assignStmt->bind_param("ii", $sectionId, $roomId);
-                if (!$assignStmt->execute()) {
-                    throw new Exception("Failed to assign room to section");
-                }
-            }
-            $assignStmt->close();
-        }
-
-        // Get the created section with room information
-        $sql = "SELECT s.*, 
-                GROUP_CONCAT(DISTINCT r.room_id, ':', r.room_number, ':', r.room_type, ':', r.room_capacity) as rooms
-                FROM sections s
-                LEFT JOIN section_room_assignments sra ON s.section_id = sra.section_id
-                LEFT JOIN rooms r ON sra.room_id = r.room_id
-                WHERE s.section_id = ?
-                GROUP BY s.section_id";
-        
-        $stmt = $conn->prepare($sql);
-        $stmt->bind_param("i", $sectionId);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        
-        if ($result && $row = $result->fetch_assoc()) {
-            $rooms = [];
-            if ($row['rooms']) {
-                $roomData = explode(',', $row['rooms']);
-                foreach ($roomData as $room) {
-                    list($id, $number, $type, $capacity) = explode(':', $room);
-                    $rooms[] = [
-                        'id' => (int)$id,
-                        'number' => (int)$number,
-                        'type' => $type,
-                        'capacity' => (int)$capacity
-                    ];
-                }
-            }
-            
-            $section = [
-                'section_id' => (int)$row['section_id'],
-                'section_name' => $row['section_name'],
-                'grade_level' => $row['grade_level'],
-                'strand' => $row['strand'],
-                'number_of_students' => (int)$row['number_of_students'],
-                'rooms' => $rooms
-            ];
-            
-            // Commit transaction
-            $conn->commit();
-            
-            // Sync to Firebase
-            try {
-                require_once 'firebase_sync.php';
-                $sync = new FirebaseSync($firebaseConfig, $conn);
-                $firebaseResult = $sync->syncSections();
-                
-                if ($firebaseResult['success']) {
-                    http_response_code(201);
-                    echo json_encode([
-                        "status" => "success", 
-                        "message" => "Section added successfully and synced to Firebase", 
-                        "section" => $section,
-                        "firebase_sync" => $firebaseResult
-                    ]);
-                } else {
-                    http_response_code(201);
-                    echo json_encode([
-                        "status" => "success", 
-                        "message" => "Section added successfully but Firebase sync failed", 
-                        "section" => $section,
-                        "firebase_sync" => $firebaseResult
-                    ]);
-                }
-            } catch (Exception $firebaseError) {
-                http_response_code(201);
-                echo json_encode([
-                    "status" => "success", 
-                    "message" => "Section added successfully but Firebase sync failed", 
-                    "section" => $section,
-                    "firebase_error" => $firebaseError->getMessage()
-                ]);
-            }
-        } else {
-            throw new Exception("Failed to fetch created section");
-        }
-        
-    } catch (Exception $e) {
-        // Rollback transaction on error
-        $conn->rollback();
-        http_response_code(500);
-        echo json_encode(["status" => "error", "message" => "Error: " . $e->getMessage()]);
+      require_once 'firebase_sync.php';
+      $sync = new FirebaseSync($firebaseConfig, $conn);
+      $firebaseResult = $sync->syncSections();
+      http_response_code(201);
+      echo json_encode([
+        "status" => "success",
+        "message" => $firebaseResult['success']
+          ? "Section added successfully and synced to Firebase"
+          : "Section added successfully but Firebase sync failed",
+        "section" => $section,
+        "firebase_sync" => $firebaseResult
+      ]);
+    } catch (Exception $firebaseError) {
+      http_response_code(201);
+      echo json_encode([
+        "status" => "success",
+        "message" => "Section added successfully but Firebase sync failed",
+        "section" => $section,
+        "firebase_error" => $firebaseError->getMessage()
+      ]);
     }
-    
-    if (isset($stmt)) {
-        $stmt->close();
-    }
+  } catch (Throwable $e) {
+    $conn->rollback();
+    http_response_code(500);
+    echo json_encode(["status" => "error", "message" => "Error: ".$e->getMessage()]);
+  }
 }
 
-// Function to update a section
-function updateSection($conn, $id, $data) {
-    $conn->begin_transaction();
-    
-    try {
-        // Check if section exists
-        $checkStmt = $conn->prepare("SELECT section_id FROM sections WHERE section_id = ?");
-        $checkStmt->bind_param("i", $id);
-        $checkStmt->execute();
-        $checkResult = $checkStmt->get_result();
-        
-        if ($checkResult->num_rows === 0) {
-            throw new Exception("Section not found");
-        }
-        $checkStmt->close();
-        
-        // Validate section_name length
-        if (strlen($data['section_name']) > 50) {
-            throw new Exception("Section name must not exceed 50 characters");
-        }
-        
-        // Validate grade level if provided
-        if (isset($data['grade_level']) && !in_array($data['grade_level'], ['11', '12'])) {
-            throw new Exception("Grade level must be either '11' or '12'");
-        }
-        
-        // Validate strand if provided
-        if (isset($data['strand']) && strlen($data['strand']) > 10) {
-            throw new Exception("Strand must not exceed 10 characters");
-        }
-        
-        // Validate number of students if provided
-        if (isset($data['number_of_students']) && (!is_numeric($data['number_of_students']) || $data['number_of_students'] < 0)) {
-            throw new Exception("Number of students must be a non-negative integer");
-        }
-        
-        // Validate room_ids if provided
-        if (isset($data['room_ids'])) {
-            if (!is_array($data['room_ids'])) {
-                throw new Exception("room_ids must be an array");
-            }
-            
-            // Check if all rooms exist
-            $roomIds = array_map('intval', $data['room_ids']);
-            $placeholders = str_repeat('?,', count($roomIds) - 1) . '?';
-            $roomCheckStmt = $conn->prepare("SELECT room_id FROM rooms WHERE room_id IN ($placeholders)");
-            $roomCheckStmt->bind_param(str_repeat('i', count($roomIds)), ...$roomIds);
-            $roomCheckStmt->execute();
-            $roomCheckResult = $roomCheckStmt->get_result();
-            
-            if ($roomCheckResult->num_rows !== count($roomIds)) {
-                throw new Exception("One or more room IDs do not exist");
-            }
-            $roomCheckStmt->close();
-        }
-        
-        // Get current section data
-        $currentStmt = $conn->prepare("SELECT * FROM sections WHERE section_id = ?");
-        $currentStmt->bind_param("i", $id);
-        $currentStmt->execute();
-        $currentResult = $currentStmt->get_result();
-        $currentData = $currentResult->fetch_assoc();
-        $currentStmt->close();
-        
-        // Prepare values
-        $name = $data['section_name'];
-        $gradeLevel = isset($data['grade_level']) ? $data['grade_level'] : $currentData['grade_level'];
-        $numberOfStudents = isset($data['number_of_students']) ? (int)$data['number_of_students'] : $currentData['number_of_students'];
-        $strand = isset($data['strand']) ? $data['strand'] : $currentData['strand'];
-        $roomIds = isset($data['room_ids']) ? array_unique($data['room_ids']) : [];
-        
-        // Update section
-        $sql = "UPDATE sections SET 
-                section_name = ?, 
-                grade_level = ?,
-                number_of_students = ?,
-                strand = ?
-                WHERE section_id = ?";
-        
-        $stmt = $conn->prepare($sql);
-        if ($stmt === false) {
-            throw new Exception("Failed to prepare SQL statement");
-        }
-        
-        $stmt->bind_param("ssisi", $name, $gradeLevel, $numberOfStudents, $strand, $id);
-        
-        if (!$stmt->execute()) {
-            throw new Exception("Failed to update section");
-        }
-        $stmt->close();
+function updateSection(mysqli $conn, int $id, array $data) {
+  $conn->begin_transaction();
+  try {
+    $curRes = $conn->query("SELECT * FROM sections WHERE section_id = $id");
+    if ($curRes->num_rows === 0) throw new Exception("Section not found");
+    $cur = $curRes->fetch_assoc();
 
-        // Update room assignments
-        // First, delete existing assignments
-        $deleteStmt = $conn->prepare("DELETE FROM section_room_assignments WHERE section_id = ?");
-        $deleteStmt->bind_param("i", $id);
-        if (!$deleteStmt->execute()) {
-            throw new Exception("Failed to remove existing room assignments");
-        }
-        $deleteStmt->close();
+    $sets = [];
 
-        // Then, insert new assignments if any
-        if (!empty($roomIds)) {
-            $assignSql = "INSERT INTO section_room_assignments (section_id, room_id) VALUES (?, ?)";
-            $assignStmt = $conn->prepare($assignSql);
-            
-            foreach ($roomIds as $roomId) {
-                $assignStmt->bind_param("ii", $id, $roomId);
-                if (!$assignStmt->execute()) {
-                    throw new Exception("Failed to assign room to section");
-                }
-            }
-            $assignStmt->close();
-        }
-
-        // Get updated section with room information
-        $sql = "SELECT s.*, 
-                GROUP_CONCAT(DISTINCT r.room_id, ':', r.room_number, ':', r.room_type, ':', r.room_capacity) as rooms
-                FROM sections s
-                LEFT JOIN section_room_assignments sra ON s.section_id = sra.section_id
-                LEFT JOIN rooms r ON sra.room_id = r.room_id
-                WHERE s.section_id = ?
-                GROUP BY s.section_id";
-        
-        $stmt = $conn->prepare($sql);
-        $stmt->bind_param("i", $id);
-        $stmt->execute();
-        $result = $stmt->get_result();
-        
-        if ($result && $row = $result->fetch_assoc()) {
-            $rooms = [];
-            if ($row['rooms']) {
-                $roomData = explode(',', $row['rooms']);
-                foreach ($roomData as $room) {
-                    list($id, $number, $type, $capacity) = explode(':', $room);
-                    $rooms[] = [
-                        'id' => (int)$id,
-                        'number' => (int)$number,
-                        'type' => $type,
-                        'capacity' => (int)$capacity
-                    ];
-                }
-            }
-            
-            $section = [
-                'section_id' => (int)$row['section_id'],
-                'section_name' => $row['section_name'],
-                'grade_level' => $row['grade_level'],
-                'strand' => $row['strand'],
-                'number_of_students' => (int)$row['number_of_students'],
-                'rooms' => $rooms
-            ];
-            
-            // Commit transaction
-            $conn->commit();
-            
-            echo json_encode([
-                "status" => "success", 
-                "message" => "Section updated successfully",
-                "section" => $section
-            ]);
-        } else {
-            throw new Exception("Failed to fetch updated section");
-        }
-        
-    } catch (Exception $e) {
-        // Rollback transaction on error
-        $conn->rollback();
-        http_response_code(500);
-        echo json_encode(["status" => "error", "message" => "Error: " . $e->getMessage()]);
+    if (array_key_exists('section_name', $data)) {
+      $name = trim((string)$data['section_name']);
+      if (strlen($name) > 50) throw new Exception("Section name must not exceed 50 characters");
+      $sets[] = "section_name = ".esc($conn,$name);
     }
-    
-    if (isset($stmt)) {
-        $stmt->close();
+
+    if (array_key_exists('grade_level', $data)) {
+      $gl = (string)$data['grade_level'];
+      if ($gl !== '' && !in_array($gl, ['11','12'], true)) throw new Exception("Grade level must be either '11' or '12'");
+      $sets[] = "grade_level = ".($gl===''? "NULL" : esc($conn,$gl));
     }
+
+    if (array_key_exists('strand', $data)) {
+      $strand = (string)$data['strand'];
+      if (strlen($strand) > 10) throw new Exception("Strand must not exceed 10 characters");
+      $sets[] = "strand = ".($strand===''? "NULL" : esc($conn,$strand));
+    }
+
+    if (array_key_exists('number_of_students', $data)) {
+      if ($data['number_of_students'] === null || $data['number_of_students'] === '') {
+        $sets[] = "number_of_students = NULL";
+      } else {
+        $nos = (int)$data['number_of_students'];
+        if ($nos < 0) throw new Exception("Number of students must be a non-negative integer");
+        $sets[] = "number_of_students = $nos";
+      }
+    }
+
+    if (array_key_exists('subj_ids', $data)) {
+      if (is_array($data['subj_ids'])) {
+        $ids = array_values(array_unique(array_filter(array_map('intval', $data['subj_ids']), fn($v)=>$v>0)));
+        $json = json_encode($ids, JSON_UNESCAPED_UNICODE);
+      } elseif (is_string($data['subj_ids']) && trim($data['subj_ids']) !== '') {
+        $json = trim($data['subj_ids']); // assume valid JSON
+      } else {
+        $json = '[]';
+      }
+      $sets[] = "subject_ids = ".esc($conn,$json);
+    }
+
+    $updateRooms = false;
+    $roomIds = [];
+    if (array_key_exists('room_ids', $data)) {
+      if (!is_array($data['room_ids'])) throw new Exception("room_ids must be an array");
+      $roomIds = array_values(array_unique(array_map('intval', $data['room_ids'])));
+      if (count($roomIds) > 0) {
+        $in = implode(',', $roomIds);
+        $rc = $conn->query("SELECT room_id FROM rooms WHERE room_id IN ($in)")->num_rows;
+        if ($rc !== count($roomIds)) throw new Exception("One or more room IDs do not exist");
+      }
+      $updateRooms = true;
+    }
+
+    if (!empty($sets)) {
+      $sql = "UPDATE sections SET ".implode(', ', $sets).", updated_at = NOW() WHERE section_id = $id";
+      $conn->query($sql);
+    }
+
+    if ($updateRooms) {
+      $conn->query("DELETE FROM section_room_assignments WHERE section_id = $id");
+      foreach ($roomIds as $rid) {
+        $conn->query("INSERT INTO section_room_assignments (section_id, room_id) VALUES ($id, ".(int)$rid.")");
+      }
+    }
+
+    $row = $conn->query("SELECT * FROM sections WHERE section_id = $id")->fetch_assoc();
+    $subject_ids_raw = $row['subject_ids'] ?? null;
+    $subject_ids_arr = [];
+    if ($subject_ids_raw !== null && $subject_ids_raw !== '') {
+      $decoded = json_decode($subject_ids_raw, true);
+      if (is_array($decoded)) $subject_ids_arr = array_values(array_map('intval', $decoded));
+    }
+
+    $conn->commit();
+    echo json_encode([
+      "success" => true,
+      "status"  => "success",
+      "message" => "Section updated successfully",
+      "section" => [
+        "section_id" => (int)$row["section_id"],
+        "section_name" => $row["section_name"],
+        "grade_level" => $row["grade_level"],
+        "strand" => $row["strand"],
+        "number_of_students" => isset($row["number_of_students"]) ? (int)$row["number_of_students"] : null,
+        "subject_ids_raw" => $subject_ids_raw,
+        "subject_ids" => $subject_ids_arr,
+      ],
+    ]);
+  } catch (Throwable $e) {
+    $conn->rollback();
+    http_response_code(500);
+    echo json_encode(["success" => false, "status" => "error", "message" => "Error: ".$e->getMessage()]);
+  }
 }
 
-// Function to delete a section
-function deleteSection($conn, $id) {
-    $cascade = isset($_GET['cascade']) && $_GET['cascade'] == '1';
+function deleteSection(mysqli $conn, int $id) {
+  $cascade = isset($_GET['cascade']) && $_GET['cascade'] == '1';
 
-    // Does the section exist?
-    $checkStmt = $conn->prepare("SELECT section_id FROM sections WHERE section_id = ?");
-    $checkStmt->bind_param("i", $id);
-    $checkStmt->execute();
-    $exists = $checkStmt->get_result()->num_rows > 0;
-    $checkStmt->close();
+  $exists = $conn->query("SELECT section_id FROM sections WHERE section_id = $id")->num_rows > 0;
+  if (!$exists) {
+    http_response_code(404);
+    echo json_encode(["success" => false, "status" => "error", "message" => "Section not found"]);
+    return;
+  }
 
-    if (!$exists) {
-        http_response_code(404);
-        echo json_encode(["success" => false, "status" => "error", "message" => "Section not found"]);
-        return;
+  $c = (int)($conn->query("SELECT COUNT(*) AS c FROM schedules WHERE section_id = $id")->fetch_assoc()['c'] ?? 0);
+  if ($c > 0 && !$cascade) {
+    http_response_code(409);
+    echo json_encode([
+      "success" => false,
+      "status"  => "error",
+      "message" => "This section is referenced by $c schedule(s). Delete them first or pass cascade=1."
+    ]);
+    return;
+  }
+
+  $conn->begin_transaction();
+  try {
+    if ($c > 0) {
+      $conn->query("DELETE sd FROM schedule_days sd INNER JOIN schedules s ON s.schedule_id = sd.schedule_id WHERE s.section_id = $id");
+      $conn->query("DELETE FROM schedules WHERE section_id = $id");
     }
+    $conn->query("DELETE FROM section_room_assignments WHERE section_id = $id");
+    $conn->query("DELETE FROM sections WHERE section_id = $id");
 
-    // How many schedules reference this section?
-    $cntStmt = $conn->prepare("SELECT COUNT(*) AS c FROM schedules WHERE section_id = ?");
-    $cntStmt->bind_param("i", $id);
-    $cntStmt->execute();
-    $c = (int)($cntStmt->get_result()->fetch_assoc()['c'] ?? 0);
-    $cntStmt->close();
-
-    if ($c > 0 && !$cascade) {
-        http_response_code(409);
-        echo json_encode([
-            "success" => false,
-            "status"  => "error",
-            "message" => "This section is referenced by $c schedule(s). Delete them first or pass cascade=1."
-        ]);
-        return;
-    }
-
-    $conn->begin_transaction();
-    try {
-        if ($c > 0) {
-            // delete children in the right order
-            // 1) schedule_days → depends on schedules
-            $sdStmt = $conn->prepare("DELETE sd FROM schedule_days sd
-                                      INNER JOIN schedules s ON s.schedule_id = sd.schedule_id
-                                      WHERE s.section_id = ?");
-            $sdStmt->bind_param("i", $id);
-            $sdStmt->execute();
-            $sdStmt->close();
-
-            // 2) schedules
-            $schStmt = $conn->prepare("DELETE FROM schedules WHERE section_id = ?");
-            $schStmt->bind_param("i", $id);
-            $schStmt->execute();
-            $schStmt->close();
-        }
-
-        // 3) room assignments
-        $delAssign = $conn->prepare("DELETE FROM section_room_assignments WHERE section_id = ?");
-        $delAssign->bind_param("i", $id);
-        $delAssign->execute();
-        $delAssign->close();
-
-        // 4) section
-        $delSec = $conn->prepare("DELETE FROM sections WHERE section_id = ?");
-        $delSec->bind_param("i", $id);
-        $delSec->execute();
-        $delSec->close();
-
-        $conn->commit();
-        echo json_encode(["success" => true, "status" => "success", "message" => "Section deleted successfully"]);
-    } catch (Throwable $e) {
-        $conn->rollback();
-        http_response_code(500);
-        echo json_encode(["success" => false, "status" => "error", "message" => "Error: " . $e->getMessage()]);
-    }
+    $conn->commit();
+    echo json_encode(["success" => true, "status" => "success", "message" => "Section deleted successfully"]);
+  } catch (Throwable $e) {
+    $conn->rollback();
+    http_response_code(500);
+    echo json_encode(["success" => false, "status" => "error", "message" => "Error: ".$e->getMessage()]);
+  }
 }
 
-// Close the database connection   
 $conn->close();
-?>
