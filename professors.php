@@ -9,7 +9,30 @@ use PHPMailer\PHPMailer\Exception;
 
 require __DIR__ . '/vendor/autoload.php';
 
-function sendWelcomeProfessorEmail($toEmail, $toName, $username, $plainPassword, $schoolName, $portalUrl) {
+function fetchSubjectsByIds($conn, $ids) {
+    if (!is_array($ids) || empty($ids)) return [];
+
+    // sanitize to integers and remove empties/dupes
+    $safe = array_values(array_unique(array_filter(array_map(function($v){ return (int)$v; }, $ids), function($v){ return $v > 0; })));
+    if (empty($safe)) return [];
+
+    $in = implode(',', $safe);
+    $sql = "SELECT subj_id, subj_code, subj_name FROM subjects WHERE subj_id IN ($in) ORDER BY subj_name ASC";
+    $res = $conn->query($sql);
+    $out = [];
+    if ($res) {
+        while($row = $res->fetch_assoc()) {
+            $out[] = [
+                'subj_id'   => (int)$row['subj_id'],
+                'subj_code' => $row['subj_code'],
+                'subj_name' => $row['subj_name'],
+            ];
+        }
+    }
+    return $out;
+}
+
+function sendWelcomeProfessorEmail($toEmail, $toName, $username, $plainPassword, $schoolName, $portalUrl, $subjectRows) {
     if (!$toEmail) return ['sent' => false, 'message' => 'No recipient email'];
     $mail = new PHPMailer(true);
     try {
@@ -27,6 +50,18 @@ function sendWelcomeProfessorEmail($toEmail, $toName, $username, $plainPassword,
         $mail->CharSet = 'UTF-8';
         $mail->isHTML(true);
         $mail->Subject = "$schoolName — Your Professor Account";
+
+        $subjectList = "";
+        if (!empty($subjectRows)) {
+            $subjectList .= "<ul style='margin:10px 0; padding-left:20px;'>";
+            foreach ($subjectRows as $s) {
+                $label = trim(($s['subj_code'] ?? '') . ' — ' . ($s['subj_name'] ?? ''));
+                $subjectList .= "<li>".htmlspecialchars($label)."</li>";
+            }
+            $subjectList .= "</ul>";
+        } else {
+            $subjectList = "<p><em>No subjects assigned yet.</em></p>";
+        }
 
         $body = "
         <div style='font-family:Segoe UI,Roboto,Helvetica,Arial,sans-serif; background:#f9fafb; padding:20px;'>
@@ -47,6 +82,8 @@ function sendWelcomeProfessorEmail($toEmail, $toName, $username, $plainPassword,
                   <td style='padding:10px; border:1px solid #e5e7eb;'><code>".htmlspecialchars($plainPassword)."</code></td>
                 </tr>
               </table>
+              <p><strong>Assigned Subjects:</strong></p>
+              $subjectList
               <p style='margin:20px 0;'>Login here:
                 <a href='".htmlspecialchars($portalUrl)."' style='color:#4f46e5; text-decoration:none; font-weight:500;'>".htmlspecialchars($portalUrl)."</a>
               </p>
@@ -58,7 +95,14 @@ function sendWelcomeProfessorEmail($toEmail, $toName, $username, $plainPassword,
           </div>
         </div>";
 
-        $alt = "Welcome to $schoolName\n\nHi ".($toName ?: 'Professor').",\n\nYour professor account has been created.\n\nUsername: $username\nTemporary Password: $plainPassword\nLogin: $portalUrl\n\nPlease change your password after logging in.";
+        $alts = array_map(function($s){
+          $code = $s['subj_code'] ?? '';
+          $name = $s['subj_name'] ?? '';
+          return trim("$code — $name");
+        }, $subjectRows);
+        $altSubjects = empty($alts) ? "No subjects assigned yet." : implode(", ", $alts);
+
+        $alt = "Welcome to $schoolName\n\nHi ".($toName ?: 'Professor').",\n\nYour professor account has been created.\n\nUsername: $username\nTemporary Password: $plainPassword\n\nSubjects: $altSubjects\n\nLogin: $portalUrl\n\nPlease change your password after logging in.";
 
         $mail->Body    = $body;
         $mail->AltBody = $alt;
@@ -71,7 +115,6 @@ function sendWelcomeProfessorEmail($toEmail, $toName, $username, $plainPassword,
 }
 
 $conn = new mysqli($host, $user, $password, $database);
-
 if ($conn->connect_error) {
     http_response_code(500);
     echo json_encode(["status" => "error", "message" => "Database connection failed: " . $conn->connect_error]);
@@ -81,316 +124,165 @@ if ($conn->connect_error) {
 $method = $_SERVER['REQUEST_METHOD'];
 
 switch ($method) {
-    case 'GET':
+    case 'POST':
+        $data = json_decode(file_get_contents('php://input'), true);
+        createProfessor($conn, $data);
+        break;
+    case 'PUT':
+        $data = json_decode(file_get_contents('php://input'), true);
+        updateProfessor($conn, (int)($_GET['id'] ?? 0), $data);
+        break;
+    case 'DELETE':
+        deleteProfessor($conn, (int)($_GET['id'] ?? 0));
+        break;
+    default:
         if (isset($_GET['id'])) {
             getProfessor($conn, (int)$_GET['id']);
         } else {
             getAllProfessors($conn);
         }
         break;
-
-    case 'POST':
-        $data = json_decode(file_get_contents('php://input'), true);
-        if (!$data) {
-            http_response_code(400);
-            echo json_encode(["status" => "error", "message" => "Invalid JSON data"]);
-            exit();
-        }
-        createProfessor($conn, $data);
-        break;
-
-    case 'PUT':
-        if (!isset($_GET['id'])) {
-            http_response_code(400);
-            echo json_encode(["status" => "error", "message" => "Professor ID is required"]);
-            exit();
-        }
-        $data = json_decode(file_get_contents('php://input'), true);
-        if (!$data) {
-            http_response_code(400);
-            echo json_encode(["status" => "error", "message" => "Invalid JSON data"]);
-            exit();
-        }
-        updateProfessor($conn, (int)$_GET['id'], $data);
-        break;
-
-    case 'DELETE':
-        if (!isset($_GET['id'])) {
-            http_response_code(400);
-            echo json_encode(["status" => "error", "message" => "Professor ID is required"]);
-            exit();
-        }
-        deleteProfessor($conn, (int)$_GET['id']);
-        break;
-
-    default:
-        http_response_code(405);
-        echo json_encode(["status" => "error", "message" => "Method not allowed"]);
-        break;
-}
-
-function getAllProfessors($conn) {
-    $sql = "
-        SELECT 
-            p.*,
-            COALESCE(s.cnt, 0) AS subject_count
-        FROM professors p
-        LEFT JOIN (
-            SELECT prof_id, COUNT(*) AS cnt
-            FROM schedules
-            GROUP BY prof_id
-        ) s ON s.prof_id = p.prof_id
-        ORDER BY p.prof_id ASC
-    ";
-
-    $result = $conn->query($sql);
-    if (!$result) {
-        http_response_code(500);
-        echo json_encode(["success" => false, "status" => "error", "message" => "Failed to fetch professors"]);
-        return;
-    }
-
-    $professors = [];
-    while ($row = $result->fetch_assoc()) {
-        $quals = [];
-        if (isset($row['prof_qualifications']) && $row['prof_qualifications'] !== null && $row['prof_qualifications'] !== '') {
-            $decoded = json_decode($row['prof_qualifications'], true);
-            $quals = is_array($decoded) ? $decoded : [];
-        }
-
-        $professors[] = [
-            'prof_id'        => (int)$row['prof_id'],
-            'prof_name'      => $row['prof_name'],
-            'prof_email'     => $row['prof_email'],
-            'prof_phone'     => $row['prof_phone'],
-            'qualifications' => $quals,
-            'prof_username'  => $row['prof_username'],
-            'prof_password'  => $row['prof_password'],
-            'subject_count'  => (int)$row['subject_count'],
-            'subjectCount'   => (int)$row['subject_count'],
-        ];
-    }
-
-    echo json_encode(["success" => true, "status" => "success", "data" => $professors]);
-}
-
-function getProfessor($conn, $id) {
-    $stmt = $conn->prepare("
-        SELECT 
-            p.*,
-            (
-                SELECT COUNT(*) 
-                FROM schedules s 
-                WHERE s.prof_id = p.prof_id
-            ) AS subject_count
-        FROM professors p
-        WHERE p.prof_id = ?
-        LIMIT 1
-    ");
-    $stmt->bind_param("i", $id);
-    $stmt->execute();
-    $res = $stmt->get_result();
-
-    if (!$res || $res->num_rows === 0) {
-        http_response_code(404);
-        echo json_encode(["status" => "error", "message" => "Professor not found"]);
-        $stmt->close();
-        return;
-    }
-
-    $row = $res->fetch_assoc();
-    $stmt->close();
-
-    $quals = [];
-    if (isset($row['prof_qualifications']) && $row['prof_qualifications'] !== null && $row['prof_qualifications'] !== '') {
-        $decoded = json_decode($row['prof_qualifications'], true);
-        $quals = is_array($decoded) ? $decoded : [];
-    }
-
-    $professor = [
-        'id'             => (int)$row['prof_id'],
-        'name'           => $row['prof_name'],
-        'email'          => $row['prof_email'],
-        'phone'          => $row['prof_phone'],
-        'qualifications' => $quals,
-        'username'       => $row['prof_username'],
-        'password'       => $row['prof_password'],
-        'subject_count'  => (int)$row['subject_count'],
-        'subjectCount'   => (int)$row['subject_count'],
-    ];
-
-    echo json_encode(["status" => "success", "data" => $professor]);
 }
 
 function createProfessor($conn, $data) {
-    $requiredFields = ['name', 'qualifications'];
-    foreach ($requiredFields as $field) {
-        if (!isset($data[$field])) {
-            http_response_code(400);
-            echo json_encode(["status" => "error", "message" => "Missing required field: $field"]);
-            exit();
-        }
-    }
+    $name  = mysqli_real_escape_string($conn, (string)($data['name'] ?? ''));
+    $username = mysqli_real_escape_string($conn, (string)($data['username'] ?? ''));
+    $password = mysqli_real_escape_string($conn, (string)($data['password'] ?? ''));
+    $email = mysqli_real_escape_string($conn, (string)($data['email'] ?? ''));
+    $phone = mysqli_real_escape_string($conn, (string)($data['phone'] ?? ''));
+    $quals = json_encode($data['qualifications'] ?? []);
+    $ids   = $data['subject_ids'] ?? [];
+    $subjects_json = json_encode($ids);
+    $subj_count = is_array($ids) ? count($ids) : 0;
 
-    $name = $data['name'];
-    $username = isset($data['username']) ? $data['username'] : null;
-    $password = isset($data['password']) ? $data['password'] : null;
-    $email = isset($data['email']) ? $data['email'] : null;
-    $phone = isset($data['phone']) ? $data['phone'] : null;
-    $qualifications = json_encode($data['qualifications']);
+    $sql = "INSERT INTO professors 
+        (prof_name, prof_username, prof_password, prof_email, prof_phone, prof_qualifications, prof_subject_ids, subj_count)
+        VALUES ('$name', '$username', '$password', '$email', '$phone', '$quals', '$subjects_json', $subj_count)";
 
-    $sql = "INSERT INTO professors (prof_name, prof_username, prof_password, prof_email, prof_phone, prof_qualifications, subj_count)
-        VALUES (?, ?, ?, ?, ?, ?, 0)";
-
-    $stmt = $conn->prepare($sql);
-    if ($stmt === false) {
-        http_response_code(500);
-        echo json_encode(["status" => "error", "message" => "Failed to prepare SQL statement"]);
-        exit();
-    }
-
-    $stmt->bind_param("ssssss", $name, $username, $password, $email, $phone, $qualifications);
-
-    if ($stmt->execute()) {
+    if ($conn->query($sql) === TRUE) {
         $id = $conn->insert_id;
-        $professor = [
-            'id' => $id,
-            'name' => $name,
-            'email' => $email,
-            'phone' => $phone,
-            'qualifications' => $data['qualifications'],
-            'username' => $username,
-            'password' => $password,
-            'subjectCount' => 0,
-            'subject_count' => 0
-        ];
 
-        try {
-            require_once 'realtime_firebase_sync.php';
-            $sync = new RealtimeFirebaseSync();
-            $sync->syncProfessors();
-        } catch (Exception $e) {
-            error_log("Firebase sync failed for professor $id: " . $e->getMessage());
-        }
+        // Fetch subject rows for email (code + name)
+        $subjectRows = fetchSubjectsByIds($conn, $ids);
 
-        $emailResult = ['sent' => false, 'message' => 'Skipped (no email)'];
-        if (!empty($email)) {
-            $emailResult = sendWelcomeProfessorEmail(
+        $emailResult = !empty($email)
+            ? sendWelcomeProfessorEmail(
                 $email,
                 $name,
                 $username,
                 $password,
                 'Systems Plus Computer College Caloocan',
-                'https://your-portal.example.com/login'
-            );
-        }
+                'https://your-portal.example.com/login',
+                $subjectRows
+              )
+            : ['sent'=>false,'message'=>'No email'];
 
-        http_response_code(201);
-        echo json_encode([
-            "status" => "success",
-            "message" => "Professor added successfully",
-            "id" => $id,
-            "data" => $professor,
-            "email" => $emailResult
-        ]);
-        exit();
+        echo json_encode(["status"=>"success","message"=>"Professor added","id"=>$id,"email"=>$emailResult]);
     } else {
         http_response_code(500);
-        echo json_encode(["status" => "error", "message" => "Error: " . $stmt->error]);
-        exit();
+        echo json_encode(["status"=>"error","message"=>$conn->error]);
     }
-
-    $stmt->close();
 }
 
 function updateProfessor($conn, $id, $data) {
-    $checkStmt = $conn->prepare("SELECT prof_id FROM professors WHERE prof_id = ?");
-    $checkStmt->bind_param("i", $id);
-    $checkStmt->execute();
-    $checkResult = $checkStmt->get_result();
-
-    if ($checkResult->num_rows === 0) {
-        http_response_code(404);
-        echo json_encode(["status" => "error", "message" => "Professor not found"]);
-        $checkStmt->close();
-        exit();
+    if ($id <= 0) {
+        http_response_code(400);
+        echo json_encode(["status"=>"error","message"=>"Professor ID is required"]);
+        return;
     }
-    $checkStmt->close();
-
-    $name = $data['name'];
-    $email = isset($data['email']) ? $data['email'] : null;
-    $phone = isset($data['phone']) ? $data['phone'] : null;
-    $qualifications = json_encode($data['qualifications']);
+    $name  = mysqli_real_escape_string($conn, (string)($data['name'] ?? ''));
+    $email = mysqli_real_escape_string($conn, (string)($data['email'] ?? ''));
+    $phone = mysqli_real_escape_string($conn, (string)($data['phone'] ?? ''));
+    $quals = json_encode($data['qualifications'] ?? []);
+    $ids   = $data['subject_ids'] ?? [];
+    $subjects_json = json_encode($ids);
+    $subj_count = is_array($ids) ? count($ids) : 0;
 
     $sql = "UPDATE professors SET 
-            prof_name = ?, 
-            prof_email = ?, 
-            prof_phone = ?, 
-            prof_qualifications = ? 
-            WHERE prof_id = ?";
+        prof_name='$name', 
+        prof_email='$email', 
+        prof_phone='$phone', 
+        prof_qualifications='$quals',
+        prof_subject_ids='$subjects_json',
+        subj_count=$subj_count
+        WHERE prof_id=$id";
 
-    $stmt = $conn->prepare($sql);
-    if ($stmt === false) {
-        http_response_code(500);
-        echo json_encode(["status" => "error", "message" => "Failed to prepare SQL statement"]);
-        exit();
-    }
-
-    $stmt->bind_param("ssssi", $name, $email, $phone, $qualifications, $id);
-
-    if ($stmt->execute()) {
-        $updatedProfessor = [
-            'id' => $id,
-            'name' => $name,
-            'email' => $email,
-            'phone' => $phone,
-            'qualifications' => $data['qualifications']
-        ];
-
-        echo json_encode([
-            "status" => "success", 
-            "message" => "Professor updated successfully",
-            "data" => $updatedProfessor
-        ]);
+    if ($conn->query($sql) === TRUE) {
+        echo json_encode(["status"=>"success","message"=>"Professor updated"]);
     } else {
         http_response_code(500);
-        echo json_encode(["status" => "error", "message" => "Error: " . $stmt->error]);
+        echo json_encode(["status"=>"error","message"=>$conn->error]);
     }
-
-    $stmt->close();
 }
 
 function deleteProfessor($conn, $id) {
-    $checkStmt = $conn->prepare("SELECT prof_id FROM professors WHERE prof_id = ?");
-    $checkStmt->bind_param("i", $id);
-    $checkStmt->execute();
-    $checkResult = $checkStmt->get_result();
-
-    if ($checkResult->num_rows === 0) {
-        http_response_code(404);
-        echo json_encode(["status" => "error", "message" => "Professor not found"]);
-        $checkStmt->close();
-        exit();
+    if ($id <= 0) {
+        http_response_code(400);
+        echo json_encode(["status"=>"error","message"=>"Professor ID is required"]);
+        return;
     }
-    $checkStmt->close();
-
-    $sql = "DELETE FROM professors WHERE prof_id = ?";
-
-    $stmt = $conn->prepare($sql);
-    $stmt->bind_param("i", $id);
-
-    if ($stmt->execute()) {
-        echo json_encode([
-            "status" => "success", 
-            "message" => "Professor deleted successfully",
-            "data" => ["id" => $id]
-        ]);
+    $sql = "DELETE FROM professors WHERE prof_id=$id";
+    if ($conn->query($sql) === TRUE) {
+        echo json_encode(["status"=>"success","message"=>"Professor deleted"]);
     } else {
         http_response_code(500);
-        echo json_encode(["status" => "error", "message" => "Error: " . $stmt->error]);
+        echo json_encode(["status"=>"error","message"=>$conn->error]);
     }
+}
 
-    $stmt->close();
+function getAllProfessors($conn) {
+    $sql = "SELECT * FROM professors ORDER BY prof_id ASC";
+    $result = $conn->query($sql);
+    $professors = [];
+    if ($result) {
+        while ($row = $result->fetch_assoc()) {
+            $professors[] = [
+                'prof_id'         => (int)$row['prof_id'],
+                'prof_name'       => $row['prof_name'],
+                'prof_email'      => $row['prof_email'],
+                'prof_phone'      => $row['prof_phone'],
+                'prof_username'   => $row['prof_username'],
+                'prof_password'   => $row['prof_password'],
+                'qualifications'  => json_decode($row['prof_qualifications'] ?? '[]', true) ?: [],
+                'subjects_ids'    => json_decode($row['prof_subject_ids'] ?? '[]', true) ?: [],
+                'subj_count'      => (int)$row['subj_count'],
+            ];
+        }
+    }
+    echo json_encode(["success"=>true,"data"=>$professors]);
+}
+
+function getProfessor($conn, $id) {
+    if ($id <= 0) {
+        http_response_code(400);
+        echo json_encode(["status"=>"error","message"=>"Professor ID is required"]);
+        return;
+    }
+    $sql = "SELECT * FROM professors WHERE prof_id=$id LIMIT 1";
+    $res = $conn->query($sql);
+    if (!$res || $res->num_rows === 0) {
+        http_response_code(404);
+        echo json_encode(["status"=>"error","message"=>"Professor not found"]);
+        return;
+    }
+    $row = $res->fetch_assoc();
+
+    $ids = json_decode($row['prof_subject_ids'] ?? '[]', true) ?: [];
+    $subjects = fetchSubjectsByIds($conn, $ids);
+
+    $prof = [
+        'id'              => (int)$row['prof_id'],
+        'name'            => $row['prof_name'],
+        'email'           => $row['prof_email'],
+        'phone'           => $row['prof_phone'],
+        'username'        => $row['prof_username'],
+        'password'        => $row['prof_password'],
+        'qualifications'  => json_decode($row['prof_qualifications'] ?? '[]', true) ?: [],
+        'subjects'        => $subjects,
+        'subj_count'      => (int)$row['subj_count'],
+    ];
+
+    echo json_encode(["status"=>"success","data"=>$prof]);
 }
 
 $conn->close();
