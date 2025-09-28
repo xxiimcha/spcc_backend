@@ -10,20 +10,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit();
 }
 
-// Database connection
-try {
-    $host = 'localhost';
-    $dbname = 'spcc_scheduling_system';
-    $dbuser = 'root';
-    $dbpass = '';
-    
-    $pdo = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8", $dbuser, $dbpass);
-    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-} catch (PDOException $e) {
-    echo json_encode([
-        'success' => false,
-        'message' => 'Database connection failed: ' . $e->getMessage()
-    ]);
+require_once __DIR__ . '/connect.php';
+/** @var mysqli $conn */
+if (!isset($conn) || !($conn instanceof mysqli)) {
+    http_response_code(500);
+    echo json_encode(['success' => false, 'message' => 'Database connection not available']);
+    exit();
+}
+
+// Helpers
+function bind_params(mysqli_stmt $stmt, string $types, array &$params): bool {
+    $refs = [];
+    $refs[] = $types;
+    foreach ($params as $k => &$v) {
+        $refs[] = &$params[$k];
+    }
+    return call_user_func_array([$stmt, 'bind_param'], $refs);
+}
+
+function json_out($ok, $payload = []) {
+    echo json_encode(array_merge(['success' => (bool)$ok], $payload));
     exit();
 }
 
@@ -31,289 +37,322 @@ $method = $_SERVER['REQUEST_METHOD'];
 
 switch ($method) {
     case 'GET':
-        handleGetSchedules($pdo);
+        handleGetSchedules($conn);
         break;
     case 'POST':
-        handleCreateSchedule($pdo);
+        handleCreateSchedule($conn);
         break;
     case 'PUT':
-        handleUpdateSchedule($pdo);
+        handleUpdateSchedule($conn);
         break;
     case 'DELETE':
-        handleDeleteSchedule($pdo);
+        handleDeleteSchedule($conn);
         break;
     default:
         http_response_code(405);
-        echo json_encode(['success' => false, 'message' => 'Method not allowed']);
-        break;
+        json_out(false, ['message' => 'Method not allowed']);
 }
 
-function handleCreateSchedule($pdo) {
+/**
+ * POST /schedule.php
+ */
+function handleCreateSchedule(mysqli $conn) {
     try {
-        $input = json_decode(file_get_contents('php://input'), true);
-        
-        // Log the input for debugging
-        error_log("Schedule creation input: " . json_encode($input));
-        
-        if (!$input) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Invalid JSON input'
-            ]);
-            return;
+        $raw = file_get_contents('php://input');
+        error_log("Create schedule raw input: " . $raw);
+        $input = json_decode($raw, true);
+
+        if (!$input || !is_array($input)) {
+            json_out(false, ['message' => 'Invalid JSON input']);
         }
-        
-        // Validate required fields
-        $required_fields = ['school_year', 'semester', 'subj_id', 'prof_id', 'section_id', 'schedule_type', 'start_time', 'end_time', 'days'];
-        foreach ($required_fields as $field) {
-            if (!isset($input[$field]) || (is_array($input[$field]) && empty($input[$field])) || (!is_array($input[$field]) && trim($input[$field]) === '')) {
-                echo json_encode([
-                    'success' => false,
-                    'message' => "Missing required field: $field"
-                ]);
-                return;
+
+        // Validate required columns
+        $required = ['school_year','semester','subj_id','prof_id','section_id','schedule_type','start_time','end_time','days'];
+        foreach ($required as $f) {
+            if (!array_key_exists($f, $input) || (is_array($input[$f]) ? empty($input[$f]) : trim((string)$input[$f]) === '')) {
+                json_out(false, ['message' => "Missing required field: $f"]);
             }
         }
-        
-        // Note: schedules table already exists with schedule_id as primary key
-        
-        // Insert schedule without conflict checking for now (to ensure it works)
-        $sql = "INSERT INTO schedules (school_year, semester, subj_id, prof_id, section_id, room_id, schedule_type, start_time, end_time, days, created_at) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())";
-        
-        $stmt = $pdo->prepare($sql);
-        $result = $stmt->execute([
-            $input['school_year'],
-            $input['semester'],
-            $input['subj_id'],
-            $input['prof_id'],
-            $input['section_id'],
-            $input['room_id'] ?? null,
-            $input['schedule_type'],
-            $input['start_time'],
-            $input['end_time'],
-            json_encode($input['days'])
-        ]);
-        
-        if ($result) {
-            $schedule_id = $pdo->lastInsertId();
-            
-            // Auto-sync to Firebase
-            try {
-                require_once 'realtime_firebase_sync.php';
-                $sync = new RealtimeFirebaseSync();
-                $sync->syncSingleSchedule($schedule_id);
-            } catch (Exception $e) {
-                error_log("Firebase sync failed for schedule $schedule_id: " . $e->getMessage());
-            }
-            
-            echo json_encode([
-                'success' => true,
-                'message' => 'Schedule created successfully',
-                'data' => [
-                    'schedule_id' => $schedule_id,
-                    ...$input
-                ]
-            ]);
-        } else {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to create schedule'
-            ]);
+
+        // Prepare values
+        $school_year   = (string)$input['school_year'];
+        $semester      = (string)$input['semester'];
+        $subj_id       = (int)$input['subj_id'];
+        $prof_id       = (int)$input['prof_id'];
+        $schedule_type = (string)$input['schedule_type'];
+        $start_time    = (string)$input['start_time']; // 'HH:MM:SS' or 'HH:MM'
+        $end_time      = (string)$input['end_time'];
+        $room_id       = isset($input['room_id']) && $input['room_id'] !== '' ? (int)$input['room_id'] : null;
+        $section_id    = (int)$input['section_id'];
+        $days_json     = json_encode($input['days']);
+
+        $sql = "INSERT INTO schedules
+                (school_year, semester, subj_id, prof_id, schedule_type, start_time, end_time, created_at, room_id, section_id, days)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?)";
+        $stmt = $conn->prepare($sql);
+        if (!$stmt) {
+            error_log("Create prepare error: " . $conn->error);
+            json_out(false, ['message' => 'Failed to prepare insert']);
         }
-        
-    } catch (Exception $e) {
-        error_log("Schedule creation error: " . $e->getMessage());
-        echo json_encode([
-            'success' => false,
-            'message' => 'Error creating schedule: ' . $e->getMessage()
+
+        // Types: s s i i s s s i i s
+        $types = 'ssii sss iis';
+        // spaces are just for readability above; remove for actual string:
+        $types = 'ssiisssiis';
+
+        $params = [
+            $school_year,
+            $semester,
+            $subj_id,
+            $prof_id,
+            $schedule_type,
+            $start_time,
+            $end_time,
+            $room_id,     // can be NULL
+            $section_id,
+            $days_json
+        ];
+
+        if (!bind_params($stmt, $types, $params)) {
+            error_log("Bind params failed on create: " . $stmt->error);
+            json_out(false, ['message' => 'Failed to bind parameters']);
+        }
+
+        $ok = $stmt->execute();
+        if (!$ok) {
+            error_log("Insert execute error: " . $stmt->error);
+            json_out(false, ['message' => 'Failed to create schedule']);
+        }
+
+        $id = $conn->insert_id;
+
+        // Optional sync (non-fatal)
+        try {
+            $syncFile = __DIR__ . '/realtime_firebase_sync.php';
+            if (file_exists($syncFile)) {
+                require_once $syncFile;
+                if (class_exists('RealtimeFirebaseSync')) {
+                    $sync = new RealtimeFirebaseSync();
+                    $sync->syncSingleSchedule($id);
+                }
+            }
+        } catch (Throwable $e) {
+            error_log("Firebase sync failed for schedule $id: " . $e->getMessage());
+        }
+
+        json_out(true, [
+            'message' => 'Schedule created successfully',
+            'data' => [
+                'schedule_id'  => (int)$id,
+                'school_year'  => $school_year,
+                'semester'     => $semester,
+                'subj_id'      => $subj_id,
+                'prof_id'      => $prof_id,
+                'section_id'   => $section_id,
+                'room_id'      => $room_id,
+                'schedule_type'=> $schedule_type,
+                'start_time'   => $start_time,
+                'end_time'     => $end_time,
+                'days'         => json_decode($days_json, true),
+            ]
         ]);
+    } catch (Throwable $e) {
+        error_log("Create schedule error: " . $e->getMessage());
+        json_out(false, ['message' => 'Error creating schedule: ' . $e->getMessage()]);
     }
 }
 
-function handleGetSchedules($pdo) {
+/**
+ * GET /schedule.php?school_year=&semester=&professor_id=
+ */
+function handleGetSchedules(mysqli $conn) {
     try {
-        $school_year = $_GET['school_year'] ?? '';
-        $semester = $_GET['semester'] ?? '';
+        $school_year  = $_GET['school_year']  ?? '';
+        $semester     = $_GET['semester']     ?? '';
         $professor_id = $_GET['professor_id'] ?? '';
-        
-        // Note: schedules table already exists with schedule_id as primary key
-        
-        $sql = "SELECT s.*, 
+
+        $sql = "SELECT s.*,
                        subj.subj_name, subj.subj_code,
-                       p.prof_name as professor_name,
-                       sect.section_name, sect.grade_level as level, sect.strand,
+                       p.prof_name AS professor_name,
+                       sect.section_name, sect.grade_level AS level, sect.strand,
                        r.room_number, r.room_type
-                FROM schedules s
-                LEFT JOIN subjects subj ON s.subj_id = subj.subj_id
-                LEFT JOIN professors p ON s.prof_id = p.prof_id
-                LEFT JOIN sections sect ON s.section_id = sect.section_id
-                LEFT JOIN rooms r ON s.room_id = r.room_id
-                WHERE 1=1";
+                  FROM schedules s
+             LEFT JOIN subjects   subj ON s.subj_id   = subj.subj_id
+             LEFT JOIN professors p    ON s.prof_id   = p.prof_id
+             LEFT JOIN sections   sect ON s.section_id= sect.section_id
+             LEFT JOIN rooms      r    ON s.room_id   = r.room_id
+                 WHERE 1=1";
+        $conds = [];
+        $types = '';
         $params = [];
-        
-        if (!empty($school_year)) {
-            $sql .= " AND s.school_year = ?";
-            $params[] = $school_year;
-        }
-        
-        if (!empty($semester)) {
-            $sql .= " AND s.semester = ?";
-            $params[] = $semester;
-        }
-        
-        if (!empty($professor_id)) {
-            $sql .= " AND s.prof_id = ?";
-            $params[] = $professor_id;
-        }
-        
-        $sql .= " ORDER BY s.schedule_id DESC";
-        
-        $stmt = $pdo->prepare($sql);
-        $stmt->execute($params);
-        $schedules = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        
-        // Parse days JSON and add schedule_id field for each schedule
-        foreach ($schedules as &$schedule) {
-            if (isset($schedule['days'])) {
-                $schedule['days'] = json_decode($schedule['days'], true) ?: [];
+
+        if ($school_year !== '') { $conds[] = " AND s.school_year = ?"; $types .= 's'; $params[] = $school_year; }
+        if ($semester    !== '') { $conds[] = " AND s.semester    = ?"; $types .= 's'; $params[] = $semester; }
+        if ($professor_id!== '') { $conds[] = " AND s.prof_id     = ?"; $types .= 'i'; $params[] = (int)$professor_id; }
+
+        $sql .= implode('', $conds) . " ORDER BY s.schedule_id DESC";
+
+        if ($types === '') {
+            // no params -> simple query
+            $result = $conn->query($sql);
+            if (!$result) {
+                error_log("Get schedules query error: " . $conn->error);
+                json_out(false, ['message' => 'Failed to retrieve schedules']);
             }
-            // Add schedule_id field for frontend compatibility (it already exists)
-            // $schedule['schedule_id'] is already present in the table
+        } else {
+            $stmt = $conn->prepare($sql);
+            if (!$stmt) {
+                error_log("Get schedules prepare error: " . $conn->error);
+                json_out(false, ['message' => 'Failed to prepare query']);
+            }
+            if (!bind_params($stmt, $types, $params)) {
+                error_log("Get schedules bind error: " . $stmt->error);
+                json_out(false, ['message' => 'Failed to bind parameters']);
+            }
+            if (!$stmt->execute()) {
+                error_log("Get schedules execute error: " . $stmt->error);
+                json_out(false, ['message' => 'Failed to execute query']);
+            }
+            $result = $stmt->get_result();
         }
-        
-        echo json_encode([
-            'success' => true,
-            'data' => $schedules,
-            'message' => 'Schedules retrieved successfully'
-        ]);
-        
-    } catch (Exception $e) {
-        echo json_encode([
-            'success' => false,
-            'message' => 'Error retrieving schedules: ' . $e->getMessage()
-        ]);
+
+        $rows = [];
+        while ($row = $result->fetch_assoc()) {
+            if (isset($row['days'])) {
+                $row['days'] = json_decode($row['days'], true) ?: [];
+            }
+            $rows[] = $row;
+        }
+
+        json_out(true, ['data' => $rows, 'message' => 'Schedules retrieved successfully']);
+    } catch (Throwable $e) {
+        json_out(false, ['message' => 'Error retrieving schedules: ' . $e->getMessage()]);
     }
 }
 
-function handleUpdateSchedule($pdo) {
+/**
+ * PUT /schedule.php?id=123
+ */
+function handleUpdateSchedule(mysqli $conn) {
     try {
         $id = $_GET['id'] ?? '';
-        if (empty($id)) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Schedule ID is required'
-            ]);
-            return;
+        if ($id === '') {
+            json_out(false, ['message' => 'Schedule ID is required']);
         }
-        
-        $input = json_decode(file_get_contents('php://input'), true);
-        
+        $id = (int)$id;
+
+        $raw = file_get_contents('php://input');
+        $input = json_decode($raw, true);
         if (!$input) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Invalid JSON input'
-            ]);
-            return;
+            json_out(false, ['message' => 'Invalid JSON input']);
         }
-        
-        // Build update query dynamically
-        $updateFields = [];
+
+        $allowed = ['school_year','semester','subj_id','prof_id','section_id','room_id','schedule_type','start_time','end_time','days'];
+        $set = [];
+        $types = '';
         $params = [];
-        
-        $allowedFields = ['school_year', 'semester', 'subj_id', 'prof_id', 'section_id', 'room_id', 'schedule_type', 'start_time', 'end_time', 'days'];
-        
-        foreach ($allowedFields as $field) {
-            if (isset($input[$field])) {
-                $updateFields[] = "$field = ?";
-                $params[] = $field === 'days' ? json_encode($input[$field]) : $input[$field];
+
+        foreach ($allowed as $f) {
+            if (array_key_exists($f, $input)) {
+                $set[] = "$f = ?";
+                if ($f === 'subj_id' || $f === 'prof_id' || $f === 'section_id' || $f === 'room_id') {
+                    $types .= 'i';
+                    $params[] = ($input[$f] === null || $input[$f] === '') ? null : (int)$input[$f];
+                } elseif ($f === 'days') {
+                    $types .= 's';
+                    $params[] = json_encode($input[$f]);
+                } else {
+                    $types .= 's';
+                    $params[] = (string)$input[$f];
+                }
             }
         }
-        
-        if (empty($updateFields)) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'No valid fields to update'
-            ]);
-            return;
+
+        if (empty($set)) {
+            json_out(false, ['message' => 'No valid fields to update']);
         }
-        
-        $sql = "UPDATE schedules SET " . implode(', ', $updateFields) . " WHERE schedule_id = ?";
+
+        $sql = "UPDATE schedules SET " . implode(', ', $set) . " WHERE schedule_id = ?";
+        $types .= 'i';
         $params[] = $id;
-        
-        $stmt = $pdo->prepare($sql);
-        $result = $stmt->execute($params);
-        
-        if ($result) {
-            // Auto-sync to Firebase
-            try {
-                require_once 'realtime_firebase_sync.php';
-                $sync = new RealtimeFirebaseSync();
-                $sync->syncSingleSchedule($id);
-            } catch (Exception $e) {
-                error_log("Firebase sync failed for schedule update $id: " . $e->getMessage());
-            }
-            
-            echo json_encode([
-                'success' => true,
-                'message' => 'Schedule updated successfully'
-            ]);
-        } else {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to update schedule'
-            ]);
+
+        $stmt = $conn->prepare($sql);
+        if (!$stmt) {
+            error_log("Update prepare error: " . $conn->error);
+            json_out(false, ['message' => 'Failed to prepare update']);
         }
-        
-    } catch (Exception $e) {
-        echo json_encode([
-            'success' => false,
-            'message' => 'Error updating schedule: ' . $e->getMessage()
-        ]);
+
+        if (!bind_params($stmt, $types, $params)) {
+            error_log("Update bind error: " . $stmt->error);
+            json_out(false, ['message' => 'Failed to bind parameters']);
+        }
+
+        if (!$stmt->execute()) {
+            error_log("Update execute error: " . $stmt->error);
+            json_out(false, ['message' => 'Failed to update schedule']);
+        }
+
+        // Optional sync (non-fatal)
+        try {
+            $syncFile = __DIR__ . '/realtime_firebase_sync.php';
+            if (file_exists($syncFile)) {
+                require_once $syncFile;
+                if (class_exists('RealtimeFirebaseSync')) {
+                    $sync = new RealtimeFirebaseSync();
+                    $sync->syncSingleSchedule($id);
+                }
+            }
+        } catch (Throwable $e) {
+            error_log("Firebase sync failed for schedule update $id: " . $e->getMessage());
+        }
+
+        json_out(true, ['message' => 'Schedule updated successfully']);
+    } catch (Throwable $e) {
+        json_out(false, ['message' => 'Error updating schedule: ' . $e->getMessage()]);
     }
 }
 
-function handleDeleteSchedule($pdo) {
+/**
+ * DELETE /schedule.php?id=123
+ */
+function handleDeleteSchedule(mysqli $conn) {
     try {
         $id = $_GET['id'] ?? '';
-        if (empty($id)) {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Schedule ID is required'
-            ]);
-            return;
+        if ($id === '') {
+            json_out(false, ['message' => 'Schedule ID is required']);
         }
-        
-        $sql = "DELETE FROM schedules WHERE schedule_id = ?";
-        $stmt = $pdo->prepare($sql);
-        $result = $stmt->execute([$id]);
-        
-        if ($result) {
-            // Auto-sync to Firebase (delete from Firebase)
-            try {
-                require_once 'realtime_firebase_sync.php';
-                $sync = new RealtimeFirebaseSync();
-                $sync->deleteSingleSchedule($id);
-            } catch (Exception $e) {
-                error_log("Firebase sync failed for schedule deletion $id: " . $e->getMessage());
+        $id = (int)$id;
+
+        $stmt = $conn->prepare("DELETE FROM schedules WHERE schedule_id = ?");
+        if (!$stmt) {
+            error_log("Delete prepare error: " . $conn->error);
+            json_out(false, ['message' => 'Failed to prepare delete']);
+        }
+        if (!bind_params($stmt, 'i', [$id])) {
+            error_log("Delete bind error: " . $stmt->error);
+            json_out(false, ['message' => 'Failed to bind parameters']);
+        }
+        if (!$stmt->execute()) {
+            error_log("Delete execute error: " . $stmt->error);
+            json_out(false, ['message' => 'Failed to delete schedule']);
+        }
+
+        // Optional sync (non-fatal)
+        try {
+            $syncFile = __DIR__ . '/realtime_firebase_sync.php';
+            if (file_exists($syncFile)) {
+                require_once $syncFile;
+                if (class_exists('RealtimeFirebaseSync')) {
+                    $sync = new RealtimeFirebaseSync();
+                    $sync->deleteSingleSchedule($id);
+                }
             }
-            
-            echo json_encode([
-                'success' => true,
-                'message' => 'Schedule deleted successfully'
-            ]);
-        } else {
-            echo json_encode([
-                'success' => false,
-                'message' => 'Failed to delete schedule'
-            ]);
+        } catch (Throwable $e) {
+            error_log("Firebase sync failed for schedule deletion $id: " . $e->getMessage());
         }
-        
-    } catch (Exception $e) {
-        echo json_encode([
-            'success' => false,
-            'message' => 'Error deleting schedule: ' . $e->getMessage()
-        ]);
+
+        json_out(true, ['message' => 'Schedule deleted successfully']);
+    } catch (Throwable $e) {
+        json_out(false, ['message' => 'Error deleting schedule: ' . $e->getMessage()]);
     }
 }
-?>
