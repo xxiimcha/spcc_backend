@@ -1,6 +1,7 @@
 <?php
 // subjects_bulk_upload.php
-// Upload Excel/CSV and insert/update the `subjects` table
+// Upload Excel/CSV and insert/update the `subjects` table, now supporting:
+// code, name, description, subject type, grade level, strand, semester
 
 require_once __DIR__ . '/cors_helper.php';
 handleCORS();
@@ -9,7 +10,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit;
 }
 
-// Always return JSON
 header('Content-Type: application/json; charset=utf-8');
 
 // DB connect
@@ -62,18 +62,31 @@ if (!in_array($ext, $allowed, true)) {
     exit;
 }
 
-// --- Utilities ---
-function normalize_header($h) {
-    $h = trim($h);
-    $h = strtolower($h);
-    if (in_array($h, ['subj_code', 'subject_code', 'code'], true)) return 'code';
-    if (in_array($h, ['subj_name', 'subject_name', 'name', 'title'], true)) return 'name';
-    if (in_array($h, ['subj_description', 'subject_description', 'description', 'desc'], true)) return 'description';
-    return $h;
+// ---------- Utilities ----------
+function norm_str($s) {
+    return strtolower(trim(preg_replace('/[\s\-_]+/', ' ', (string)$s)));
 }
+
+function normalize_header($h) {
+    $h = norm_str($h);
+    // base
+    if (in_array($h, ['subj code','subject code','code'], true)) return 'code';
+    if (in_array($h, ['subj name','subject name','name','title'], true)) return 'name';
+    if (in_array($h, ['subj description','subject description','description','desc'], true)) return 'description';
+
+    // new fields
+    if (in_array($h, ['subject type','type','subj type'], true)) return 'subject type';
+    if (in_array($h, ['grade level','grade_level','year level','year_level','grade'], true)) return 'grade level';
+    if (in_array($h, ['strand','track/strand','track strand'], true)) return 'strand';
+    if (in_array($h, ['semester','sem'], true)) return 'semester';
+
+    return $h; // fallback
+}
+
 function strip_bom($s) {
     return (substr($s, 0, 3) === "\xEF\xBB\xBF") ? substr($s, 3) : $s;
 }
+
 function detect_delimiter($path) {
     $candidates = [",", ";", "\t"];
     $h = fopen($path, 'r');
@@ -82,8 +95,7 @@ function detect_delimiter($path) {
     fclose($h);
     if ($line === false) return ",";
     $line = strip_bom($line);
-    $best = ",";
-    $bestCount = 0;
+    $best = ","; $bestCount = 0;
     foreach ($candidates as $d) {
         $parts = str_getcsv($line, $d);
         if (count($parts) > $bestCount) {
@@ -94,36 +106,54 @@ function detect_delimiter($path) {
     return $best;
 }
 
-// --- Read rows ---
+// Value normalizers (lightweight; adjust if you have strict enums)
+function normalize_semester($v) {
+    $n = norm_str($v);
+    if ($n === '' ) return '';
+    if (preg_match('/^1(st)?$|^first$/', $n))  return 'First Semester';
+    if (preg_match('/^2(nd)?$|^second$/', $n)) return 'Second Semester';
+    // accept "summer", "midyear", etc
+    if (strpos($n, 'summer') !== false) return 'Summer';
+    if (strpos($n, 'mid') !== false) return 'Midyear';
+    return ucfirst($n); // fallback keep readable
+}
+function normalize_grade_level($v) {
+    $n = trim((string)$v);
+    // keep raw but trim; if numeric like "11", keep as "11"
+    return $n;
+}
+function normalize_strand($v) {
+    // common SHS strands: STEM, ABM, HUMSS, GAS, ICT, HE, IA
+    $n = strtoupper(trim((string)$v));
+    return $n;
+}
+function sanitize($v) {
+    return trim((string)$v);
+}
+
+// ---------- Read rows ----------
 $rows = [];
 $sheetName = null;
 
 try {
     if ($ext === 'csv') {
-        // CSV (pure PHP)
         $delim = detect_delimiter($tmpPath);
         $fh = fopen($tmpPath, 'r');
-        if ($fh === false) {
-            throw new Exception("Unable to open uploaded CSV.");
-        }
+        if ($fh === false) throw new Exception("Unable to open uploaded CSV.");
 
         // header line
         $first = fgets($fh);
-        if ($first === false) {
-            fclose($fh);
-            throw new Exception("CSV is empty.");
-        }
+        if ($first === false) { fclose($fh); throw new Exception("CSV is empty."); }
         $first = strip_bom($first);
         $rawHeaders = str_getcsv($first, $delim);
         $headers    = array_map('normalize_header', $rawHeaders);
 
-        // data lines
         while (($data = fgetcsv($fh, 0, $delim)) !== false) {
             if (!$data || count($data) === 0) continue;
             $rowAssoc = [];
             foreach ($headers as $i => $key) {
                 if ($key === '') continue;
-                $rowAssoc[$key] = isset($data[$i]) ? trim((string)$data[$i]) : '';
+                $rowAssoc[$key] = isset($data[$i]) ? sanitize($data[$i]) : '';
             }
             $rows[] = $rowAssoc;
         }
@@ -131,16 +161,13 @@ try {
         $sheetName = 'CSV';
     } else {
         // Excel via PhpSpreadsheet
-        // Composer autoloader (vendor is inside this project)
         require_once __DIR__ . '/vendor/autoload.php';
-
         $spreadsheet = \PhpOffice\PhpSpreadsheet\IOFactory::load($tmpPath);
         $sheet = $spreadsheet->getSheet(0);
         $sheetName = $sheet->getTitle();
         $arr = $sheet->toArray(null, true, true, true);
-        if (empty($arr)) {
-            throw new Exception("The Excel file is empty.");
-        }
+        if (empty($arr)) throw new Exception("The Excel file is empty.");
+
         // headers
         $first = array_shift($arr);
         $headers = [];
@@ -153,9 +180,7 @@ try {
             $i = 0;
             foreach ($r as $col => $val) {
                 $key = $headers[$i] ?? '';
-                if ($key !== '') {
-                    $rowAssoc[$key] = trim((string)$val);
-                }
+                if ($key !== '') $rowAssoc[$key] = sanitize($val);
                 $i++;
             }
             $rows[] = $rowAssoc;
@@ -171,32 +196,46 @@ try {
     exit;
 }
 
-// --- Validate required headers: code + name (description optional) ---
+// ---------- Validate headers ----------
+// Required minimum (to remain backward compatible): code + name
+// Recommended new headers: subject type, grade level, strand, semester
 $hasCode = false; $hasName = false;
-if (!empty($rows)) {
-    $sampleKeys = array_map('strtolower', array_keys($rows[0]));
-    $hasCode = in_array('code', $sampleKeys, true);
-    $hasName = in_array('name', $sampleKeys, true);
-}
+$sampleKeys = !empty($rows) ? array_map('strtolower', array_keys($rows[0])) : [];
+$hasCode = in_array('code', $sampleKeys, true);
+$hasName = in_array('name', $sampleKeys, true);
+
 if (!$hasCode || !$hasName) {
     http_response_code(400);
     echo json_encode([
         "success" => false,
         "status"  => "error",
-        "message" => "Missing required headers. Expected at least: code, name. (description is optional)"
+        "message" => "Missing required headers. Expected at least: code, name. Optional: description, subject type, grade level, strand, semester."
     ]);
     exit;
 }
 
-// --- Prepare UPSERT ---
-// IMPORTANT: subj_code must be UNIQUE for ON DUPLICATE KEY to work.
-// ALTER TABLE subjects ADD UNIQUE KEY uq_subject_code (subj_code);
+// Detect presence of new fields in this file
+$hasType   = in_array('subject type', $sampleKeys, true);
+$hasGL     = in_array('grade level',   $sampleKeys, true);
+$hasStrand = in_array('strand',        $sampleKeys, true);
+$hasSem    = in_array('semester',      $sampleKeys, true);
+
+// ---------- Prepare UPSERT ----------
+// Adjust these column names if your schema differs.
+$col_list = "subj_code, subj_name, subj_description, subj_type, grade_level, strand, semester";
+$placeholders = "?, ?, ?, ?, ?, ?, ?";
+$update_list =
+  "subj_name = VALUES(subj_name),
+   subj_description = VALUES(subj_description),
+   subj_type = VALUES(subj_type),
+   grade_level = VALUES(grade_level),
+   strand = VALUES(strand),
+   semester = VALUES(semester)";
+
 $stmt = $mysqli->prepare(
-    "INSERT INTO subjects (subj_code, subj_name, subj_description)
-     VALUES (?, ?, ?)
-     ON DUPLICATE KEY UPDATE
-       subj_name = VALUES(subj_name),
-       subj_description = VALUES(subj_description)"
+    "INSERT INTO subjects ($col_list)
+     VALUES ($placeholders)
+     ON DUPLICATE KEY UPDATE $update_list"
 );
 if ($stmt === false) {
     http_response_code(500);
@@ -208,22 +247,22 @@ if ($stmt === false) {
     exit;
 }
 
-$inserted = 0;
-$updated  = 0;
-$skipped  = 0;
-$errors   = [];
-$preview  = [];
+$inserted = 0; $updated = 0; $skipped = 0; $errors = []; $preview = [];
 
 $mysqli->begin_transaction();
 
 try {
     foreach ($rows as $idx => $row) {
-        $code = trim((string)($row['code'] ?? ''));
-        $name = trim((string)($row['name'] ?? ''));
-        $desc = trim((string)($row['description'] ?? ''));
+        $code = sanitize($row['code'] ?? '');
+        $name = sanitize($row['name'] ?? '');
+        $desc = sanitize($row['description'] ?? '');
 
-        // row number in the original file (1-based; +2 accounts for header)
-        $rowNo = $idx + 2;
+        $type = $hasType ? sanitize($row['subject type'] ?? '') : '';
+        $gl   = $hasGL   ? normalize_grade_level($row['grade level'] ?? '') : '';
+        $str  = $hasStrand ? normalize_strand($row['strand'] ?? '') : '';
+        $sem  = $hasSem ? normalize_semester($row['semester'] ?? '') : '';
+
+        $rowNo = $idx + 2; // header at 1
 
         if ($code === '' && $name === '') { $skipped++; continue; }
         if ($code === '' || $name === '') {
@@ -232,20 +271,29 @@ try {
             continue;
         }
 
-        $stmt->bind_param('sss', $code, $name, $desc);
+        // Bind and execute (7 columns)
+        $stmt->bind_param('sssssss', $code, $name, $desc, $type, $gl, $str, $sem);
         if (!$stmt->execute()) {
             $skipped++;
             $errors[] = "Row {$rowNo}: DB error - " . $stmt->error;
             continue;
         }
 
-        // affected_rows: 1=insert, 2=update
+        // affected_rows: 1 insert, 2 update
         if ($stmt->affected_rows === 1) $inserted++;
         elseif ($stmt->affected_rows === 2) $updated++;
-        else $skipped++; // no change
+        else $skipped++;
 
         if (count($preview) < 10) {
-            $preview[] = ['code' => $code, 'name' => $name, 'description' => $desc];
+            $preview[] = [
+                'code' => $code,
+                'name' => $name,
+                'description' => $desc,
+                'subject_type' => $type,
+                'grade_level' => $gl,
+                'strand' => $str,
+                'semester' => $sem
+            ];
         }
     }
 
