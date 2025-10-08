@@ -77,9 +77,64 @@ switch ($method) {
 // ---------------------------------------------------------------------------
 
 function getAllSubject($conn) {
+  // ---- read optional filters ---------------------------------------------
+  $strandParam   = isset($_GET['strand']) ? trim($_GET['strand']) : null;               // e.g. "ICT" or "ICT,STEM"
+  $gradeLevel    = isset($_GET['grade_level']) ? trim($_GET['grade_level']) : (isset($_GET['grade']) ? trim($_GET['grade']) : null); // "11" | "12"
+  $typeParam     = isset($_GET['type']) ? trim($_GET['type']) : (isset($_GET['subj_type']) ? trim($_GET['subj_type']) : null);       // core|applied|...
+  $isActiveParam = isset($_GET['is_active']) ? $_GET['is_active'] : null;               // 0|1
+  $q             = isset($_GET['q']) ? trim($_GET['q']) : null;                          // free-text: code/name/desc
+
+  $where = [];
+
+  // strand filter (supports comma-separated list, case-insensitive)
+  if ($strandParam !== null && $strandParam !== '') {
+    $parts = array_filter(array_map('trim', explode(',', $strandParam)));
+    if ($parts) {
+      $in = [];
+      foreach ($parts as $p) {
+        $in[] = "LOWER('".esc($conn, $p)."')";
+      }
+      // Compare as LOWER on both sides (no prepared statements here)
+      $where[] = "LOWER(s.strand) IN (".implode(',', $in).")";
+    }
+  }
+
+  // grade_level filter ("11" or "12")
+  if ($gradeLevel !== null && $gradeLevel !== '') {
+    // keep only allowed values
+    if (in_array($gradeLevel, ['11','12'], true)) {
+      $where[] = "s.grade_level = '".esc($conn, $gradeLevel)."'";
+    }
+  }
+
+  // type filter (subject type)
+  if ($typeParam !== null && $typeParam !== '') {
+    $where[] = "LOWER(s.subj_type) = LOWER('".esc($conn, $typeParam)."')";
+  }
+
+  // is_active filter (0/1)
+  if ($isActiveParam !== null && $isActiveParam !== '') {
+    $where[] = "s.is_active = ".((int)$isActiveParam);
+  }
+
+  // free-text query across code, name, description (case-insensitive)
+  if ($q !== null && $q !== '') {
+    $qEsc = esc($conn, $q);
+    $where[] = "(s.subj_code LIKE '%{$qEsc}%' OR s.subj_name LIKE '%{$qEsc}%' OR s.subj_description LIKE '%{$qEsc}%')";
+  }
+
+  // ---- base SQL -----------------------------------------------------------
   $sql = "SELECT s.*,
                  (SELECT COUNT(*) FROM schedules WHERE subj_id = s.subj_id) AS schedule_count
           FROM subjects s";
+
+  if (!empty($where)) {
+    $sql .= " WHERE ".implode(" AND ", $where);
+  }
+
+  // optional: stable ordering for UI
+  $sql .= " ORDER BY s.strand IS NULL, s.strand, s.grade_level, s.subj_code";
+
   $result = $conn->query($sql);
 
   if ($result) {
