@@ -46,7 +46,7 @@ try {
 
   $enfSec     = (bool)($in['preventSameTimeSameSection'] ?? true);
   $enfProf    = (bool)($in['preventProfDoubleBooking'] ?? true);
-  $subCapHrs  = (int)($in['subjectWeeklyHourCap'] ?? 4);
+  $subCapHrs  = (int)($in['subjectWeeklyHourCap'] ?? 4); // cap stays configurable; default 4
   $ignoreExisting = (bool)($in['ignoreExistingMinutes'] ?? false);
   $seedFrom   = strtolower((string)($in['seedFrom'] ?? 'assignments'));
   $lunchStart = trim((string)($in['lunchStart'] ?? '12:00'));
@@ -84,6 +84,7 @@ try {
     return $enforceLunch ? ($s < $lunchEnd && $e > $lunchStart) : false;
   };
 
+  // Section -> Room (latest assignment)
   $sectionRoom = [];
   foreach ($qAll("
       SELECT s.section_id, sra.room_id
@@ -101,11 +102,26 @@ try {
     exit();
   }
 
-  $subHours = [];
-  foreach ($qAll("SELECT subj_id, COALESCE(subj_hours_per_week,3) AS h FROM subjects") as $r) {
-    $subHours[(int)$r['subj_id']] = (int)$r['h'];
+  // Section meta (grade_level, strand) for filtering
+  $sectionInfo = [];
+  foreach ($qAll("SELECT section_id, grade_level, strand FROM sections") as $r) {
+    $sectionInfo[(int)$r['section_id']] = [
+      'grade_level' => (string)$r['grade_level'],
+      'strand'      => (string)$r['strand']
+    ];
   }
 
+  // Subject meta (grade_level, strand) + default hours/week = 4
+  $subjectMeta = []; // subj_id => ['grade_level'=>..., 'strand'=>...]
+  foreach ($qAll("SELECT subj_id, grade_level, strand FROM subjects") as $r) {
+    $subjectMeta[(int)$r['subj_id']] = [
+      'grade_level' => (string)$r['grade_level'],
+      'strand'      => (string)$r['strand'],
+      'hours'       => 4 // default since subj_hours_per_week removed
+    ];
+  }
+
+  // Current professor loads (minutes) this term
   $profLoad = [];
   foreach ($qAll("
     SELECT prof_id, COALESCE(SUM(TIME_TO_SEC(TIMEDIFF(end_time,start_time))/60),0) AS m
@@ -117,62 +133,108 @@ try {
     if (!isset($profLoad[$pid])) $profLoad[$pid] = 0;
   }
 
+  // Professor -> teachable subjects (from JSON array field prof_subject_ids)
+  $canTeach = []; // subj_id => [prof_id,...]
+  foreach ($qAll("SELECT prof_id, prof_subject_ids FROM professors") as $r) {
+    $pid = (int)$r['prof_id'];
+    $dec = [];
+    if (!empty($r['prof_subject_ids'])) {
+      $tmp = json_decode($r['prof_subject_ids'], true);
+      if (is_array($tmp)) $dec = $tmp;
+    }
+    foreach ($dec as $sj) {
+      $sj = (int)$sj; if ($sj<=0) continue;
+      $canTeach[$sj][] = $pid;
+    }
+  }
+
   $triplesBySection = [];
   $noEligible = [];
 
   if ($seedFrom === 'section_subjects') {
+    // Use section_subjects; respect weekly_hours_needed if present, else default to 4
     foreach ($qAll("
       SELECT ss.section_id, ss.subj_id, ss.prof_id,
-             COALESCE(ss.weekly_hours_needed, COALESCE(s.subj_hours_per_week,3)) AS wh
+             ss.weekly_hours_needed AS wh
       FROM section_subjects ss
-      LEFT JOIN subjects s ON s.subj_id = ss.subj_id
       WHERE ss.school_year='{$sy}' AND ss.semester='{$sem}'
     ") as $r) {
-      $sec = (int)$r['section_id'];
-      if (!isset($triplesBySection[$sec])) $triplesBySection[$sec]=[];
-      $triplesBySection[$sec][] = [
-        "subj_id" => (int)$r['subj_id'],
-        "prof_id" => (int)$r['prof_id'],
-        "weekly_minutes" => max(0, (int)$r['wh'] * 60),
-      ];
-    }
-  } else {
-    $sectionSubs = [];
-    foreach ($qAll("SELECT section_id, subject_ids FROM sections") as $r) {
-      $lst = [];
-      if (!empty($r['subject_ids'])) {
-        $dec = json_decode($r['subject_ids'], true);
-        if (is_array($dec)) foreach ($dec as $v) { $n=(int)$v; if ($n>0) $lst[]=$n; }
-      }
-      $sectionSubs[(int)$r['section_id']] = array_values(array_unique($lst));
-    }
-    $canTeach = [];
-    foreach ($qAll("SELECT prof_id, prof_subject_ids FROM professors") as $r) {
-      $pid = (int)$r['prof_id'];
-      $dec = [];
-      if (!empty($r['prof_subject_ids'])) {
-        $tmp = json_decode($r['prof_subject_ids'], true);
-        if (is_array($tmp)) $dec = $tmp;
-      }
-      foreach ($dec as $sj) {
-        $sj = (int)$sj; if ($sj<=0) continue;
-        $canTeach[$sj][] = $pid;
-      }
-    }
-    foreach ($sectionSubs as $secId => $subs) {
-      if (!isset($triplesBySection[$secId])) $triplesBySection[$secId]=[];
-      foreach ($subs as $subj) {
-        $cands = $canTeach[$subj] ?? [];
-        if (!$cands) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subj]; continue; }
+      $secId = (int)$r['section_id'];
+      $subjId = (int)$r['subj_id'];
+      $givenProf = $r['prof_id'] !== null ? (int)$r['prof_id'] : null;
+
+      if (!isset($sectionInfo[$secId])) continue;
+      if (!isset($subjectMeta[$subjId])) continue;
+
+      $secGL = (string)$sectionInfo[$secId]['grade_level'];
+      $secStr= strtolower((string)$sectionInfo[$secId]['strand']);
+      $subGL = (string)$subjectMeta[$subjId]['grade_level'];
+      $subStr= strtolower((string)$subjectMeta[$subjId]['strand']);
+
+      // Filter by grade_level + strand match
+      if ($secGL !== $subGL || $secStr !== $subStr) continue;
+
+      $hrs = isset($r['wh']) && $r['wh'] !== null && $r['wh'] !== '' ? (float)$r['wh'] : 4.0;
+      $profId = $givenProf;
+
+      // If no professor specified, pick least-loaded eligible
+      if ($profId === null) {
+        $cands = $canTeach[$subjId] ?? [];
+        if (!$cands) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId]; continue; }
         $best=null; $bestLoad=PHP_INT_MAX;
         foreach ($cands as $pid) {
           $l = $profLoad[$pid] ?? 0;
           if ($l < $bestLoad) { $best=$pid; $bestLoad=$l; }
         }
-        if ($best===null) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subj]; continue; }
-        $hrs = $subHours[$subj] ?? 3;
+        if ($best===null) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId]; continue; }
+        $profId = (int)$best;
+        $profLoad[$profId] = ($profLoad[$profId] ?? 0) + (int)round($hrs*60);
+      }
+
+      if (!isset($triplesBySection[$secId])) $triplesBySection[$secId]=[];
+      $triplesBySection[$secId][] = [
+        "subj_id" => $subjId,
+        "prof_id" => $profId,
+        "weekly_minutes" => max(0, (int)round($hrs * 60)),
+      ];
+    }
+  } else {
+    // Seed from sections.subject_ids; filter by section grade_level + strand
+    $sectionSubs = [];
+    foreach ($qAll("SELECT section_id, subject_ids, grade_level, strand FROM sections") as $r) {
+      $lst = [];
+      if (!empty($r['subject_ids'])) {
+        $dec = json_decode($r['subject_ids'], true);
+        if (is_array($dec)) foreach ($dec as $v) { $n=(int)$v; if ($n>0) $lst[]=$n; }
+      }
+      $secId = (int)$r['section_id'];
+      $secGL = (string)$r['grade_level'];
+      $secStr= strtolower((string)$r['strand']);
+
+      // keep only subjects whose meta matches section grade+strand
+      $lst = array_values(array_filter($lst, function($sid) use ($subjectMeta, $secGL, $secStr) {
+        if (!isset($subjectMeta[$sid])) return false;
+        $m = $subjectMeta[$sid];
+        return ((string)$m['grade_level'] === $secGL) && (strtolower((string)$m['strand']) === $secStr);
+      }));
+
+      $sectionSubs[$secId] = $lst;
+    }
+
+    foreach ($sectionSubs as $secId => $subs) {
+      if (!isset($triplesBySection[$secId])) $triplesBySection[$secId]=[];
+      foreach ($subs as $subjId) {
+        $cands = $canTeach[$subjId] ?? [];
+        if (!$cands) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId]; continue; }
+        $best=null; $bestLoad=PHP_INT_MAX;
+        foreach ($cands as $pid) {
+          $l = $profLoad[$pid] ?? 0;
+          if ($l < $bestLoad) { $best=$pid; $bestLoad=$l; }
+        }
+        if ($best===null) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId]; continue; }
+        $hrs = 4; // default hours/week per subject
         $triplesBySection[$secId][] = [
-          "subj_id" => $subj,
+          "subj_id" => (int)$subjId,
           "prof_id" => (int)$best,
           "weekly_minutes" => max(0, $hrs*60),
         ];
