@@ -1,5 +1,4 @@
 <?php
-
 header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: POST, OPTIONS');
@@ -46,12 +45,18 @@ try {
 
   $enfSec     = (bool)($in['preventSameTimeSameSection'] ?? true);
   $enfProf    = (bool)($in['preventProfDoubleBooking'] ?? true);
-  $subCapHrs  = (int)($in['subjectWeeklyHourCap'] ?? 4); // cap stays configurable; default 4
+  $subCapHrs  = (int)($in['subjectWeeklyHourCap'] ?? 4);
   $ignoreExisting = (bool)($in['ignoreExistingMinutes'] ?? false);
   $seedFrom   = strtolower((string)($in['seedFrom'] ?? 'assignments'));
   $lunchStart = trim((string)($in['lunchStart'] ?? '12:00'));
   $lunchEnd   = trim((string)($in['lunchEnd']   ?? '13:00'));
   $enforceLunch = ($lunchStart !== '' && $lunchEnd !== '');
+
+  $addFixedBlocks = (bool)($in['addFixedBlocks'] ?? true);
+  $fixedBlocks = [
+    ['label' => 'Homeroom', 'start' => '07:30', 'end' => '08:00', 'status' => 'fixed'],
+    ['label' => 'Recess',   'start' => '08:00', 'end' => '08:30', 'status' => 'fixed'],
+  ];
 
   if ($schoolYear === '' || $semester === '') throw new Exception('Missing school_year or semester');
   if (!is_array($daysIn) || count($daysIn) === 0) throw new Exception('At least one active day is required');
@@ -68,6 +73,7 @@ try {
   $toM   = $toMin($endTime);
   if ($fromM < 0 || $toM < 0 || $fromM >= $toM) throw new Exception('Invalid start/end time window');
 
+  /** Build slots */
   $SLOTS = [];
   for ($m=$fromM; $m+$slotMin <= $toM; $m += $slotMin) {
     $sH=str_pad((string)intdiv($m,60),2,'0',STR_PAD_LEFT);
@@ -84,7 +90,7 @@ try {
     return $enforceLunch ? ($s < $lunchEnd && $e > $lunchStart) : false;
   };
 
-  // Section -> Room (latest assignment)
+  /** Section -> latest room assignment */
   $sectionRoom = [];
   foreach ($qAll("
       SELECT s.section_id, sra.room_id
@@ -97,12 +103,7 @@ try {
   ") as $r) {
     $sectionRoom[(int)$r['section_id']] = (int)$r['room_id'];
   }
-  if (!$sectionRoom) {
-    echo json_encode(["success"=>true,"inserted"=>0,"skipped"=>0,"details"=>["reason"=>"no sections found with room"]]);
-    exit();
-  }
 
-  // Section meta (grade_level, strand) for filtering
   $sectionInfo = [];
   foreach ($qAll("SELECT section_id, grade_level, strand FROM sections") as $r) {
     $sectionInfo[(int)$r['section_id']] = [
@@ -111,17 +112,15 @@ try {
     ];
   }
 
-  // Subject meta (grade_level, strand) + default hours/week = 4
-  $subjectMeta = []; // subj_id => ['grade_level'=>..., 'strand'=>...]
+  $subjectMeta = [];
   foreach ($qAll("SELECT subj_id, grade_level, strand FROM subjects") as $r) {
     $subjectMeta[(int)$r['subj_id']] = [
       'grade_level' => (string)$r['grade_level'],
       'strand'      => (string)$r['strand'],
-      'hours'       => 4 // default since subj_hours_per_week removed
+      'hours'       => 4
     ];
   }
 
-  // Current professor loads (minutes) this term
   $profLoad = [];
   foreach ($qAll("
     SELECT prof_id, COALESCE(SUM(TIME_TO_SEC(TIMEDIFF(end_time,start_time))/60),0) AS m
@@ -133,8 +132,7 @@ try {
     if (!isset($profLoad[$pid])) $profLoad[$pid] = 0;
   }
 
-  // Professor -> teachable subjects (from JSON array field prof_subject_ids)
-  $canTeach = []; // subj_id => [prof_id,...]
+  $canTeach = [];
   foreach ($qAll("SELECT prof_id, prof_subject_ids FROM professors") as $r) {
     $pid = (int)$r['prof_id'];
     $dec = [];
@@ -152,7 +150,6 @@ try {
   $noEligible = [];
 
   if ($seedFrom === 'section_subjects') {
-    // Use section_subjects; respect weekly_hours_needed if present, else default to 4
     foreach ($qAll("
       SELECT ss.section_id, ss.subj_id, ss.prof_id,
              ss.weekly_hours_needed AS wh
@@ -171,13 +168,11 @@ try {
       $subGL = (string)$subjectMeta[$subjId]['grade_level'];
       $subStr= strtolower((string)$subjectMeta[$subjId]['strand']);
 
-      // Filter by grade_level + strand match
       if ($secGL !== $subGL || $secStr !== $subStr) continue;
 
       $hrs = isset($r['wh']) && $r['wh'] !== null && $r['wh'] !== '' ? (float)$r['wh'] : 4.0;
       $profId = $givenProf;
 
-      // If no professor specified, pick least-loaded eligible
       if ($profId === null) {
         $cands = $canTeach[$subjId] ?? [];
         if (!$cands) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId]; continue; }
@@ -199,7 +194,6 @@ try {
       ];
     }
   } else {
-    // Seed from sections.subject_ids; filter by section grade_level + strand
     $sectionSubs = [];
     foreach ($qAll("SELECT section_id, subject_ids, grade_level, strand FROM sections") as $r) {
       $lst = [];
@@ -211,7 +205,6 @@ try {
       $secGL = (string)$r['grade_level'];
       $secStr= strtolower((string)$r['strand']);
 
-      // keep only subjects whose meta matches section grade+strand
       $lst = array_values(array_filter($lst, function($sid) use ($subjectMeta, $secGL, $secStr) {
         if (!isset($subjectMeta[$sid])) return false;
         $m = $subjectMeta[$sid];
@@ -232,7 +225,7 @@ try {
           if ($l < $bestLoad) { $best=$pid; $bestLoad=$l; }
         }
         if ($best===null) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId]; continue; }
-        $hrs = 4; // default hours/week per subject
+        $hrs = 4;
         $triplesBySection[$secId][] = [
           "subj_id" => (int)$subjId,
           "prof_id" => (int)$best,
@@ -249,6 +242,7 @@ try {
     exit();
   }
 
+  // Count day loads across ALL schedule types
   $secDayLoad = function(int $sec, string $day) use ($qOne,$sy,$sem) {
     return (int)$qOne("SELECT COUNT(*) FROM schedules
                        WHERE school_year='{$sy}' AND semester='{$sem}' AND section_id={$sec}
@@ -286,12 +280,65 @@ try {
     return $score;
   };
 
+  // Allow NULL room_id for fixed blocks so sections WITHOUT rooms still get Homeroom/Recess
+  $ensureFixed = function(int $sectionId, ?int $roomId, string $day, string $label, string $s, string $e, string $status='fixed') use ($conn, $esc, $sy, $sem) {
+    $sE    = $esc($s);
+    $eE    = $esc($e);
+    $dayE  = $esc($day);
+    $labE  = $esc($label);
+    $statusE = $esc($status);
+    $roomSql = $roomId === null ? "NULL" : (string)((int)$roomId);
+
+    $existsSql = "
+      SELECT 1 FROM schedules
+      WHERE school_year='{$sy}' AND semester='{$sem}'
+        AND section_id={$sectionId}
+        AND subj_id IS NULL AND prof_id IS NULL
+        AND schedule_type='{$labE}'
+        AND start_time='{$sE}' AND end_time='{$eE}'
+        AND JSON_LENGTH(days)=1
+        AND JSON_CONTAINS(days, JSON_QUOTE('{$dayE}'))
+      LIMIT 1";
+    $exists = $conn->query($existsSql);
+    if ($exists && $exists->fetch_row()) return false;
+
+    $insSql = "
+      INSERT INTO schedules
+        (school_year, semester, subj_id, prof_id, schedule_type, start_time, end_time, room_id, section_id, days, status, origin)
+      VALUES
+        ('{$sy}','{$sem}', NULL, NULL, '{$labE}', '{$sE}', '{$eE}', {$roomSql}, {$sectionId}, JSON_ARRAY('{$dayE}'), '{$statusE}', 'auto-default')";
+    $ok = $conn->query($insSql);
+    if ($ok === false) throw new Exception('Insert fixed block failed: '.$conn->error);
+    return true;
+  };
+
   $conn->begin_transaction();
+
+  // >>> MODIFIED: Add fixed blocks (Homeroom/Recess) for ALL sections that will get schedules,
+  // including those WITHOUT rooms (room_id NULL). Previously this only ran for sections with rooms.
+  $fixedInserted = 0;
+  if ($addFixedBlocks) {
+    // sections that actually have subjects (i.e., will receive schedules)
+    $sectionsNeedingBlocks = array_keys($triplesBySection);
+    foreach ($sectionsNeedingBlocks as $secId) {
+      $roomId = $sectionRoom[$secId] ?? null; // may be NULL for online sections
+      foreach ($DAYS as $day) {
+        foreach ($fixedBlocks as $fb) {
+          if ($fb['start'] < $endTime && $fb['end'] > $startTime) {
+            if ($ensureFixed((int)$secId, $roomId, (string)$day, (string)$fb['label'], (string)$fb['start'], (string)$fb['end'], (string)$fb['status'])) {
+              $fixedInserted++;
+            }
+          }
+        }
+      }
+    }
+  }
 
   $inserted=0; $skipped=0; $conflicts=[]; $metrics=[];
   foreach ($triplesBySection as $secId => $rows) {
-    if (!isset($sectionRoom[$secId])) continue;
-    $roomId = (int)$sectionRoom[$secId];
+    // Allow generation even if NO room was assigned (Online)
+    $hasRoom = array_key_exists($secId, $sectionRoom);
+    $roomId  = $hasRoom ? (int)$sectionRoom[$secId] : null;
 
     foreach ($rows as $t) {
       $subjId = (int)$t['subj_id'];
@@ -368,14 +415,21 @@ try {
 
         if ($best === null) break;
 
-        $scheduleType='Onsite'; $status='pending'; $origin='auto';
+        // Online if section has no room, else Onsite
+        $scheduleType = $hasRoom ? 'Onsite' : 'Online';
+        $status='pending'; $origin='auto';
         $sE=$esc($best['s']); $eE=$esc($best['e']);
+        $schTypeE = $esc($scheduleType);
+        $statusE  = $esc($status);
+        $originE  = $esc($origin);
+        $roomSql  = $roomId === null ? "NULL" : (string)((int)$roomId);
+
         $ok = $conn->query("
           INSERT INTO schedules
             (school_year, semester, subj_id, prof_id, schedule_type, start_time, end_time, room_id, section_id, days, status, origin)
           VALUES
-            ('{$sy}','{$sem}', {$subjId}, {$profId}, '{$esc($scheduleType)}', '{$sE}', '{$eE}', {$roomId}, {$secId},
-             JSON_ARRAY('{$best['day']}'), '{$esc($status)}', '{$esc($origin)}')
+            ('{$sy}','{$sem}', {$subjId}, {$profId}, '{$schTypeE}', '{$sE}', '{$eE}', {$roomSql}, {$secId},
+             JSON_ARRAY('{$best['day']}'), '{$statusE}', '{$originE}')
         ");
         if ($ok === false) throw new Exception("Insert failed: ".$conn->error);
 
@@ -408,6 +462,7 @@ try {
     "details"=>[
       "conflicts"=>$conflicts,
       "noEligible"=>$noEligible,
+      "fixedInserted"=>$fixedInserted,
       "params"=>[
         "school_year"=>$schoolYear,
         "semester"=>$semester,
@@ -421,7 +476,8 @@ try {
         "ignoreExistingMinutes"=>$ignoreExisting,
         "seedFrom"=>$seedFrom,
         "lunchStart"=>$lunchStart,
-        "lunchEnd"=>$lunchEnd
+        "lunchEnd"=>$lunchEnd,
+        "addFixedBlocks"=>$addFixedBlocks
       ],
       "metrics"=>$metrics
     ]
