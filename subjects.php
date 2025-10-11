@@ -1,9 +1,9 @@
 <?php
-// subjects.php (no prepared statements)
 include 'cors_helper.php';
 handleCORS();
 
 include 'connect.php';
+require_once __DIR__ . '/system_settings_helper.php';
 
 $conn = new mysqli($host, $user, $password, $database);
 header('Content-Type: application/json; charset=utf-8');
@@ -15,25 +15,22 @@ if ($conn->connect_error) {
 }
 $conn->set_charset('utf8mb4');
 
-// ---- helpers ---------------------------------------------------------------
-function esc($conn, $val) {
-  return mysqli_real_escape_string($conn, (string)$val);
-}
-function in_arrayi($needle, $haystack) {
-  return in_array(strtolower((string)$needle), array_map('strtolower', $haystack), true);
-}
-function read_field($data, $snake, $camel, $default = null) {
-  return $data[$snake] ?? $data[$camel] ?? $default;
-}
-function read_field_multi($data, $keys, $default = null) {
-  foreach ($keys as $k) { if (array_key_exists($k, $data)) return $data[$k]; }
-  return $default;
-}
+function esc($conn, $val) { return mysqli_real_escape_string($conn, (string)$val); }
+function in_arrayi($needle, $haystack) { return in_array(strtolower((string)$needle), array_map('strtolower', $haystack), true); }
+function read_field($data, $snake, $camel, $default = null) { return $data[$snake] ?? $data[$camel] ?? $default; }
+function read_field_multi($data, $keys, $default = null) { foreach ($keys as $k) { if (array_key_exists($k, $data)) return $data[$k]; } return $default; }
 
 $ALLOWED_TYPES = ['core','applied','specialized','contextualized','elective'];
 
-// Handle different HTTP methods
 $method = $_SERVER['REQUEST_METHOD'];
+
+if ($method === 'GET' && isset($_GET['setting_key'])) {
+  $k = trim((string)$_GET['setting_key']);
+  $val = $k !== '' ? ss_get_setting($conn, $k) : null;
+  echo json_encode(["success"=>true,"setting_key"=>$k,"setting_value"=>$val]);
+  $conn->close();
+  exit();
+}
 
 switch ($method) {
   case 'GET':
@@ -43,12 +40,10 @@ switch ($method) {
       getAllSubject($conn);
     }
     break;
-
   case 'POST':
     $data = json_decode(file_get_contents('php://input'), true);
     createSubject($conn, is_array($data) ? $data : [], $ALLOWED_TYPES);
     break;
-
   case 'PUT':
     $data = json_decode(file_get_contents('php://input'), true);
     if (isset($_GET['id'])) {
@@ -58,7 +53,6 @@ switch ($method) {
       echo json_encode(['success' => false, 'status' => 'error', 'message' => 'Subject ID is required']);
     }
     break;
-
   case 'DELETE':
     if (isset($_GET['id'])) {
       deleteSubject($conn, (int)$_GET['id']);
@@ -67,72 +61,57 @@ switch ($method) {
       echo json_encode(['success' => false, 'status' => 'error', 'message' => 'Subject ID is required']);
     }
     break;
-
   default:
     http_response_code(405);
     echo json_encode(['success' => false, 'status' => 'error', 'message' => 'Method not allowed']);
     break;
 }
 
-// ---------------------------------------------------------------------------
+function current_sy_sql($conn) {
+  $sy = ss_get_current_school_year($conn);
+  $sy = $sy !== null ? trim($sy) : '';
+  return $sy === '' ? null : esc($conn, $sy);
+}
 
 function getAllSubject($conn) {
-  // ---- read optional filters ---------------------------------------------
-  $strandParam   = isset($_GET['strand']) ? trim($_GET['strand']) : null;               // e.g. "ICT" or "ICT,STEM"
-  $gradeLevel    = isset($_GET['grade_level']) ? trim($_GET['grade_level']) : (isset($_GET['grade']) ? trim($_GET['grade']) : null); // "11" | "12"
-  $typeParam     = isset($_GET['type']) ? trim($_GET['type']) : (isset($_GET['subj_type']) ? trim($_GET['subj_type']) : null);       // core|applied|...
-  $isActiveParam = isset($_GET['is_active']) ? $_GET['is_active'] : null;               // 0|1
-  $q             = isset($_GET['q']) ? trim($_GET['q']) : null;                          // free-text: code/name/desc
+  $strandParam   = isset($_GET['strand']) ? trim($_GET['strand']) : null;
+  $gradeLevel    = isset($_GET['grade_level']) ? trim($_GET['grade_level']) : (isset($_GET['grade']) ? trim($_GET['grade']) : null);
+  $typeParam     = isset($_GET['type']) ? trim($_GET['type']) : (isset($_GET['subj_type']) ? trim($_GET['subj_type']) : null);
+  $isActiveParam = isset($_GET['is_active']) ? $_GET['is_active'] : null;
+  $q             = isset($_GET['q']) ? trim($_GET['q']) : null;
 
   $where = [];
+  $syEsc = current_sy_sql($conn);
+  if ($syEsc !== null) $where[] = "s.school_year = '{$syEsc}'";
 
-  // strand filter (supports comma-separated list, case-insensitive)
   if ($strandParam !== null && $strandParam !== '') {
     $parts = array_filter(array_map('trim', explode(',', $strandParam)));
     if ($parts) {
       $in = [];
-      foreach ($parts as $p) {
-        $in[] = "LOWER('".esc($conn, $p)."')";
-      }
-      // Compare as LOWER on both sides (no prepared statements here)
+      foreach ($parts as $p) { $in[] = "LOWER('".esc($conn, $p)."')"; }
       $where[] = "LOWER(s.strand) IN (".implode(',', $in).")";
     }
   }
-
-  // grade_level filter ("11" or "12")
   if ($gradeLevel !== null && $gradeLevel !== '') {
-    // keep only allowed values
     if (in_array($gradeLevel, ['11','12'], true)) {
       $where[] = "s.grade_level = '".esc($conn, $gradeLevel)."'";
     }
   }
-
-  // type filter (subject type)
   if ($typeParam !== null && $typeParam !== '') {
     $where[] = "LOWER(s.subj_type) = LOWER('".esc($conn, $typeParam)."')";
   }
-
-  // is_active filter (0/1)
   if ($isActiveParam !== null && $isActiveParam !== '') {
     $where[] = "s.is_active = ".((int)$isActiveParam);
   }
-
-  // free-text query across code, name, description (case-insensitive)
   if ($q !== null && $q !== '') {
     $qEsc = esc($conn, $q);
     $where[] = "(s.subj_code LIKE '%{$qEsc}%' OR s.subj_name LIKE '%{$qEsc}%' OR s.subj_description LIKE '%{$qEsc}%')";
   }
 
-  // ---- base SQL -----------------------------------------------------------
   $sql = "SELECT s.*,
                  (SELECT COUNT(*) FROM schedules WHERE subj_id = s.subj_id) AS schedule_count
           FROM subjects s";
-
-  if (!empty($where)) {
-    $sql .= " WHERE ".implode(" AND ", $where);
-  }
-
-  // optional: stable ordering for UI
+  if (!empty($where)) { $sql .= " WHERE ".implode(" AND ", $where); }
   $sql .= " ORDER BY s.strand IS NULL, s.strand, s.grade_level, s.subj_code";
 
   $result = $conn->query($sql);
@@ -150,9 +129,11 @@ function getAllSubject($conn) {
         'subj_type'        => $row['subj_type'],
         'is_active'        => isset($row['is_active']) ? (int)$row['is_active'] : 1,
         'schedule_count'   => (int)$row['schedule_count'],
+        'school_year'      => $row['school_year'] ?? null
       ];
     }
-    echo json_encode(["success" => true, "status" => "success", "data" => $subjects]);
+    $currentSY = ss_get_current_school_year($conn);
+    echo json_encode(["success" => true, "status" => "success", "data" => $subjects, "current_school_year" => $currentSY]);
   } else {
     http_response_code(500);
     echo json_encode(["success" => false, "status" => "error", "message" => "Failed to fetch subjects"]);
@@ -161,11 +142,12 @@ function getAllSubject($conn) {
 
 function getSubject($conn, $id) {
   $id = (int)$id;
-
+  $syEsc = current_sy_sql($conn);
+  $syClause = $syEsc !== null ? " AND s.school_year = '{$syEsc}'" : "";
   $sql = "SELECT s.*,
                  (SELECT COUNT(*) FROM schedules WHERE subj_id = s.subj_id) AS schedule_count
           FROM subjects s
-          WHERE s.subj_id = {$id}
+          WHERE s.subj_id = {$id}{$syClause}
           LIMIT 1";
   $result = $conn->query($sql);
 
@@ -179,10 +161,10 @@ function getSubject($conn, $id) {
       'strand'          => $row['strand'],
       'subj_type'       => $row['subj_type'],
       'is_active'       => isset($row['is_active']) ? (int)$row['is_active'] : 1,
-      'schedule_count'  => (int)$row['schedule_count']
+      'schedule_count'  => (int)$row['schedule_count'],
+      'school_year'     => $row['school_year'] ?? null
     ];
 
-    // schedules list (read-only view)
     $sched_sql = "SELECT s.*, 
                          p.prof_name AS professor_name, p.subj_count AS professor_subject_count,
                          sec.section_name, sec.grade_level, sec.strand,
@@ -226,7 +208,8 @@ function getSubject($conn, $id) {
     }
     $subject['schedules'] = $schedules;
 
-    echo json_encode(["success" => true, "data" => $subject]);
+    $currentSY = ss_get_current_school_year($conn);
+    echo json_encode(["success" => true, "data" => $subject, "current_school_year" => $currentSY]);
   } else {
     http_response_code(404);
     echo json_encode(["success" => false, "message" => "Subject not found"]);
@@ -234,19 +217,15 @@ function getSubject($conn, $id) {
 }
 
 function createSubject($conn, $data, $ALLOWED_TYPES) {
-  // Accept both naming styles
   $code        = read_field($data, 'subj_code', 'code');
   $name        = read_field($data, 'subj_name', 'name');
   $description = read_field($data, 'subj_description', 'description', '');
-  $gradeLevel  = read_field($data, 'grade_level', 'gradeLevel', null);   // optional
-  $strand      = read_field($data, 'strand', 'strand', null);            // optional
+  $gradeLevel  = read_field($data, 'grade_level', 'gradeLevel', null);
+  $strand      = read_field($data, 'strand', 'strand', null);
   $subjType    = read_field_multi($data, ['subj_type','type','subjectType'], null);
   $isActive    = (int)read_field($data, 'is_active', 'isActive', 1);
 
-  // Normalize
   if (is_string($subjType)) $subjType = strtolower($subjType);
-
-  // Basic validation
   if (!$code) { http_response_code(400); echo json_encode(["success"=>false,"status"=>"error","message"=>"Missing required field: code"]); return; }
   if (!$name) { http_response_code(400); echo json_encode(["success"=>false,"status"=>"error","message"=>"Missing required field: name"]); return; }
   if ($gradeLevel !== null && !in_array($gradeLevel, ['11','12'], true)) {
@@ -256,26 +235,30 @@ function createSubject($conn, $data, $ALLOWED_TYPES) {
     http_response_code(400); echo json_encode(["success"=>false,"status"=>"error","message"=>"Invalid or missing type (allowed: ".implode(', ', $ALLOWED_TYPES).")"]); return;
   }
 
-  // Escape
-  $codeEsc  = esc($conn, $code);
-  $nameEsc  = esc($conn, $name);
-  $descEsc  = esc($conn, $description);
-  $glEsc    = $gradeLevel !== null ? "'".esc($conn, $gradeLevel)."'" : "NULL";
-  $strandEsc= $strand !== null ? "'".esc($conn, $strand)."'" : "NULL";
-  $typeEsc  = esc($conn, $subjType);
+  $codeEsc   = esc($conn, $code);
+  $nameEsc   = esc($conn, $name);
+  $descEsc   = esc($conn, $description);
+  $glEsc     = $gradeLevel !== null ? "'".esc($conn, $gradeLevel)."'" : "NULL";
+  $strandEsc = $strand !== null ? "'".esc($conn, $strand)."'" : "NULL";
+  $typeEsc   = esc($conn, $subjType);
+
+  $syEsc = current_sy_sql($conn);
+  $sySQL = $syEsc !== null ? "'{$syEsc}'" : "NULL";
 
   $sql = "INSERT INTO subjects
-            (subj_code, subj_name, subj_description, grade_level, strand, subj_type, is_active)
+            (subj_code, subj_name, subj_description, grade_level, strand, subj_type, is_active, school_year)
           VALUES
-            ('{$codeEsc}', '{$nameEsc}', '{$descEsc}', {$glEsc}, {$strandEsc}, '{$typeEsc}', {$isActive})";
+            ('{$codeEsc}', '{$nameEsc}', '{$descEsc}', {$glEsc}, {$strandEsc}, '{$typeEsc}', {$isActive}, {$sySQL})";
 
   if ($conn->query($sql)) {
     http_response_code(201);
+    $currentSY = ss_get_current_school_year($conn);
     echo json_encode([
       "success" => true,
       "status"  => "success",
       "message" => "Subject added successfully.",
-      "id"      => (int)$conn->insert_id
+      "id"      => (int)$conn->insert_id,
+      "current_school_year" => $currentSY
     ]);
   } else {
     http_response_code(500);
@@ -285,8 +268,6 @@ function createSubject($conn, $data, $ALLOWED_TYPES) {
 
 function updateSubject($conn, $id, $data, $ALLOWED_TYPES) {
   $id = (int)$id;
-
-  // Ensure exists
   $exists = $conn->query("SELECT subj_id FROM subjects WHERE subj_id = {$id} LIMIT 1");
   if (!$exists || $exists->num_rows === 0) {
     http_response_code(404);
@@ -294,7 +275,6 @@ function updateSubject($conn, $id, $data, $ALLOWED_TYPES) {
     return;
   }
 
-  // Accept both naming styles; allow partial updates
   $code        = read_field($data, 'subj_code', 'code', null);
   $name        = read_field($data, 'subj_name', 'name', null);
   $description = read_field($data, 'subj_description', 'description', null);
@@ -302,25 +282,19 @@ function updateSubject($conn, $id, $data, $ALLOWED_TYPES) {
   $strand      = read_field($data, 'strand', 'strand', null);
   $subjType    = read_field_multi($data, ['subj_type','type','subjectType'], null);
   $isActive    = read_field($data, 'is_active', 'isActive', null);
+  $schoolYear  = array_key_exists('school_year', $data) ? (string)$data['school_year'] : null;
 
   $sets = [];
-
   if ($code !== null)        $sets[] = "subj_code = '".esc($conn, $code)."'";
   if ($name !== null)        $sets[] = "subj_name = '".esc($conn, $name)."'";
   if ($description !== null) $sets[] = "subj_description = '".esc($conn, $description)."'";
-
   if ($gradeLevel !== null) {
     if (!in_array($gradeLevel, ['11','12'], true)) {
       http_response_code(400); echo json_encode(["success"=>false,"status"=>"error","message"=>"Invalid grade_level (allowed: '11','12')"]); return;
     }
     $sets[] = "grade_level = '".esc($conn, $gradeLevel)."'";
   }
-
-  if ($strand !== null) {
-    // allow empty string to clear
-    $sets[] = "strand = ".($strand === '' ? "NULL" : "'".esc($conn, $strand)."'");
-  }
-
+  if ($strand !== null)      $sets[] = "strand = ".($strand === '' ? "NULL" : "'".esc($conn, $strand)."'");
   if ($subjType !== null) {
     if (is_string($subjType)) $subjType = strtolower($subjType);
     if (!in_arrayi($subjType, $ALLOWED_TYPES)) {
@@ -328,10 +302,8 @@ function updateSubject($conn, $id, $data, $ALLOWED_TYPES) {
     }
     $sets[] = "subj_type = '".esc($conn, $subjType)."'";
   }
-
-  if ($isActive !== null) {
-    $sets[] = "is_active = ".((int)$isActive);
-  }
+  if ($isActive !== null)    $sets[] = "is_active = ".((int)$isActive);
+  if ($schoolYear !== null)  $sets[] = trim($schoolYear) === '' ? "school_year = NULL" : "school_year = '".esc($conn, $schoolYear)."'";
 
   if (!$sets) {
     echo json_encode(["success"=>false,"status"=>"error","message"=>"No fields to update"]);
@@ -339,9 +311,9 @@ function updateSubject($conn, $id, $data, $ALLOWED_TYPES) {
   }
 
   $sql = "UPDATE subjects SET ".implode(", ", $sets)." WHERE subj_id = {$id}";
-
   if ($conn->query($sql)) {
-    echo json_encode(["success"=>true,"status"=>"success","message"=>"Subject updated successfully"]);
+    $currentSY = ss_get_current_school_year($conn);
+    echo json_encode(["success"=>true,"status"=>"success","message"=>"Subject updated successfully","current_school_year"=>$currentSY]);
   } else {
     http_response_code(500);
     echo json_encode(["success"=>false,"status"=>"error","message"=>"Update failed: ".$conn->error]);
@@ -350,18 +322,16 @@ function updateSubject($conn, $id, $data, $ALLOWED_TYPES) {
 
 function deleteSubject($conn, $id) {
   $id = (int)$id;
-
-  // Ensure exists
   $exists = $conn->query("SELECT subj_id FROM subjects WHERE subj_id = {$id} LIMIT 1");
   if (!$exists || $exists->num_rows === 0) {
     http_response_code(404);
     echo json_encode(["success" => false, "message" => "Subject not found"]);
     return;
   }
-
   $sql = "DELETE FROM subjects WHERE subj_id = {$id}";
   if ($conn->query($sql)) {
-    echo json_encode(["success" => true, "message" => "Subject deleted successfully"]);
+    $currentSY = ss_get_current_school_year($conn);
+    echo json_encode(["success" => true, "message" => "Subject deleted successfully", "current_school_year"=>$currentSY]);
   } else {
     http_response_code(500);
     echo json_encode(["success" => false, "message" => "Delete failed: " . $conn->error]);
