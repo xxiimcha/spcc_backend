@@ -1,50 +1,30 @@
 <?php
-// subjects_bulk_upload.php
-// Upload Excel/CSV and insert/update the `subjects` table, now supporting:
-// code, name, description, subject type, grade level, strand, semester
-
 require_once __DIR__ . '/cors_helper.php';
 handleCORS();
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(204);
-    exit;
-}
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(204); exit; }
 
 header('Content-Type: application/json; charset=utf-8');
 
-// DB connect
 require_once __DIR__ . '/connect.php';
+require_once __DIR__ . '/system_settings_helper.php';
+
 $mysqli = new mysqli($host, $user, $password, $database);
 if ($mysqli->connect_error) {
     http_response_code(500);
-    echo json_encode([
-        "success" => false,
-        "status"  => "error",
-        "message" => "Database connection failed: " . $mysqli->connect_error
-    ]);
+    echo json_encode(["success"=>false,"status"=>"error","message"=>"Database connection failed: " . $mysqli->connect_error]);
     exit;
 }
 $mysqli->set_charset("utf8mb4");
 
-// Only POST allowed
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     http_response_code(405);
-    echo json_encode([
-        "success" => false,
-        "status"  => "error",
-        "message" => "Method not allowed. Use POST."
-    ]);
+    echo json_encode(["success"=>false,"status"=>"error","message"=>"Method not allowed. Use POST."]);
     exit;
 }
 
-// Validate upload
 if (!isset($_FILES['file']) || $_FILES['file']['error'] !== UPLOAD_ERR_OK) {
     http_response_code(400);
-    echo json_encode([
-        "success" => false,
-        "status"  => "error",
-        "message" => "No file uploaded or upload failed."
-    ]);
+    echo json_encode(["success"=>false,"status"=>"error","message"=>"No file uploaded or upload failed."]);
     exit;
 }
 
@@ -54,84 +34,46 @@ $ext      = strtolower(pathinfo($fileName, PATHINFO_EXTENSION));
 $allowed  = ['xlsx', 'xls', 'csv'];
 if (!in_array($ext, $allowed, true)) {
     http_response_code(400);
-    echo json_encode([
-        "success" => false,
-        "status"  => "error",
-        "message" => "Invalid file type. Allowed: .xlsx, .xls, .csv"
-    ]);
+    echo json_encode(["success"=>false,"status"=>"error","message"=>"Invalid file type. Allowed: .xlsx, .xls, .csv"]);
     exit;
 }
 
-// ---------- Utilities ----------
-function norm_str($s) {
-    return strtolower(trim(preg_replace('/[\s\-_]+/', ' ', (string)$s)));
-}
-
+function norm_str($s) { return strtolower(trim(preg_replace('/[\s\-_]+/', ' ', (string)$s))); }
 function normalize_header($h) {
     $h = norm_str($h);
-    // base
     if (in_array($h, ['subj code','subject code','code'], true)) return 'code';
     if (in_array($h, ['subj name','subject name','name','title'], true)) return 'name';
     if (in_array($h, ['subj description','subject description','description','desc'], true)) return 'description';
-
-    // new fields
     if (in_array($h, ['subject type','type','subj type'], true)) return 'subject type';
     if (in_array($h, ['grade level','grade_level','year level','year_level','grade'], true)) return 'grade level';
     if (in_array($h, ['strand','track/strand','track strand'], true)) return 'strand';
     if (in_array($h, ['semester','sem'], true)) return 'semester';
-
-    return $h; // fallback
+    return $h;
 }
-
-function strip_bom($s) {
-    return (substr($s, 0, 3) === "\xEF\xBB\xBF") ? substr($s, 3) : $s;
-}
-
+function strip_bom($s) { return (substr($s, 0, 3) === "\xEF\xBB\xBF") ? substr($s, 3) : $s; }
 function detect_delimiter($path) {
     $candidates = [",", ";", "\t"];
-    $h = fopen($path, 'r');
-    if (!$h) return ",";
-    $line = fgets($h);
-    fclose($h);
-    if ($line === false) return ",";
+    $h = fopen($path, 'r'); if (!$h) return ",";
+    $line = fgets($h); fclose($h); if ($line === false) return ",";
     $line = strip_bom($line);
     $best = ","; $bestCount = 0;
-    foreach ($candidates as $d) {
-        $parts = str_getcsv($line, $d);
-        if (count($parts) > $bestCount) {
-            $bestCount = count($parts);
-            $best = $d;
-        }
-    }
+    foreach ($candidates as $d) { $parts = str_getcsv($line, $d); if (count($parts) > $bestCount) { $bestCount = count($parts); $best = $d; } }
     return $best;
 }
-
-// Value normalizers (lightweight; adjust if you have strict enums)
 function normalize_semester($v) {
-    $n = norm_str($v);
-    if ($n === '' ) return '';
+    $n = norm_str($v); if ($n === '') return '';
     if (preg_match('/^1(st)?$|^first$/', $n))  return 'First Semester';
     if (preg_match('/^2(nd)?$|^second$/', $n)) return 'Second Semester';
-    // accept "summer", "midyear", etc
     if (strpos($n, 'summer') !== false) return 'Summer';
     if (strpos($n, 'mid') !== false) return 'Midyear';
-    return ucfirst($n); // fallback keep readable
+    return ucfirst($n);
 }
-function normalize_grade_level($v) {
-    $n = trim((string)$v);
-    // keep raw but trim; if numeric like "11", keep as "11"
-    return $n;
-}
-function normalize_strand($v) {
-    // common SHS strands: STEM, ABM, HUMSS, GAS, ICT, HE, IA
-    $n = strtoupper(trim((string)$v));
-    return $n;
-}
-function sanitize($v) {
-    return trim((string)$v);
-}
+function normalize_grade_level($v) { return trim((string)$v); }
+function normalize_strand($v) { return strtoupper(trim((string)$v)); }
+function sanitize($v) { return trim((string)$v); }
+function esc($db, $v) { return mysqli_real_escape_string($db, (string)$v); }
+function q($db, $v) { return ($v === null) ? "NULL" : "'" . esc($db, $v) . "'"; }
 
-// ---------- Read rows ----------
 $rows = [];
 $sheetName = null;
 
@@ -140,14 +82,11 @@ try {
         $delim = detect_delimiter($tmpPath);
         $fh = fopen($tmpPath, 'r');
         if ($fh === false) throw new Exception("Unable to open uploaded CSV.");
-
-        // header line
         $first = fgets($fh);
         if ($first === false) { fclose($fh); throw new Exception("CSV is empty."); }
         $first = strip_bom($first);
         $rawHeaders = str_getcsv($first, $delim);
         $headers    = array_map('normalize_header', $rawHeaders);
-
         while (($data = fgetcsv($fh, 0, $delim)) !== false) {
             if (!$data || count($data) === 0) continue;
             $rowAssoc = [];
@@ -160,21 +99,15 @@ try {
         fclose($fh);
         $sheetName = 'CSV';
     } else {
-        // Excel via PhpSpreadsheet
         require_once __DIR__ . '/vendor/autoload.php';
         $spreadsheet = \PhpOffice\PhpSpreadsheet\IOFactory::load($tmpPath);
         $sheet = $spreadsheet->getSheet(0);
         $sheetName = $sheet->getTitle();
         $arr = $sheet->toArray(null, true, true, true);
         if (empty($arr)) throw new Exception("The Excel file is empty.");
-
-        // headers
         $first = array_shift($arr);
         $headers = [];
-        foreach ($first as $col => $val) {
-            $headers[] = normalize_header((string)$val);
-        }
-        // data
+        foreach ($first as $col => $val) { $headers[] = normalize_header((string)$val); }
         foreach ($arr as $r) {
             $rowAssoc = [];
             $i = 0;
@@ -188,64 +121,26 @@ try {
     }
 } catch (Exception $e) {
     http_response_code(400);
-    echo json_encode([
-        "success" => false,
-        "status"  => "error",
-        "message" => "Failed to read file: " . $e->getMessage()
-    ]);
+    echo json_encode(["success"=>false,"status"=>"error","message"=>"Failed to read file: " . $e->getMessage()]);
     exit;
 }
 
-// ---------- Validate headers ----------
-// Required minimum (to remain backward compatible): code + name
-// Recommended new headers: subject type, grade level, strand, semester
-$hasCode = false; $hasName = false;
 $sampleKeys = !empty($rows) ? array_map('strtolower', array_keys($rows[0])) : [];
 $hasCode = in_array('code', $sampleKeys, true);
 $hasName = in_array('name', $sampleKeys, true);
-
 if (!$hasCode || !$hasName) {
     http_response_code(400);
-    echo json_encode([
-        "success" => false,
-        "status"  => "error",
-        "message" => "Missing required headers. Expected at least: code, name. Optional: description, subject type, grade level, strand, semester."
-    ]);
+    echo json_encode(["success"=>false,"status"=>"error","message"=>"Missing required headers. Expected at least: code, name. Optional: description, subject type, grade level, strand, semester."]);
     exit;
 }
-
-// Detect presence of new fields in this file
 $hasType   = in_array('subject type', $sampleKeys, true);
 $hasGL     = in_array('grade level',   $sampleKeys, true);
 $hasStrand = in_array('strand',        $sampleKeys, true);
 $hasSem    = in_array('semester',      $sampleKeys, true);
 
-// ---------- Prepare UPSERT ----------
-// Adjust these column names if your schema differs.
-$col_list = "subj_code, subj_name, subj_description, subj_type, grade_level, strand, semester";
-$placeholders = "?, ?, ?, ?, ?, ?, ?";
-$update_list =
-  "subj_name = VALUES(subj_name),
-   subj_description = VALUES(subj_description),
-   subj_type = VALUES(subj_type),
-   grade_level = VALUES(grade_level),
-   strand = VALUES(strand),
-   semester = VALUES(semester)";
-
-$stmt = $mysqli->prepare(
-    "INSERT INTO subjects ($col_list)
-     VALUES ($placeholders)
-     ON DUPLICATE KEY UPDATE $update_list"
-);
-if ($stmt === false) {
-    http_response_code(500);
-    echo json_encode([
-        "success" => false,
-        "status"  => "error",
-        "message" => "Failed to prepare statement: " . $mysqli->error
-    ]);
-    exit;
-}
+$currentSYRaw = ss_get_current_school_year($mysqli);
+$currentSY    = $currentSYRaw !== null ? trim($currentSYRaw) : '';
+$schoolYearForInsert = $currentSY !== '' ? $currentSY : null;
 
 $inserted = 0; $updated = 0; $skipped = 0; $errors = []; $preview = [];
 
@@ -257,32 +152,71 @@ try {
         $name = sanitize($row['name'] ?? '');
         $desc = sanitize($row['description'] ?? '');
 
-        $type = $hasType ? sanitize($row['subject type'] ?? '') : '';
-        $gl   = $hasGL   ? normalize_grade_level($row['grade level'] ?? '') : '';
+        $type = $hasType   ? sanitize($row['subject type'] ?? '') : '';
+        $gl   = $hasGL     ? normalize_grade_level($row['grade level'] ?? '') : '';
         $str  = $hasStrand ? normalize_strand($row['strand'] ?? '') : '';
-        $sem  = $hasSem ? normalize_semester($row['semester'] ?? '') : '';
+        $sem  = $hasSem    ? normalize_semester($row['semester'] ?? '') : '';
 
-        $rowNo = $idx + 2; // header at 1
-
+        $rowNo = $idx + 2;
         if ($code === '' && $name === '') { $skipped++; continue; }
-        if ($code === '' || $name === '') {
+        if ($code === '' || $name === '') { $skipped++; $errors[] = "Row {$rowNo}: Missing required 'code' or 'name'."; continue; }
+
+        $sy = $schoolYearForInsert;
+
+        $codeEsc = esc($mysqli, $code);
+        $nameEsc = esc($mysqli, $name);
+        $descEsc = esc($mysqli, $desc);
+        $typeEsc = esc($mysqli, $type);
+        $glEsc   = esc($mysqli, $gl);
+        $semEsc  = esc($mysqli, $sem);
+        $strEsc  = esc($mysqli, $str);
+
+        /* Duplicate only if ALL relevant fields match (including NULL/blank tolerance for nullable fields) */
+        $where = "
+            subj_code = '{$codeEsc}'
+            AND subj_name = '{$nameEsc}'
+            AND COALESCE(subj_description,'') = COALESCE('{$descEsc}','')
+            AND subj_type = '{$typeEsc}'
+            AND COALESCE(grade_level,'') = COALESCE('{$glEsc}','')
+            AND COALESCE(strand,'') = COALESCE('{$strEsc}','')
+            AND COALESCE(semester,'') = COALESCE('{$semEsc}','')
+            AND school_year <=> " . q($mysqli, $sy) . "
+        ";
+
+        $checkSql = "SELECT subj_id FROM subjects WHERE {$where} LIMIT 1";
+        $dupRes = $mysqli->query($checkSql);
+        if ($dupRes === false) {
             $skipped++;
-            $errors[] = "Row {$rowNo}: Missing required 'code' or 'name'.";
+            $errors[] = "Row {$rowNo}: DB check error - " . $mysqli->error;
+            continue;
+        }
+        if ($dupRes->num_rows > 0) {
+            $skipped++; // duplicate only when EVERYTHING matches
             continue;
         }
 
-        // Bind and execute (7 columns)
-        $stmt->bind_param('sssssss', $code, $name, $desc, $type, $gl, $str, $sem);
-        if (!$stmt->execute()) {
+        $glVal  = ($gl === '') ? "NULL" : "'{$glEsc}'";
+        $strVal = ($str === '') ? "NULL" : "'{$strEsc}'";
+        $semVal = ($sem === '') ? "NULL" : "'{$semEsc}'";
+        $syVal  = q($mysqli, $sy);
+
+        $insSql = "
+            INSERT INTO subjects
+                (subj_code, subj_name, subj_description, subj_type, grade_level, strand, semester, school_year)
+            VALUES
+                ('{$codeEsc}', '{$nameEsc}', '{$descEsc}', '{$typeEsc}', {$glVal}, {$strVal}, {$semVal}, {$syVal})
+        ";
+
+        if (!$mysqli->query($insSql)) {
             $skipped++;
-            $errors[] = "Row {$rowNo}: DB error - " . $stmt->error;
+            $errors[] = "Row {$rowNo}: Insert blocked by existing unique constraint. "
+                      . "To enforce exactly-this-duplicate rule at DB level, create a composite UNIQUE index on "
+                      . "(subj_code, subj_name, subj_description, subj_type, grade_level, strand, semester, school_year). "
+                      . "Error: " . $mysqli->error;
             continue;
         }
 
-        // affected_rows: 1 insert, 2 update
-        if ($stmt->affected_rows === 1) $inserted++;
-        elseif ($stmt->affected_rows === 2) $updated++;
-        else $skipped++;
+        $inserted++;
 
         if (count($preview) < 10) {
             $preview[] = [
@@ -292,7 +226,8 @@ try {
                 'subject_type' => $type,
                 'grade_level' => $gl,
                 'strand' => $str,
-                'semester' => $sem
+                'semester' => $sem,
+                'school_year' => $sy
             ];
         }
     }
@@ -311,17 +246,13 @@ try {
             "skipped"   => $skipped,
             "sample"    => $preview,
             "errors"    => $errors
-        ]
+        ],
+        "current_school_year" => $currentSY
     ]);
 } catch (Exception $e) {
     $mysqli->rollback();
     http_response_code(500);
-    echo json_encode([
-        "success" => false,
-        "status"  => "error",
-        "message" => "Transaction failed: " . $e->getMessage()
-    ]);
+    echo json_encode(["success"=>false,"status"=>"error","message"=>"Transaction failed: " . $e->getMessage()]);
 } finally {
-    $stmt->close();
     $mysqli->close();
 }
