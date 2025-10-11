@@ -46,15 +46,26 @@ function fetchSubjectsByIds($conn, $ids) {
     $safe = array_values(array_unique(array_filter(array_map(fn($v)=>(int)$v, $ids), fn($v)=>$v>0)));
     if (empty($safe)) return [];
     $in = implode(',', $safe);
-    $sql = "SELECT subj_id, subj_code, subj_name FROM subjects WHERE subj_id IN ($in) ORDER BY subj_name ASC";
+
+    // NOTE: grade_level + strand come straight from subjects
+    $sql = "
+        SELECT subj_id, subj_code, subj_name, grade_level, strand
+        FROM subjects
+        WHERE subj_id IN ($in)
+        ORDER BY 
+          CASE WHEN grade_level REGEXP '^[0-9]+$' THEN CAST(grade_level AS UNSIGNED) ELSE 999 END ASC,
+          strand ASC, subj_name ASC
+    ";
     $res = $conn->query($sql);
     $out = [];
     if ($res) {
         while($row = $res->fetch_assoc()) {
             $out[] = [
-                'subj_id'   => (int)$row['subj_id'],
-                'subj_code' => $row['subj_code'],
-                'subj_name' => $row['subj_name'],
+                'subj_id'     => (int)$row['subj_id'],
+                'subj_code'   => $row['subj_code'],
+                'subj_name'   => $row['subj_name'],
+                'grade_level' => $row['grade_level'] ?? null,
+                'strand'      => $row['strand'] ?? null,
             ];
         }
     }
@@ -296,6 +307,11 @@ function getAllProfessors(mysqli $conn) {
     $professors = [];
     if ($result) {
         while ($row = $result->fetch_assoc()) {
+            // derive count from JSON, ignore bad/empty values safely
+            $ids = json_decode($row['prof_subject_ids'] ?? '[]', true);
+            if (!is_array($ids)) { $ids = []; }
+            $derivedCount = count(array_filter(array_map('intval', $ids), fn($v) => $v > 0));
+
             $professors[] = [
                 'prof_id'        => (int)$row['prof_id'],
                 'prof_name'      => $row['prof_name'],
@@ -304,9 +320,9 @@ function getAllProfessors(mysqli $conn) {
                 'prof_username'  => $row['prof_username'],
                 'prof_password'  => $row['prof_password'],
                 'qualifications' => json_decode($row['prof_qualifications'] ?? '[]', true) ?: [],
-                // ✅ normalize key name expected by your frontend
-                'subject_ids'    => json_decode($row['prof_subject_ids'] ?? '[]', true) ?: [],
-                'subj_count'     => (int)$row['subj_count'],
+                'subject_ids'    => $ids,
+                // prefer the derived count; fall back to stored value if needed
+                'subj_count'     => $derivedCount > 0 ? $derivedCount : (int)($row['subj_count'] ?? 0),
             ];
         }
     }
