@@ -211,7 +211,7 @@ function createProfessor(mysqli $conn, array $data) {
     $subjects_json = mysqli_real_escape_string($conn, json_encode(array_map('intval', $subjIds)));
     $subj_count    = is_array($subjIds) ? count($subjIds) : 0;
 
-    $schoolYear    = ss_get_current_school_year($conn);                       // <-- fetch
+    $schoolYear    = ss_get_current_school_year($conn);
     $schoolYearSQL = $schoolYear !== null ? "'" . mysqli_real_escape_string($conn, $schoolYear) . "'" : "NULL";
 
     $sql = "
@@ -272,7 +272,7 @@ function updateProfessor(mysqli $conn, int $id, array $data) {
     $set[] = "prof_subject_ids='$subjects_json'";
     $set[] = "subj_count=$subj_count";
 
-    if (array_key_exists('school_year', $data)) {                              // optional override
+    if (array_key_exists('school_year', $data)) {
         $sy = trim((string)$data['school_year']);
         if ($sy === '') {
             $set[] = "school_year=NULL";
@@ -307,7 +307,23 @@ function deleteProfessor(mysqli $conn, int $id) {
 }
 
 function getAllProfessors(mysqli $conn) {
-    $sql = "SELECT * FROM professors ORDER BY prof_id ASC";
+    $requestedSY = isset($_GET['school_year']) ? trim((string)$_GET['school_year']) : '';
+    $currentSY   = ss_get_current_school_year($conn);
+
+    if ($requestedSY === '' || strtolower($requestedSY) === 'current') {
+        $filterSY = $currentSY;
+    } elseif (strtolower($requestedSY) === 'all') {
+        $filterSY = null;
+    } else {
+        $filterSY = $requestedSY;
+    }
+
+    $sql = "SELECT * FROM professors";
+    if ($filterSY !== null) {
+        $sql .= " WHERE school_year " . ($filterSY === '' ? "IS NULL" : "= '" . mysqli_real_escape_string($conn, $filterSY) . "'") ;
+    }
+    $sql .= " ORDER BY prof_id ASC";
+
     $result = $conn->query($sql);
     $professors = [];
     if ($result) {
@@ -329,8 +345,12 @@ function getAllProfessors(mysqli $conn) {
             ];
         }
     }
-    $currentSY = ss_get_current_school_year($conn);
-    echo json_encode(["success"=>true,"data"=>$professors,"current_school_year"=>$currentSY]);
+    echo json_encode([
+        "success"=>true,
+        "data"=>$professors,
+        "current_school_year"=>$currentSY,
+        "applied_school_year"=>$filterSY === null ? "all" : ($filterSY ?? "")
+    ]);
 }
 
 function getProfessor(mysqli $conn, int $id) {
