@@ -1,14 +1,10 @@
 <?php
-// firebase_sync_lib.php
 require_once __DIR__ . '/firebase_config.php';
 
 class FirebaseSync {
-    /** Enable simple file logging (toggle to true while debugging) */
-    private const LOG_ENABLED = false; // set to true to generate logs/firebase_sync.log
+    private const LOG_ENABLED = false;
 
-    /** @var mixed An object exposing ->setData($path, $payloadOrNull) */
     private $firebaseConfig;
-    /** @var mysqli */
     private $conn;
 
     public function __construct($firebaseConfig, mysqli $conn) {
@@ -16,9 +12,6 @@ class FirebaseSync {
         $this->conn = $conn;
     }
 
-    /** --------- Utilities ---------- */
-
-    /** Ensure path has no leading slash so setData() never receives "//..." */
     private function normPath(string $p): string {
         return ltrim($p, "/");
     }

@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+
 function ss_get_setting(mysqli $conn, string $key): ?string {
     if ($key === '') return null;
 
@@ -36,4 +37,16 @@ function ss_get_settings(mysqli $conn, array $keys): array {
 
 function ss_get_current_school_year(mysqli $conn): ?string {
     return ss_get_setting($conn, 'current_school_year');
+}
+
+function ss_get_current_semester(mysqli $conn): ?string {
+    return ss_get_setting($conn, 'current_semester');
+}
+
+function ss_get_current_school_info(mysqli $conn): array {
+    $settings = ss_get_settings($conn, ['current_school_year', 'current_semester']);
+    return [
+        'school_year' => $settings['current_school_year'] ?? null,
+        'semester' => $settings['current_semester'] ?? null,
+    ];
 }

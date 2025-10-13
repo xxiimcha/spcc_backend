@@ -6,7 +6,7 @@ class FirebaseConfig {
 
     public function __construct() {
         $this->databaseUrl = 'https://spcc-database-default-rtdb.firebaseio.com';
-        $this->authToken   = ''; // e.g. 'eyJhbGciOi...' or leave '' if rules are public
+        $this->authToken   = ''; 
     }
 
     private function buildUrl(string $path): string {

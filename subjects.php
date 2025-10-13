@@ -17,7 +17,6 @@ if ($conn->connect_error) {
 }
 $conn->set_charset('utf8mb4');
 
-/** Firebase sync helper — same style as your professors endpoint */
 function firebaseSync(mysqli $conn): FirebaseSync {
     global $firebaseConfig; // from firebase_config.php
     return new FirebaseSync($firebaseConfig, $conn);
