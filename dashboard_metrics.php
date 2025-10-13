@@ -9,57 +9,66 @@ header("Access-Control-Allow-Credentials: true");
 header("Content-Type: application/json");
 
 // Handle OPTIONS preflight request
-if($_SERVER['REQUEST_METHOD'] == 'OPTIONS'){
+if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
     exit(0);
 }
 
 include 'connect.php';
+require_once __DIR__ . '/system_settings_helper.php'; // ✅ import helper
 
-// Function to get metrics for dashboard
 function getDashboardMetrics($conn) {
     $metrics = [
-        'totalSchedules' => 0,
+        'totalSchedules'  => 0,
         'totalProfessors' => 0,
-        'totalSubjects' => 0,
-        'totalRooms' => 0,
-        'totalSections' => 0
+        'totalSubjects'   => 0,
+        'totalRooms'      => 0,
+        'totalSections'   => 0,
+        'schoolYear'      => null
     ];
-    
-    // Get total schedules
-    $sql = "SELECT COUNT(*) as count FROM schedules";
+
+    // ✅ Get current school year from system settings
+    $schoolYear = ss_get_current_school_year($conn);
+    $metrics['schoolYear'] = $schoolYear;
+
+    if (!$schoolYear) {
+        return $metrics;
+    }
+
+    // Get total schedules for that school year
+    $sql = "SELECT COUNT(*) as count FROM schedules WHERE school_year = '$schoolYear'";
     $result = $conn->query($sql);
     if ($result && $row = $result->fetch_assoc()) {
         $metrics['totalSchedules'] = (int)$row['count'];
     }
-    
-    // Get total professors
-    $sql = "SELECT COUNT(*) as count FROM professors";
+
+    // Get total professors for that school year (only if professors table has school_year)
+    $sql = "SELECT COUNT(*) as count FROM professors WHERE school_year = '$schoolYear'";
     $result = $conn->query($sql);
     if ($result && $row = $result->fetch_assoc()) {
         $metrics['totalProfessors'] = (int)$row['count'];
     }
-    
-    // Get total subjects
-    $sql = "SELECT COUNT(*) as count FROM subjects";
+
+    // Get total subjects for that school year (only if subjects table has school_year)
+    $sql = "SELECT COUNT(*) as count FROM subjects WHERE school_year = '$schoolYear'";
     $result = $conn->query($sql);
     if ($result && $row = $result->fetch_assoc()) {
         $metrics['totalSubjects'] = (int)$row['count'];
     }
 
-    // Get total rooms
-    $sql = "SELECT COUNT(*) as count FROM rooms";
+    // Get total rooms for that school year (only if rooms table has school_year)
+    $sql = "SELECT COUNT(*) as count FROM rooms WHERE school_year = '$schoolYear'";
     $result = $conn->query($sql);
     if ($result && $row = $result->fetch_assoc()) {
         $metrics['totalRooms'] = (int)$row['count'];
     }
 
-    // Get total sections
-    $sql = "SELECT COUNT(*) as count FROM sections";
+    // Get total sections for that school year (only if sections table has school_year)
+    $sql = "SELECT COUNT(*) as count FROM sections WHERE school_year = '$schoolYear'";
     $result = $conn->query($sql);
     if ($result && $row = $result->fetch_assoc()) {
         $metrics['totalSections'] = (int)$row['count'];
     }
-    
+
     return $metrics;
 }
 
@@ -86,6 +95,5 @@ if ($_SERVER['REQUEST_METHOD'] == 'GET') {
     ]);
 }
 
-// Close the connection
 $conn->close();
 ?>

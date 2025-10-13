@@ -4,11 +4,18 @@ handleCORS();
 
 include 'connect.php';
 require_once __DIR__ . '/system_settings_helper.php';
+require_once __DIR__ . '/firebase_config.php';
+require_once __DIR__ . '/firebase_sync_lib.php';
 
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\Exception;
 
 require __DIR__ . '/vendor/autoload.php';
+
+function firebaseSync(mysqli $conn): FirebaseSync {
+    global $firebaseConfig; // from firebase_config.php
+    return new FirebaseSync($firebaseConfig, $conn);
+}
 
 function read_json_body(): array {
     $raw = file_get_contents('php://input');
@@ -227,6 +234,9 @@ function createProfessor(mysqli $conn, array $data) {
 
     $id = $conn->insert_id;
 
+    // 🔄 Firebase: sync just this professor
+    $syncResult = firebaseSync($conn)->syncSingleProfessor($id);
+
     $subjectRows = fetchSubjectsByIds($conn, $subjIds);
     $emailResult = $email !== ''
         ? sendWelcomeProfessorEmail(
@@ -237,7 +247,13 @@ function createProfessor(mysqli $conn, array $data) {
           )
         : ['sent'=>false,'message'=>'No email'];
 
-    echo json_encode(["status"=>"success","message"=>"Professor added","id"=>$id,"email"=>$emailResult]);
+    echo json_encode([
+        "status"=>"success",
+        "message"=>"Professor added",
+        "id"=>$id,
+        "email"=>$emailResult,
+        "firebase_sync"=>$syncResult
+    ]);
 }
 
 function updateProfessor(mysqli $conn, int $id, array $data) {
@@ -288,7 +304,15 @@ function updateProfessor(mysqli $conn, int $id, array $data) {
         return;
     }
 
-    echo json_encode(["status"=>"success","message"=>"Professor updated","id"=>$id]);
+    // 🔄 Firebase: sync just this professor
+    $syncResult = firebaseSync($conn)->syncSingleProfessor($id);
+
+    echo json_encode([
+        "status"=>"success",
+        "message"=>"Professor updated",
+        "id"=>$id,
+        "firebase_sync"=>$syncResult
+    ]);
 }
 
 function deleteProfessor(mysqli $conn, int $id) {
@@ -303,7 +327,15 @@ function deleteProfessor(mysqli $conn, int $id) {
         echo json_encode(["status"=>"error","message"=>$conn->error]);
         return;
     }
-    echo json_encode(["status"=>"success","message"=>"Professor deleted"]);
+
+    // 🔄 Firebase: remove this professor
+    $syncResult = firebaseSync($conn)->deleteProfessorInFirebase($id);
+
+    echo json_encode([
+        "status"=>"success",
+        "message"=>"Professor deleted",
+        "firebase_sync"=>$syncResult
+    ]);
 }
 
 function getAllProfessors(mysqli $conn) {
