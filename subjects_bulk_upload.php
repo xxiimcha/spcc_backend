@@ -8,6 +8,13 @@ header('Content-Type: application/json; charset=utf-8');
 require_once __DIR__ . '/connect.php';
 require_once __DIR__ . '/system_settings_helper.php';
 
+require_once __DIR__ . '/firebase_config.php';
+require_once __DIR__ . '/firebase_sync_lib.php';
+function firebaseSync(mysqli $db): FirebaseSync {
+    global $firebaseConfig; // from firebase_config.php
+    return new FirebaseSync($firebaseConfig, $db);
+}
+
 $mysqli = new mysqli($host, $user, $password, $database);
 if ($mysqli->connect_error) {
     http_response_code(500);
@@ -143,6 +150,7 @@ $currentSY    = $currentSYRaw !== null ? trim($currentSYRaw) : '';
 $schoolYearForInsert = $currentSY !== '' ? $currentSY : null;
 
 $inserted = 0; $updated = 0; $skipped = 0; $errors = []; $preview = [];
+$syncSynced = 0; $syncFailed = 0;
 
 $mysqli->begin_transaction();
 
@@ -191,7 +199,7 @@ try {
             continue;
         }
         if ($dupRes->num_rows > 0) {
-            $skipped++; // duplicate only when EVERYTHING matches
+            $skipped++; // exact duplicate
             continue;
         }
 
@@ -217,6 +225,21 @@ try {
         }
 
         $inserted++;
+
+        // Firebase sync for the new subject (same style as your endpoints)
+        $newId = (int)$mysqli->insert_id;
+        try {
+            $syncResult = firebaseSync($mysqli)->syncSingleSubject($newId);
+            // If your sync method returns a 'success' field, we can count it; otherwise assume ok when no exception
+            if (is_array($syncResult) && array_key_exists('success', $syncResult)) {
+                if ($syncResult['success']) $syncSynced++; else { $syncFailed++; $errors[] = "Row {$rowNo}: Firebase sync reported failure."; }
+            } else {
+                $syncSynced++; // no exception => treat as success
+            }
+        } catch (Throwable $e) {
+            $syncFailed++;
+            $errors[] = "Row {$rowNo}: Firebase sync error - " . $e->getMessage();
+        }
 
         if (count($preview) < 10) {
             $preview[] = [
@@ -246,6 +269,10 @@ try {
             "skipped"   => $skipped,
             "sample"    => $preview,
             "errors"    => $errors
+        ],
+        "firebase_sync" => [
+            "synced" => $syncSynced,
+            "failed" => $syncFailed
         ],
         "current_school_year" => $currentSY
     ]);

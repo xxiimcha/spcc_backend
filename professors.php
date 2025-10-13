@@ -234,7 +234,6 @@ function createProfessor(mysqli $conn, array $data) {
 
     $id = $conn->insert_id;
 
-    // 🔄 Firebase: sync just this professor
     $syncResult = firebaseSync($conn)->syncSingleProfessor($id);
 
     $subjectRows = fetchSubjectsByIds($conn, $subjIds);
@@ -304,7 +303,6 @@ function updateProfessor(mysqli $conn, int $id, array $data) {
         return;
     }
 
-    // 🔄 Firebase: sync just this professor
     $syncResult = firebaseSync($conn)->syncSingleProfessor($id);
 
     echo json_encode([
@@ -328,7 +326,6 @@ function deleteProfessor(mysqli $conn, int $id) {
         return;
     }
 
-    // 🔄 Firebase: remove this professor
     $syncResult = firebaseSync($conn)->deleteProfessorInFirebase($id);
 
     echo json_encode([

@@ -4,6 +4,8 @@ handleCORS();
 
 include 'connect.php';
 require_once __DIR__ . '/system_settings_helper.php';
+require_once __DIR__ . '/firebase_config.php';
+require_once __DIR__ . '/firebase_sync_lib.php';
 
 $conn = new mysqli($host, $user, $password, $database);
 header('Content-Type: application/json; charset=utf-8');
@@ -15,12 +17,18 @@ if ($conn->connect_error) {
 }
 $conn->set_charset('utf8mb4');
 
+/** Firebase sync helper — same style as your professors endpoint */
+function firebaseSync(mysqli $conn): FirebaseSync {
+    global $firebaseConfig; // from firebase_config.php
+    return new FirebaseSync($firebaseConfig, $conn);
+}
+
 function esc($conn, $val) { return mysqli_real_escape_string($conn, (string)$val); }
 function in_arrayi($needle, $haystack) { return in_array(strtolower((string)$needle), array_map('strtolower', $haystack), true); }
 function read_field($data, $snake, $camel, $default = null) { return $data[$snake] ?? $data[$camel] ?? $default; }
 function read_field_multi($data, $keys, $default = null) { foreach ($keys as $k) { if (array_key_exists($k, $data)) return $data[$k]; } return $default; }
 
-$ALLOWED_TYPES = ['core','applied','specialized','contextualized','elective'];
+$ALLOWED_TYPES = ['Core','Specialized','Contextualized'];
 
 $method = $_SERVER['REQUEST_METHOD'];
 
@@ -251,14 +259,20 @@ function createSubject($conn, $data, $ALLOWED_TYPES) {
             ('{$codeEsc}', '{$nameEsc}', '{$descEsc}', {$glEsc}, {$strandEsc}, '{$typeEsc}', {$isActive}, {$sySQL})";
 
   if ($conn->query($sql)) {
+    $newId = (int)$conn->insert_id;
+
+    /** Firebase sync — same style as professors */
+    $syncResult = firebaseSync($conn)->syncSingleSubject($newId);
+
     http_response_code(201);
     $currentSY = ss_get_current_school_year($conn);
     echo json_encode([
       "success" => true,
       "status"  => "success",
       "message" => "Subject added successfully.",
-      "id"      => (int)$conn->insert_id,
-      "current_school_year" => $currentSY
+      "id"      => $newId,
+      "current_school_year" => $currentSY,
+      "firebase_sync" => $syncResult
     ]);
   } else {
     http_response_code(500);
@@ -312,8 +326,17 @@ function updateSubject($conn, $id, $data, $ALLOWED_TYPES) {
 
   $sql = "UPDATE subjects SET ".implode(", ", $sets)." WHERE subj_id = {$id}";
   if ($conn->query($sql)) {
+    /** Firebase sync — same style as professors */
+    $syncResult = firebaseSync($conn)->syncSingleSubject($id);
+
     $currentSY = ss_get_current_school_year($conn);
-    echo json_encode(["success"=>true,"status"=>"success","message"=>"Subject updated successfully","current_school_year"=>$currentSY]);
+    echo json_encode([
+      "success"=>true,
+      "status"=>"success",
+      "message"=>"Subject updated successfully",
+      "current_school_year"=>$currentSY,
+      "firebase_sync"=>$syncResult
+    ]);
   } else {
     http_response_code(500);
     echo json_encode(["success"=>false,"status"=>"error","message"=>"Update failed: ".$conn->error]);
@@ -330,8 +353,16 @@ function deleteSubject($conn, $id) {
   }
   $sql = "DELETE FROM subjects WHERE subj_id = {$id}";
   if ($conn->query($sql)) {
+    /** Firebase sync — same style as professors */
+    $syncResult = firebaseSync($conn)->deleteSubjectInFirebase($id);
+
     $currentSY = ss_get_current_school_year($conn);
-    echo json_encode(["success" => true, "message" => "Subject deleted successfully", "current_school_year"=>$currentSY]);
+    echo json_encode([
+      "success" => true,
+      "message" => "Subject deleted successfully",
+      "current_school_year"=>$currentSY,
+      "firebase_sync"=>$syncResult
+    ]);
   } else {
     http_response_code(500);
     echo json_encode(["success" => false, "message" => "Delete failed: " . $conn->error]);
