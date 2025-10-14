@@ -12,18 +12,19 @@ header("Content-Type: application/json");
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { exit(0); }
 
 include 'connect.php';
+include 'activity_logger.php';
+
 $conn = new mysqli($host, $user, $password, $database);
 if ($conn->connect_error) {
+  @log_activity($conn, 'sections', 'error', 'DB connection failed: '.$conn->connect_error, null, null);
   http_response_code(500);
   echo json_encode(["status" => "error", "message" => "Database connection failed: ".$conn->connect_error]);
   exit();
 }
 mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
 
-// ---- bring in system settings
 require_once __DIR__ . '/system_settings_helper.php';
 
-// ---- tiny helpers
 function q(mysqli $c, $v): string { return "'".$c->real_escape_string((string)$v)."'"; }
 function ok($payload, int $code=200): void { http_response_code($code); echo json_encode($payload); }
 function fail(string $msg, int $code=400, array $extra=[]): void {
@@ -47,7 +48,6 @@ function parseSubjectIds(?string $raw): array {
   $tmp = json_decode($raw,true); return is_array($tmp) ? array_values(array_map('intval',$tmp)) : [];
 }
 
-// ---- routing
 $method = $_SERVER['REQUEST_METHOD'];
 
 switch ($method) {
@@ -58,19 +58,19 @@ switch ($method) {
 
   case 'POST':
     $data = json_decode(file_get_contents('php://input'), true);
-    if (!$data) { fail("Invalid JSON data", 400); break; }
+    if (!$data) { @log_activity($conn,'sections','create','FAILED create: invalid JSON',null,null); fail("Invalid JSON data", 400); break; }
     createSection($conn, $data);
     break;
 
   case 'PUT':
-    if (!isset($_GET['id'])) { fail("Section ID is required", 400); break; }
+    if (!isset($_GET['id'])) { @log_activity($conn,'sections','update','FAILED update: missing ID',null,null); fail("Section ID is required", 400); break; }
     $data = json_decode(file_get_contents('php://input'), true);
-    if (!$data) { fail("Invalid JSON data", 400); break; }
+    if (!$data) { @log_activity($conn,'sections','update','FAILED update ID '.$_GET['id'].': invalid JSON',(int)$_GET['id'],null); fail("Invalid JSON data", 400); break; }
     updateSection($conn, (int)$_GET['id'], $data);
     break;
 
   case 'DELETE':
-    if (!isset($_GET['id'])) { fail("Section ID is required", 400); break; }
+    if (!isset($_GET['id'])) { @log_activity($conn,'sections','delete','FAILED delete: missing ID',null,null); fail("Section ID is required", 400); break; }
     deleteSection($conn, (int)$_GET['id']);
     break;
 
@@ -79,10 +79,7 @@ switch ($method) {
     break;
 }
 
-// ---- handlers
-
 function getAllSections(mysqli $conn): void {
-  // optional filter: ?school_year=current|all|<exact>
   $requestedSY = isset($_GET['school_year']) ? trim((string)$_GET['school_year']) : '';
   $currentSY   = ss_get_current_school_year($conn);
 
@@ -123,6 +120,7 @@ function getAllSections(mysqli $conn): void {
     ];
   }
 
+  @log_activity($conn, 'sections', 'read', 'Listed sections (count='.count($sections).', filter='.$requestedSY.')', null, null);
   ok(["success"=>true,"data"=>$sections,"current_school_year"=>$currentSY,"applied_school_year"=>$requestedSY===''?'(none)':$requestedSY]);
 }
 
@@ -138,7 +136,7 @@ function getSection(mysqli $conn, int $id): void {
           GROUP BY s.section_id";
   $result = $conn->query($sql);
 
-  if (!$result || $result->num_rows === 0) { fail("Section not found", 404); return; }
+  if (!$result || $result->num_rows === 0) { @log_activity($conn,'sections','read','FAILED view: section not found (ID '.$id.')',$id,null); fail("Section not found", 404); return; }
 
   $row = $result->fetch_assoc();
 
@@ -156,7 +154,6 @@ function getSection(mysqli $conn, int $id): void {
     'school_year'        => $row['school_year'] ?? null,
   ];
 
-  // pull schedules + days
   $schedules_sql = "SELECT s.*, subj.subj_code, subj.subj_name,
                     p.prof_name AS professor_name, p.subj_count AS professor_subject_count,
                     r.room_number, r.room_type, r.room_capacity
@@ -190,6 +187,7 @@ function getSection(mysqli $conn, int $id): void {
   }
 
   $section['schedules'] = $schedules;
+  @log_activity($conn,'sections','read','Viewed section ID: '.$id,$id,null);
   ok(["success"=>true,"data"=>$section]);
 }
 
@@ -218,7 +216,6 @@ function createSection(mysqli $conn, array $data): void {
       }
     }
 
-    // school_year from settings
     $schoolYear    = ss_get_current_school_year($conn);
     $schoolYearSQL = $schoolYear !== null ? q($conn,$schoolYear) : "NULL";
 
@@ -258,9 +255,11 @@ function createSection(mysqli $conn, array $data): void {
     ];
 
     $conn->commit();
+    @log_activity($conn,'sections','create','Created section: '.$name.' (ID: '.$sectionId.') | SY: '.($schoolYear ?? 'NULL'),$sectionId,null);
     ok(["status"=>"success","message"=>"Section added successfully","section"=>$section], 201);
   } catch (Throwable $e) {
     $conn->rollback();
+    @log_activity($conn,'sections','create','FAILED create: '.$e->getMessage(),null,null);
     fail("Error: ".$e->getMessage(), 500);
   }
 }
@@ -269,7 +268,7 @@ function updateSection(mysqli $conn, int $id, array $data): void {
   $conn->begin_transaction();
   try {
     $curRes = $conn->query("SELECT * FROM sections WHERE section_id = $id");
-    if ($curRes->num_rows === 0) throw new Exception("Section not found");
+    if ($curRes->num_rows === 0) { throw new Exception("Section not found"); }
 
     $sets = [];
 
@@ -307,14 +306,13 @@ function updateSection(mysqli $conn, int $id, array $data): void {
         $ids = array_values(array_unique(array_filter(array_map('intval', $data['subj_ids']), fn($v)=>$v>0)));
         $json = json_encode($ids, JSON_UNESCAPED_UNICODE);
       } elseif (is_string($data['subj_ids']) && trim($data['subj_ids']) !== '') {
-        $json = trim($data['subj_ids']); // assume valid JSON
+        $json = trim($data['subj_ids']);
       } else {
         $json = '[]';
       }
       $sets[] = "subject_ids = ".q($conn,$json);
     }
 
-    // (optional) allow updating school_year
     if (array_key_exists('school_year', $data)) {
       $sy = trim((string)$data['school_year']);
       $sets[] = "school_year = ".($sy==='' ? "NULL" : q($conn,$sy));
@@ -360,22 +358,24 @@ function updateSection(mysqli $conn, int $id, array $data): void {
     ];
 
     $conn->commit();
+    @log_activity($conn,'sections','update','Updated section ID: '.$id,$id,null);
     ok(["success"=>true, "status"=>"success", "message"=>"Section updated successfully", "section"=>$out]);
   } catch (Throwable $e) {
     $conn->rollback();
+    @log_activity($conn,'sections','update','FAILED update ID '.$id.': '.$e->getMessage(),$id,null);
     fail("Error: ".$e->getMessage(), 500);
   }
 }
 
 function deleteSection(mysqli $conn, int $id): void {
-  // default cascade from settings unless ?cascade explicitly provided
   $cascade = isset($_GET['cascade']) ? ($_GET['cascade']=='1') : ss_bool('sections_delete_cascade_default', false);
 
   $exists = $conn->query("SELECT section_id FROM sections WHERE section_id = $id")->num_rows > 0;
-  if (!$exists) { fail("Section not found", 404); return; }
+  if (!$exists) { @log_activity($conn,'sections','delete','FAILED delete: section not found (ID '.$id.')',$id,null); fail("Section not found", 404); return; }
 
   $c = (int)($conn->query("SELECT COUNT(*) AS c FROM schedules WHERE section_id = $id")->fetch_assoc()['c'] ?? 0);
   if ($c > 0 && !$cascade) {
+    @log_activity($conn,'sections','delete','FAILED delete ID '.$id.': has '.$c.' schedules, cascade not allowed',$id,null);
     fail("This section is referenced by $c schedule(s). Delete them first or pass cascade=1.", 409);
     return;
   }
@@ -390,9 +390,11 @@ function deleteSection(mysqli $conn, int $id): void {
     $conn->query("DELETE FROM sections WHERE section_id = $id");
 
     $conn->commit();
+    @log_activity($conn,'sections','delete','Deleted section ID: '.$id.' (cascade='.(int)$cascade.')',$id,null);
     ok(["success"=>true, "status"=>"success", "message"=>"Section deleted successfully"]);
   } catch (Throwable $e) {
     $conn->rollback();
+    @log_activity($conn,'sections','delete','FAILED delete ID '.$id.': '.$e->getMessage(),$id,null);
     fail("Error: ".$e->getMessage(), 500);
   }
 }

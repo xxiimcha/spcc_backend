@@ -1,81 +1,80 @@
 <?php
-// rooms.php - API endpoint for room management (no prepared statements) + school_year + semester support
-
-// Enable CORS
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
 header("Access-Control-Allow-Headers: Content-Type, Authorization");
 header("Access-Control-Allow-Credentials: true");
 header("Content-Type: application/json");
 
-// Handle OPTIONS preflight request
 if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
     exit(0);
 }
 
-// Database connection
 include 'connect.php';
-$conn = new mysqli($host, $user, $password, $database);
+include 'activity_logger.php';
 
+$conn = new mysqli($host, $user, $password, $database);
 if ($conn->connect_error) {
+    @log_activity($conn, 'rooms', 'error', 'DB connection failed: '.$conn->connect_error, null, null);
     http_response_code(500);
     echo json_encode(["status" => "error", "message" => "Database connection failed: " . $conn->connect_error]);
     exit();
 }
 
-// Small helpers
 function esc_str($conn, $v) { return mysqli_real_escape_string($conn, (string)$v); }
 function as_int($v) { return (int)$v; }
-function bad_request($msg){ http_response_code(400); echo json_encode(["status"=>"error","message"=>$msg]); exit(); }
+function bad_request($msg){
+    global $conn;
+    @log_activity($conn, 'rooms', 'error', $msg, null, null);
+    http_response_code(400); echo json_encode(["status"=>"error","message"=>$msg]); exit();
+}
 
-// Load school settings helper
 require_once __DIR__ . '/system_settings_helper.php';
 
-// Fetch current school year + semester once per request
 $currentSY = ss_get_current_school_year($conn);
 if ($currentSY === null || $currentSY === '') {
+    @log_activity($conn, 'rooms', 'error', 'Current school year is not configured', null, null);
     http_response_code(500);
     echo json_encode(["status" => "error", "message" => "Current school year is not configured."]);
     exit();
 }
-$currentSemester = ss_get_current_semester($conn); // 🆕
+$currentSemester = ss_get_current_semester($conn);
 if ($currentSemester === null || $currentSemester === '') {
+    @log_activity($conn, 'rooms', 'error', 'Current semester is not configured', null, null);
     http_response_code(500);
     echo json_encode(["status" => "error", "message" => "Current semester is not configured."]);
     exit();
 }
 
 $currentSY_safe = esc_str($conn, $currentSY);
-$currentSem_safe = esc_str($conn, $currentSemester); // 🆕
+$currentSem_safe = esc_str($conn, $currentSemester);
 
-// Handle different HTTP methods
 $method = $_SERVER['REQUEST_METHOD'];
 
 switch ($method) {
     case 'GET':
         if (isset($_GET['id'])) {
-            getRoom($conn, $_GET['id'], $currentSY_safe, $currentSem_safe); // 🆕
+            getRoom($conn, $_GET['id'], $currentSY_safe, $currentSem_safe);
         } else {
-            getAllRooms($conn, $currentSY_safe, $currentSem_safe); // 🆕
+            getAllRooms($conn, $currentSY_safe, $currentSem_safe);
         }
         break;
 
     case 'POST':
         $data = json_decode(file_get_contents('php://input'), true);
         if (!$data) bad_request("Invalid JSON data");
-        createRoom($conn, $data, $currentSY_safe, $currentSem_safe); // 🆕
+        createRoom($conn, $data, $currentSY_safe, $currentSem_safe);
         break;
 
     case 'PUT':
         if (!isset($_GET['id'])) bad_request("Room ID is required");
         $data = json_decode(file_get_contents('php://input'), true);
         if (!$data) bad_request("Invalid JSON data");
-        updateRoom($conn, $_GET['id'], $data, $currentSY_safe, $currentSem_safe); // 🆕
+        updateRoom($conn, $_GET['id'], $data, $currentSY_safe, $currentSem_safe);
         break;
 
     case 'DELETE':
         if (!isset($_GET['id'])) bad_request("Room ID is required");
-        deleteRoom($conn, $_GET['id'], $currentSY_safe, $currentSem_safe); // 🆕
+        deleteRoom($conn, $_GET['id'], $currentSY_safe, $currentSem_safe);
         break;
 
     default:
@@ -84,39 +83,39 @@ switch ($method) {
         break;
 }
 
-// Function to get all rooms (scoped to current school year + semester)
 function getAllRooms($conn, $currentSY_safe, $currentSem_safe): void {
     $sql = "SELECT r.*,
             (SELECT COUNT(*) FROM schedules WHERE room_id = r.room_id) AS schedule_count
             FROM rooms r
             WHERE r.school_year = '{$currentSY_safe}'
-              AND r.semester = '{$currentSem_safe}'"; // 🆕
+              AND r.semester = '{$currentSem_safe}'";
     $result = $conn->query($sql);
 
     if ($result) {
         $rooms = [];
         while ($row = $result->fetch_assoc()) {
-            $rooms[] = buildRoomWithSections($conn, $row, $currentSY_safe, $currentSem_safe); // 🆕
+            $rooms[] = buildRoomWithSections($conn, $row, $currentSY_safe, $currentSem_safe);
         }
-
+        @log_activity($conn, 'rooms', 'list', 'Listed rooms for '.$currentSY_safe.' / '.$currentSem_safe.' (count: '.count($rooms).')', null, null);
         echo json_encode([
             "success" => true,
             "data" => $rooms
         ]);
     } else {
+        @log_activity($conn, 'rooms', 'error', 'Failed to fetch rooms: '.$conn->error, null, null);
         http_response_code(500);
         echo json_encode(["success" => false, "message" => "Failed to fetch rooms"]);
     }
 }
 
-function buildRoomWithSections($conn, $row, $currentSY_safe, $currentSem_safe) { // 🆕
+function buildRoomWithSections($conn, $row, $currentSY_safe, $currentSem_safe) {
     $room = [
         'id' => as_int($row['room_id']),
         'number' => as_int($row['room_number']),
         'type' => $row['room_type'],
         'capacity' => as_int($row['room_capacity']),
         'school_year' => $row['school_year'],
-        'semester' => $row['semester'], // 🆕
+        'semester' => $row['semester'],
         'schedule_count' => isset($row['schedule_count']) ? as_int($row['schedule_count']) : 0,
     ];
 
@@ -143,23 +142,20 @@ function buildRoomWithSections($conn, $row, $currentSY_safe, $currentSem_safe) {
     return $room;
 }
 
-// Function to get a specific room (scoped to current school year + semester)
-function getRoom($conn, $id, $currentSY_safe, $currentSem_safe) { // 🆕
+function getRoom($conn, $id, $currentSY_safe, $currentSem_safe) {
     $rid = as_int($id);
     $sql = "SELECT r.*,
             (SELECT COUNT(*) FROM schedules WHERE room_id = r.room_id) AS schedule_count
             FROM rooms r
             WHERE r.room_id = {$rid}
               AND r.school_year = '{$currentSY_safe}'
-              AND r.semester = '{$currentSem_safe}'  -- 🆕
+              AND r.semester = '{$currentSem_safe}'
             LIMIT 1";
     $result = $conn->query($sql);
 
     if ($result && $row = $result->fetch_assoc()) {
-        $room = buildRoomWithSections($conn, $row, $currentSY_safe, $currentSem_safe); // 🆕
+        $room = buildRoomWithSections($conn, $row, $currentSY_safe, $currentSem_safe);
 
-        // Get current schedules for this room
-        // (Add a school_year/semester column to schedules if you want this scoped too)
         $schedules_sql = "SELECT s.*, subj.subj_code, subj.subj_name,
                           p.prof_name AS professor_name, p.subj_count AS professor_subject_count,
                           sec.section_name, sec.grade_level, sec.strand
@@ -174,7 +170,6 @@ function getRoom($conn, $id, $currentSY_safe, $currentSem_safe) { // 🆕
         if ($schedules_result) {
             while ($schedule_row = $schedules_result->fetch_assoc()) {
                 $sid = as_int($schedule_row['schedule_id']);
-                // Get days per schedule
                 $days_sql = "SELECT d.day_name
                              FROM schedule_days sd
                              JOIN days d ON sd.day_id = d.day_id
@@ -215,26 +210,24 @@ function getRoom($conn, $id, $currentSY_safe, $currentSem_safe) { // 🆕
 
         $room['schedules'] = $schedules;
 
+        @log_activity($conn, 'rooms', 'read', "Viewed room ID: {$rid} for {$currentSY_safe} / {$currentSem_safe}", $rid, null);
         echo json_encode(["success" => true, "data" => $room]);
     } else {
+        @log_activity($conn, 'rooms', 'read', "Room not found ID: {$rid} for {$currentSY_safe} / {$currentSem_safe}", $rid, null);
         http_response_code(404);
         echo json_encode(["success" => false, "message" => "Room not found"]);
     }
 }
 
-// Function to create a new room (inserts current school year + semester)
-function createRoom($conn, $data, $currentSY_safe, $currentSem_safe) { // 🆕
-    // Validate required fields
+function createRoom($conn, $data, $currentSY_safe, $currentSem_safe) {
     foreach (['number','type','capacity'] as $field) {
         if (!isset($data[$field])) bad_request("Missing required field: $field");
     }
 
-    // Validate room type
     if (!in_array($data['type'], ['Lecture', 'Laboratory'], true)) {
         bad_request("Room type must be either 'Lecture' or 'Laboratory'");
     }
 
-    // Validate capacity & number
     $capacity = as_int($data['capacity']);
     if ($capacity <= 0) bad_request("Room capacity must be a positive integer");
 
@@ -243,7 +236,6 @@ function createRoom($conn, $data, $currentSY_safe, $currentSem_safe) { // 🆕
 
     $type = esc_str($conn, $data['type']);
 
-    // Check duplicate room number within the same school year + semester
     $checkSql = "SELECT room_id FROM rooms
                  WHERE room_number = {$number}
                    AND school_year = '{$currentSY_safe}'
@@ -251,39 +243,39 @@ function createRoom($conn, $data, $currentSY_safe, $currentSem_safe) { // 🆕
                  LIMIT 1";
     $checkRes = $conn->query($checkSql);
     if ($checkRes && $checkRes->num_rows > 0) {
+        @log_activity($conn, 'rooms', 'create', "Duplicate room number {$number} for {$currentSY_safe} / {$currentSem_safe}", null, null);
         bad_request("Room number already exists for the current school year and semester");
     }
 
-    // Insert with school_year + semester
     $sql = "INSERT INTO rooms (room_number, room_type, room_capacity, school_year, semester)
             VALUES ({$number}, '{$type}', {$capacity}, '{$currentSY_safe}', '{$currentSem_safe}')";
 
     if ($conn->query($sql) === TRUE) {
         $id = as_int($conn->insert_id);
+        @log_activity($conn, 'rooms', 'create', "Created room #{$number} ({$type}, cap {$capacity}) for {$currentSY_safe} / {$currentSem_safe}", $id, null);
         $room = [
             'id' => $id,
             'number' => $number,
             'type' => $data['type'],
             'capacity' => $capacity,
             'school_year' => $currentSY_safe,
-            'semester' => $currentSem_safe // 🆕
+            'semester' => $currentSem_safe
         ];
         http_response_code(201);
         echo json_encode(["status" => "success", "message" => "Room added successfully", "room" => $room]);
     } else {
+        @log_activity($conn, 'rooms', 'create', "Failed to create room #{$number}: ".$conn->error, null, null);
         http_response_code(500);
         echo json_encode(["status" => "error", "message" => "Error: " . $conn->error]);
     }
 }
 
-// Function to update a room (scoped to current school year + semester)
-function updateRoom($conn, $id, $data, $currentSY_safe, $currentSem_safe) { // 🆕
+function updateRoom($conn, $id, $data, $currentSY_safe, $currentSem_safe) {
     $rid = as_int($id);
 
     $conn->begin_transaction();
 
     try {
-        // Exists in current SY + Sem?
         $checkSql = "SELECT room_id FROM rooms
                      WHERE room_id = {$rid}
                        AND school_year = '{$currentSY_safe}'
@@ -294,7 +286,6 @@ function updateRoom($conn, $id, $data, $currentSY_safe, $currentSem_safe) { // �
             throw new Exception("Room not found for the current school year and semester");
         }
 
-        // Validate optional fields
         if (isset($data['type']) && !in_array($data['type'], ['Lecture','Laboratory'], true)) {
             throw new Exception("Room type must be either 'Lecture' or 'Laboratory'");
         }
@@ -307,7 +298,6 @@ function updateRoom($conn, $id, $data, $currentSY_safe, $currentSem_safe) { // �
             if ($num <= 0) throw new Exception("Room number must be a positive integer");
         }
 
-        // Duplicate number (if updating number) within current SY + Sem
         if (isset($data['number'])) {
             $num = as_int($data['number']);
             $dupSql = "SELECT room_id FROM rooms
@@ -322,7 +312,6 @@ function updateRoom($conn, $id, $data, $currentSY_safe, $currentSem_safe) { // �
             }
         }
 
-        // Current values
         $curSql = "SELECT * FROM rooms WHERE room_id = {$rid} LIMIT 1";
         $curRes = $conn->query($curSql);
         if (!$curRes || !$curRes->num_rows) {
@@ -334,7 +323,6 @@ function updateRoom($conn, $id, $data, $currentSY_safe, $currentSem_safe) { // �
         $type   = isset($data['type']) ? esc_str($conn, $data['type']) : esc_str($conn, $current['room_type']);
         $capacity = isset($data['capacity']) ? as_int($data['capacity']) : as_int($current['room_capacity']);
 
-        // Update (school_year + semester remain as originally inserted/current)
         $updSql = "UPDATE rooms SET
                    room_number = {$number},
                    room_type = '{$type}',
@@ -346,7 +334,6 @@ function updateRoom($conn, $id, $data, $currentSY_safe, $currentSem_safe) { // �
             throw new Exception("Failed to update room");
         }
 
-        // Return updated with schedule count
         $retSql = "SELECT r.*,
                    (SELECT COUNT(*) FROM schedules WHERE room_id = r.room_id) AS schedule_count
                    FROM rooms r
@@ -365,25 +352,25 @@ function updateRoom($conn, $id, $data, $currentSY_safe, $currentSem_safe) { // �
             'type' => $row['room_type'],
             'capacity' => as_int($row['room_capacity']),
             'school_year' => $row['school_year'],
-            'semester' => $row['semester'], // 🆕
+            'semester' => $row['semester'],
             'schedule_count' => as_int($row['schedule_count'])
         ];
 
         $conn->commit();
+        @log_activity($conn, 'rooms', 'update', "Updated room ID {$rid} to #{$room['number']} ({$room['type']}, cap {$room['capacity']})", $rid, null);
         echo json_encode(["status" => "success", "message" => "Room updated successfully", "room" => $room]);
 
     } catch (Exception $e) {
         $conn->rollback();
+        @log_activity($conn, 'rooms', 'update', "Failed to update room ID {$rid}: ".$e->getMessage(), $rid, null);
         http_response_code(500);
-        echo json_encode(["status" => "error", "message" => "Error: " . $e->getMessage()]);
+        echo json_encode(["status" => "error", "message" => "Error: " . $e->getMessage() ]);
     }
 }
 
-// Function to delete a room (scoped to current school year + semester)
-function deleteRoom($conn, $id, $currentSY_safe, $currentSem_safe) { // 🆕
+function deleteRoom($conn, $id, $currentSY_safe, $currentSem_safe) {
     $rid = as_int($id);
 
-    // Exists in current SY + Sem?
     $checkSql = "SELECT room_id FROM rooms
                  WHERE room_id = {$rid}
                    AND school_year = '{$currentSY_safe}'
@@ -391,6 +378,7 @@ function deleteRoom($conn, $id, $currentSY_safe, $currentSem_safe) { // 🆕
                  LIMIT 1";
     $checkRes = $conn->query($checkSql);
     if (!$checkRes || $checkRes->num_rows === 0) {
+        @log_activity($conn, 'rooms', 'delete', "Room not found ID {$rid} for {$currentSY_safe} / {$currentSem_safe}", $rid, null);
         http_response_code(404);
         echo json_encode(["status" => "error", "message" => "Room not found for the current school year and semester"]);
         exit();
@@ -401,13 +389,14 @@ function deleteRoom($conn, $id, $currentSY_safe, $currentSem_safe) { // 🆕
                  AND school_year = '{$currentSY_safe}'
                  AND semester = '{$currentSem_safe}'";
     if ($conn->query($delSql) === TRUE) {
+        @log_activity($conn, 'rooms', 'delete', "Deleted room ID {$rid} for {$currentSY_safe} / {$currentSem_safe}", $rid, null);
         echo json_encode(["status" => "success", "message" => "Room deleted successfully"]);
     } else {
+        @log_activity($conn, 'rooms', 'delete', "Failed to delete room ID {$rid}: ".$conn->error, $rid, null);
         http_response_code(500);
         echo json_encode(["status" => "error", "message" => "Error: " . $conn->error]);
     }
 }
 
-// Close the database connection
 $conn->close();
 ?>

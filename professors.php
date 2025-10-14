@@ -3,6 +3,8 @@ include 'cors_helper.php';
 handleCORS();
 
 include 'connect.php';
+include 'activity_logger.php';
+
 require_once __DIR__ . '/system_settings_helper.php';
 require_once __DIR__ . '/firebase_config.php';
 require_once __DIR__ . '/firebase_sync_lib.php';
@@ -158,6 +160,8 @@ function sendWelcomeProfessorEmail($toEmail, $toName, $username, $plainPassword,
 
 $conn = new mysqli($host, $user, $password, $database);
 if ($conn->connect_error) {
+    // NEW: log connection failure
+    log_activity($conn, 'professors', 'error', 'DB connection failed: '.$conn->connect_error, null, null);
     http_response_code(500);
     echo json_encode(["status" => "error", "message" => "Database connection failed: " . $conn->connect_error]);
     exit();
@@ -209,6 +213,7 @@ function createProfessor(mysqli $conn, array $data) {
     $subjIds   = normalize_array($data['subject_ids'] ?? []);
 
     if ($email !== '' && emailExists($conn, $email)) {
+        log_activity($conn, 'professors', 'create', "FAILED create: email exists for {$email}", null, null); // NEW
         http_response_code(409);
         echo json_encode(["status"=>"error","message"=>"Email already exists."]);
         return;
@@ -227,6 +232,7 @@ function createProfessor(mysqli $conn, array $data) {
         VALUES ('$name', '$username', '$password', '".mysqli_real_escape_string($conn, $email)."', '$phone', '$qualStr', '$subjects_json', $subj_count, $schoolYearSQL)
     ";
     if (!$conn->query($sql)) {
+        log_activity($conn, 'professors', 'create', "FAILED create professor {$name}: ".$conn->error, null, null); // NEW
         http_response_code(500);
         echo json_encode(["status"=>"error","message"=>$conn->error]);
         return;
@@ -246,6 +252,10 @@ function createProfessor(mysqli $conn, array $data) {
           )
         : ['sent'=>false,'message'=>'No email'];
 
+    // NEW: log success
+    $desc = "Created professor: {$name} (ID: {$id}) | SY: " . ($schoolYear ?? 'N/A') . " | Subjects: {$subj_count}";
+    log_activity($conn, 'professors', 'create', $desc, $id, null);
+
     echo json_encode([
         "status"=>"success",
         "message"=>"Professor added",
@@ -257,6 +267,7 @@ function createProfessor(mysqli $conn, array $data) {
 
 function updateProfessor(mysqli $conn, int $id, array $data) {
     if ($id <= 0) {
+        log_activity($conn, 'professors', 'update', "FAILED update: missing ID", null, null); // NEW
         http_response_code(400);
         echo json_encode(["status"=>"error","message"=>"Professor ID is required"]);
         return;
@@ -270,6 +281,7 @@ function updateProfessor(mysqli $conn, int $id, array $data) {
     $subjIds   = normalize_array($data['subject_ids'] ?? []);
 
     if ($emailRaw !== '' && emailExists($conn, $emailRaw, $id)) {
+        log_activity($conn, 'professors', 'update', "FAILED update ID {$id}: email taken ({$emailRaw})", $id, null); // NEW
         http_response_code(409);
         echo json_encode(["status"=>"error","message"=>"Email already taken by another professor."]);
         return;
@@ -298,12 +310,17 @@ function updateProfessor(mysqli $conn, int $id, array $data) {
 
     $sql = "UPDATE professors SET " . implode(',', $set) . " WHERE prof_id=".(int)$id;
     if (!$conn->query($sql)) {
+        log_activity($conn, 'professors', 'update', "FAILED update ID {$id}: ".$conn->error, $id, null); // NEW
         http_response_code(500);
         echo json_encode(["status"=>"error","message"=>$conn->error]);
         return;
     }
 
     $syncResult = firebaseSync($conn)->syncSingleProfessor($id);
+
+    // NEW: log success
+    $desc = "Updated professor: {$name} (ID: {$id}) | Subjects: {$subj_count}";
+    log_activity($conn, 'professors', 'update', $desc, $id, null);
 
     echo json_encode([
         "status"=>"success",
@@ -315,18 +332,24 @@ function updateProfessor(mysqli $conn, int $id, array $data) {
 
 function deleteProfessor(mysqli $conn, int $id) {
     if ($id <= 0) {
+        log_activity($conn, 'professors', 'delete', "FAILED delete: missing ID", null, null); // NEW
         http_response_code(400);
         echo json_encode(["status"=>"error","message"=>"Professor ID is required"]);
         return;
     }
     $sql = "DELETE FROM professors WHERE prof_id=".(int)$id;
     if (!$conn->query($sql)) {
+        log_activity($conn, 'professors', 'delete', "FAILED delete ID {$id}: ".$conn->error, $id, null); // NEW
         http_response_code(500);
         echo json_encode(["status"=>"error","message"=>$conn->error]);
         return;
     }
 
     $syncResult = firebaseSync($conn)->deleteProfessorInFirebase($id);
+
+    // NEW: log success
+    $desc = "Deleted professor ID: {$id}";
+    log_activity($conn, 'professors', 'delete', $desc, $id, null);
 
     echo json_encode([
         "status"=>"success",
@@ -384,12 +407,14 @@ function getAllProfessors(mysqli $conn) {
 
 function getProfessor(mysqli $conn, int $id) {
     if ($id <= 0) {
+        log_activity($conn, 'professors', 'read', "FAILED view: missing ID", null, null); // NEW (optional)
         http_response_code(400);
         echo json_encode(["status"=>"error","message"=>"Professor ID is required"]);
         return;
     }
     $res = $conn->query("SELECT * FROM professors WHERE prof_id=".(int)$id." LIMIT 1");
     if (!$res || $res->num_rows === 0) {
+        log_activity($conn, 'professors', 'read', "FAILED view: professor not found (ID {$id})", $id, null); // NEW (optional)
         http_response_code(404);
         echo json_encode(["status"=>"error","message"=>"Professor not found"]);
         return;
@@ -412,6 +437,9 @@ function getProfessor(mysqli $conn, int $id) {
         'subj_count'      => (int)$row['subj_count'],
         'school_year'     => $row['school_year'] ?? null,
     ];
+
+    // NEW (optional): log successful view
+    log_activity($conn, 'professors', 'read', "Viewed professor ID: {$id}", $id, null);
 
     $currentSY = ss_get_current_school_year($conn);
     echo json_encode(["status"=>"success","data"=>$prof,"current_school_year"=>$currentSY]);

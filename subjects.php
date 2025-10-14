@@ -3,6 +3,8 @@ include 'cors_helper.php';
 handleCORS();
 
 include 'connect.php';
+include 'activity_logger.php';
+
 require_once __DIR__ . '/system_settings_helper.php';
 require_once __DIR__ . '/firebase_config.php';
 require_once __DIR__ . '/firebase_sync_lib.php';
@@ -11,6 +13,7 @@ $conn = new mysqli($host, $user, $password, $database);
 header('Content-Type: application/json; charset=utf-8');
 
 if ($conn->connect_error) {
+    @log_activity($conn, 'subjects', 'error', 'DB connection failed: '.$conn->connect_error, null, null);
     http_response_code(500);
     echo json_encode(["success" => false, "status" => "error", "message" => "Database connection failed: " . $conn->connect_error]);
     exit();
@@ -18,7 +21,7 @@ if ($conn->connect_error) {
 $conn->set_charset('utf8mb4');
 
 function firebaseSync(mysqli $conn): FirebaseSync {
-    global $firebaseConfig; // from firebase_config.php
+    global $firebaseConfig;
     return new FirebaseSync($firebaseConfig, $conn);
 }
 
@@ -56,6 +59,7 @@ switch ($method) {
     if (isset($_GET['id'])) {
       updateSubject($conn, (int)$_GET['id'], is_array($data) ? $data : [], $ALLOWED_TYPES);
     } else {
+      @log_activity($conn, 'subjects', 'update', 'FAILED update: missing ID', null, null);
       http_response_code(400);
       echo json_encode(['success' => false, 'status' => 'error', 'message' => 'Subject ID is required']);
     }
@@ -64,6 +68,7 @@ switch ($method) {
     if (isset($_GET['id'])) {
       deleteSubject($conn, (int)$_GET['id']);
     } else {
+      @log_activity($conn, 'subjects', 'delete', 'FAILED delete: missing ID', null, null);
       http_response_code(400);
       echo json_encode(['success' => false, 'status' => 'error', 'message' => 'Subject ID is required']);
     }
@@ -139,9 +144,11 @@ function getAllSubject($conn) {
         'school_year'      => $row['school_year'] ?? null
       ];
     }
+    @log_activity($conn, 'subjects', 'list', 'Listed subjects (count: '.count($subjects).')'.($syEsc!==null?' | SY: '.$syEsc:''), null, null);
     $currentSY = ss_get_current_school_year($conn);
     echo json_encode(["success" => true, "status" => "success", "data" => $subjects, "current_school_year" => $currentSY]);
   } else {
+    @log_activity($conn, 'subjects', 'error', 'Failed to fetch subjects: '.$conn->error, null, null);
     http_response_code(500);
     echo json_encode(["success" => false, "status" => "error", "message" => "Failed to fetch subjects"]);
   }
@@ -215,9 +222,11 @@ function getSubject($conn, $id) {
     }
     $subject['schedules'] = $schedules;
 
+    @log_activity($conn, 'subjects', 'read', 'Viewed subject: '.$row['subj_code'].' — '.$row['subj_name'].' (ID '.$row['subj_id'].')'.($syEsc!==null?' | SY: '.$syEsc:''), (int)$row['subj_id'], null);
     $currentSY = ss_get_current_school_year($conn);
     echo json_encode(["success" => true, "data" => $subject, "current_school_year" => $currentSY]);
   } else {
+    @log_activity($conn, 'subjects', 'read', 'Subject not found (ID '.$id.')'.($syEsc!==null?' | SY: '.$syEsc:''), $id, null);
     http_response_code(404);
     echo json_encode(["success" => false, "message" => "Subject not found"]);
   }
@@ -233,12 +242,14 @@ function createSubject($conn, $data, $ALLOWED_TYPES) {
   $isActive    = (int)read_field($data, 'is_active', 'isActive', 1);
 
   if (is_string($subjType)) $subjType = strtolower($subjType);
-  if (!$code) { http_response_code(400); echo json_encode(["success"=>false,"status"=>"error","message"=>"Missing required field: code"]); return; }
-  if (!$name) { http_response_code(400); echo json_encode(["success"=>false,"status"=>"error","message"=>"Missing required field: name"]); return; }
+  if (!$code) { @log_activity($conn, 'subjects', 'create', 'FAILED create: missing code', null, null); http_response_code(400); echo json_encode(["success"=>false,"status"=>"error","message"=>"Missing required field: code"]); return; }
+  if (!$name) { @log_activity($conn, 'subjects', 'create', 'FAILED create: missing name', null, null); http_response_code(400); echo json_encode(["success"=>false,"status"=>"error","message"=>"Missing required field: name"]); return; }
   if ($gradeLevel !== null && !in_array($gradeLevel, ['11','12'], true)) {
+    @log_activity($conn, 'subjects', 'create', 'FAILED create: invalid grade_level', null, null);
     http_response_code(400); echo json_encode(["success"=>false,"status"=>"error","message"=>"Invalid grade_level (allowed: '11','12')"]); return;
   }
   if (!$subjType || !in_arrayi($subjType, $ALLOWED_TYPES)) {
+    @log_activity($conn, 'subjects', 'create', 'FAILED create: invalid type', null, null);
     http_response_code(400); echo json_encode(["success"=>false,"status"=>"error","message"=>"Invalid or missing type (allowed: ".implode(', ', $ALLOWED_TYPES).")"]); return;
   }
 
@@ -259,9 +270,8 @@ function createSubject($conn, $data, $ALLOWED_TYPES) {
 
   if ($conn->query($sql)) {
     $newId = (int)$conn->insert_id;
-
-    /** Firebase sync — same style as professors */
     $syncResult = firebaseSync($conn)->syncSingleSubject($newId);
+    @log_activity($conn, 'subjects', 'create', "Created subject: {$code} — {$name} (ID {$newId})".($syEsc!==null?' | SY: '.$syEsc:''), $newId, null);
 
     http_response_code(201);
     $currentSY = ss_get_current_school_year($conn);
@@ -274,6 +284,7 @@ function createSubject($conn, $data, $ALLOWED_TYPES) {
       "firebase_sync" => $syncResult
     ]);
   } else {
+    @log_activity($conn, 'subjects', 'create', "FAILED create {$code} — {$name}: ".$conn->error, null, null);
     http_response_code(500);
     echo json_encode(["success"=>false,"status"=>"error","message"=>"Insert failed: ".$conn->error]);
   }
@@ -281,12 +292,15 @@ function createSubject($conn, $data, $ALLOWED_TYPES) {
 
 function updateSubject($conn, $id, $data, $ALLOWED_TYPES) {
   $id = (int)$id;
-  $exists = $conn->query("SELECT subj_id FROM subjects WHERE subj_id = {$id} LIMIT 1");
+  $exists = $conn->query("SELECT subj_id, subj_code, subj_name FROM subjects WHERE subj_id = {$id} LIMIT 1");
   if (!$exists || $exists->num_rows === 0) {
+    @log_activity($conn, 'subjects', 'update', "FAILED update: subject not found (ID {$id})", $id, null);
     http_response_code(404);
     echo json_encode(["success"=>false,"status"=>"error","message"=>"Subject not found"]);
     return;
   }
+  $existing = $exists->fetch_assoc();
+  $existingLabel = $existing ? ($existing['subj_code'].' — '.$existing['subj_name']) : ('ID '.$id);
 
   $code        = read_field($data, 'subj_code', 'code', null);
   $name        = read_field($data, 'subj_name', 'name', null);
@@ -303,6 +317,7 @@ function updateSubject($conn, $id, $data, $ALLOWED_TYPES) {
   if ($description !== null) $sets[] = "subj_description = '".esc($conn, $description)."'";
   if ($gradeLevel !== null) {
     if (!in_array($gradeLevel, ['11','12'], true)) {
+      @log_activity($conn, 'subjects', 'update', "FAILED update {$existingLabel}: invalid grade_level", $id, null);
       http_response_code(400); echo json_encode(["success"=>false,"status"=>"error","message"=>"Invalid grade_level (allowed: '11','12')"]); return;
     }
     $sets[] = "grade_level = '".esc($conn, $gradeLevel)."'";
@@ -311,6 +326,7 @@ function updateSubject($conn, $id, $data, $ALLOWED_TYPES) {
   if ($subjType !== null) {
     if (is_string($subjType)) $subjType = strtolower($subjType);
     if (!in_arrayi($subjType, $ALLOWED_TYPES)) {
+      @log_activity($conn, 'subjects', 'update', "FAILED update {$existingLabel}: invalid type", $id, null);
       http_response_code(400); echo json_encode(["success"=>false,"status"=>"error","message"=>"Invalid type (allowed: ".implode(', ', $ALLOWED_TYPES).")"]); return;
     }
     $sets[] = "subj_type = '".esc($conn, $subjType)."'";
@@ -319,14 +335,15 @@ function updateSubject($conn, $id, $data, $ALLOWED_TYPES) {
   if ($schoolYear !== null)  $sets[] = trim($schoolYear) === '' ? "school_year = NULL" : "school_year = '".esc($conn, $schoolYear)."'";
 
   if (!$sets) {
+    @log_activity($conn, 'subjects', 'update', "No fields to update for {$existingLabel}", $id, null);
     echo json_encode(["success"=>false,"status"=>"error","message"=>"No fields to update"]);
     return;
   }
 
   $sql = "UPDATE subjects SET ".implode(", ", $sets)." WHERE subj_id = {$id}";
   if ($conn->query($sql)) {
-    /** Firebase sync — same style as professors */
     $syncResult = firebaseSync($conn)->syncSingleSubject($id);
+    @log_activity($conn, 'subjects', 'update', "Updated subject: {$existingLabel}", $id, null);
 
     $currentSY = ss_get_current_school_year($conn);
     echo json_encode([
@@ -337,6 +354,7 @@ function updateSubject($conn, $id, $data, $ALLOWED_TYPES) {
       "firebase_sync"=>$syncResult
     ]);
   } else {
+    @log_activity($conn, 'subjects', 'update', "FAILED update {$existingLabel}: ".$conn->error, $id, null);
     http_response_code(500);
     echo json_encode(["success"=>false,"status"=>"error","message"=>"Update failed: ".$conn->error]);
   }
@@ -344,16 +362,20 @@ function updateSubject($conn, $id, $data, $ALLOWED_TYPES) {
 
 function deleteSubject($conn, $id) {
   $id = (int)$id;
-  $exists = $conn->query("SELECT subj_id FROM subjects WHERE subj_id = {$id} LIMIT 1");
+  $exists = $conn->query("SELECT subj_id, subj_code, subj_name FROM subjects WHERE subj_id = {$id} LIMIT 1");
   if (!$exists || $exists->num_rows === 0) {
+    @log_activity($conn, 'subjects', 'delete', "FAILED delete: subject not found (ID {$id})", $id, null);
     http_response_code(404);
     echo json_encode(["success" => false, "message" => "Subject not found"]);
     return;
   }
+  $row = $exists->fetch_assoc();
+  $label = $row['subj_code'].' — '.$row['subj_name'];
+
   $sql = "DELETE FROM subjects WHERE subj_id = {$id}";
   if ($conn->query($sql)) {
-    /** Firebase sync — same style as professors */
     $syncResult = firebaseSync($conn)->deleteSubjectInFirebase($id);
+    @log_activity($conn, 'subjects', 'delete', "Deleted subject: {$label} (ID {$id})", $id, null);
 
     $currentSY = ss_get_current_school_year($conn);
     echo json_encode([
@@ -363,7 +385,9 @@ function deleteSubject($conn, $id) {
       "firebase_sync"=>$syncResult
     ]);
   } else {
+    @log_activity($conn, 'subjects', 'delete', "FAILED delete {$label} (ID {$id}): ".$conn->error, $id, null);
     http_response_code(500);
     echo json_encode(["success" => false, "message" => "Delete failed: " . $conn->error]);
   }
 }
+

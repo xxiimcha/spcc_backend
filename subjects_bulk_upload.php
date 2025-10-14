@@ -7,16 +7,18 @@ header('Content-Type: application/json; charset=utf-8');
 
 require_once __DIR__ . '/connect.php';
 require_once __DIR__ . '/system_settings_helper.php';
+require_once __DIR__ . '/activity_logger.php';
 
 require_once __DIR__ . '/firebase_config.php';
 require_once __DIR__ . '/firebase_sync_lib.php';
 function firebaseSync(mysqli $db): FirebaseSync {
-    global $firebaseConfig; // from firebase_config.php
+    global $firebaseConfig;
     return new FirebaseSync($firebaseConfig, $db);
 }
 
 $mysqli = new mysqli($host, $user, $password, $database);
 if ($mysqli->connect_error) {
+    @log_activity($mysqli, 'subjects_import', 'error', 'DB connection failed: '.$mysqli->connect_error, null, null);
     http_response_code(500);
     echo json_encode(["success"=>false,"status"=>"error","message"=>"Database connection failed: " . $mysqli->connect_error]);
     exit;
@@ -24,12 +26,14 @@ if ($mysqli->connect_error) {
 $mysqli->set_charset("utf8mb4");
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    @log_activity($mysqli, 'subjects_import', 'error', 'Method not allowed (expected POST)', null, null);
     http_response_code(405);
     echo json_encode(["success"=>false,"status"=>"error","message"=>"Method not allowed. Use POST."]);
     exit;
 }
 
 if (!isset($_FILES['file']) || $_FILES['file']['error'] !== UPLOAD_ERR_OK) {
+    @log_activity($mysqli, 'subjects_import', 'error', 'No file or upload failed (code '.((int)($_FILES['file']['error'] ?? -1)).')', null, null);
     http_response_code(400);
     echo json_encode(["success"=>false,"status"=>"error","message"=>"No file uploaded or upload failed."]);
     exit;
@@ -40,6 +44,7 @@ $fileName = $_FILES['file']['name'];
 $ext      = strtolower(pathinfo($fileName, PATHINFO_EXTENSION));
 $allowed  = ['xlsx', 'xls', 'csv'];
 if (!in_array($ext, $allowed, true)) {
+    @log_activity($mysqli, 'subjects_import', 'error', 'Invalid file type: '.$ext, null, null);
     http_response_code(400);
     echo json_encode(["success"=>false,"status"=>"error","message"=>"Invalid file type. Allowed: .xlsx, .xls, .csv"]);
     exit;
@@ -127,6 +132,7 @@ try {
         }
     }
 } catch (Exception $e) {
+    @log_activity($mysqli, 'subjects_import', 'error', 'Failed to read file: '.$e->getMessage(), null, null);
     http_response_code(400);
     echo json_encode(["success"=>false,"status"=>"error","message"=>"Failed to read file: " . $e->getMessage()]);
     exit;
@@ -136,6 +142,7 @@ $sampleKeys = !empty($rows) ? array_map('strtolower', array_keys($rows[0])) : []
 $hasCode = in_array('code', $sampleKeys, true);
 $hasName = in_array('name', $sampleKeys, true);
 if (!$hasCode || !$hasName) {
+    @log_activity($mysqli, 'subjects_import', 'error', 'Missing required headers (need: code, name)', null, null);
     http_response_code(400);
     echo json_encode(["success"=>false,"status"=>"error","message"=>"Missing required headers. Expected at least: code, name. Optional: description, subject type, grade level, strand, semester."]);
     exit;
@@ -179,7 +186,6 @@ try {
         $semEsc  = esc($mysqli, $sem);
         $strEsc  = esc($mysqli, $str);
 
-        /* Duplicate only if ALL relevant fields match (including NULL/blank tolerance for nullable fields) */
         $where = "
             subj_code = '{$codeEsc}'
             AND subj_name = '{$nameEsc}'
@@ -199,7 +205,7 @@ try {
             continue;
         }
         if ($dupRes->num_rows > 0) {
-            $skipped++; // exact duplicate
+            $skipped++;
             continue;
         }
 
@@ -217,24 +223,20 @@ try {
 
         if (!$mysqli->query($insSql)) {
             $skipped++;
-            $errors[] = "Row {$rowNo}: Insert blocked by existing unique constraint. "
-                      . "To enforce exactly-this-duplicate rule at DB level, create a composite UNIQUE index on "
-                      . "(subj_code, subj_name, subj_description, subj_type, grade_level, strand, semester, school_year). "
-                      . "Error: " . $mysqli->error;
+            $errors[] = "Row {$rowNo}: Insert blocked/failed: " . $mysqli->error;
             continue;
         }
 
         $inserted++;
-
-        // Firebase sync for the new subject (same style as your endpoints)
         $newId = (int)$mysqli->insert_id;
+
         try {
             $syncResult = firebaseSync($mysqli)->syncSingleSubject($newId);
-            // If your sync method returns a 'success' field, we can count it; otherwise assume ok when no exception
             if (is_array($syncResult) && array_key_exists('success', $syncResult)) {
-                if ($syncResult['success']) $syncSynced++; else { $syncFailed++; $errors[] = "Row {$rowNo}: Firebase sync reported failure."; }
+                if ($syncResult['success']) { $syncSynced++; }
+                else { $syncFailed++; $errors[] = "Row {$rowNo}: Firebase sync reported failure."; }
             } else {
-                $syncSynced++; // no exception => treat as success
+                $syncSynced++;
             }
         } catch (Throwable $e) {
             $syncFailed++;
@@ -257,6 +259,15 @@ try {
 
     $mysqli->commit();
 
+    @log_activity(
+        $mysqli,
+        'subjects_import',
+        'create',
+        'Import complete: processed '.count($rows).', inserted '.$inserted.', updated '.$updated.', skipped '.$skipped.' | sheet='.$sheetName.' | SY='.( $currentSY ?: 'NULL' ).' | sync ok='.$syncSynced.', sync fail='.$syncFailed,
+        null,
+        null
+    );
+
     echo json_encode([
         "success"  => true,
         "status"   => "success",
@@ -278,6 +289,7 @@ try {
     ]);
 } catch (Exception $e) {
     $mysqli->rollback();
+    @log_activity($mysqli, 'subjects_import', 'error', 'Transaction failed: '.$e->getMessage(), null, null);
     http_response_code(500);
     echo json_encode(["success"=>false,"status"=>"error","message"=>"Transaction failed: " . $e->getMessage()]);
 } finally {
