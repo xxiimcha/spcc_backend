@@ -201,6 +201,7 @@ function createSection(mysqli $conn, array $data): void {
     $numberOfStudents = isset($data['number_of_students']) ? (int)$data['number_of_students'] : null;
     $strand           = isset($data['strand']) ? (string)$data['strand'] : null;
     $roomIds          = isset($data['room_ids']) ? $data['room_ids'] : [];
+    $subjectIds       = isset($data['subject_ids']) ? $data['subject_ids'] : []; // <-- NEW
 
     if (isset($data['number_of_students']) && (!is_numeric($data['number_of_students']) || $data['number_of_students'] < 0)) {
       throw new Exception("Number of students must be a non-negative integer");
@@ -208,7 +209,7 @@ function createSection(mysqli $conn, array $data): void {
 
     if (isset($data['room_ids'])) {
       if (!is_array($data['room_ids'])) throw new Exception("room_ids must be an array");
-      $roomIds = array_values(array_unique(array_map('intval',$data['room_ids'])));
+      $roomIds = array_values(array_unique(array_map('intval', $data['room_ids'])));
       if (count($roomIds) > 0) {
         $in = implode(',', $roomIds);
         $rc = $conn->query("SELECT room_id FROM rooms WHERE room_id IN ($in)")->num_rows;
@@ -216,33 +217,32 @@ function createSection(mysqli $conn, array $data): void {
       }
     }
 
-    $schoolYear    = ss_get_current_school_year($conn);
-    $schoolYearSQL = $schoolYear !== null ? q($conn,$schoolYear) : "NULL";
+    $subjectIds = array_values(array_unique(array_filter(array_map('intval', (array)$subjectIds), fn($v) => $v > 0)));
+    $subjectIdsJson = json_encode($subjectIds, JSON_UNESCAPED_UNICODE);
 
-    $sql = "INSERT INTO sections (section_name, grade_level, number_of_students, strand, school_year)
-            VALUES (".
-              q($conn,$name).",".
-              ($gradeLevel===null ? "NULL" : q($conn,$gradeLevel)).",".
-              ($numberOfStudents===null ? "NULL" : (int)$numberOfStudents).",".
-              ($strand===null ? "NULL" : q($conn,$strand)).",".
-              $schoolYearSQL.
-            ")";
+    $schoolYear    = ss_get_current_school_year($conn);
+    $schoolYearSQL = $schoolYear !== null ? q($conn, $schoolYear) : "NULL";
+
+    $sql = "INSERT INTO sections (section_name, grade_level, number_of_students, strand, subject_ids, school_year)
+            VALUES (
+              " . q($conn, $name) . ",
+              " . ($gradeLevel === null ? "NULL" : q($conn, $gradeLevel)) . ",
+              " . ($numberOfStudents === null ? "NULL" : (int)$numberOfStudents) . ",
+              " . ($strand === null ? "NULL" : q($conn, $strand)) . ",
+              " . q($conn, $subjectIdsJson) . ",
+              " . $schoolYearSQL . "
+            )";
+
     $conn->query($sql);
     $sectionId = (int)$conn->insert_id;
 
     if (!empty($roomIds)) {
       foreach ($roomIds as $rid) {
-        $conn->query("INSERT INTO section_room_assignments (section_id, room_id) VALUES ($sectionId, ".(int)$rid.")");
+        $conn->query("INSERT INTO section_room_assignments (section_id, room_id) VALUES ($sectionId, " . (int)$rid . ")");
       }
     }
 
-    $row = $conn->query("SELECT s.*,
-                         GROUP_CONCAT(DISTINCT r.room_id, ':', r.room_number, ':', r.room_type, ':', r.room_capacity) AS rooms
-                         FROM sections s
-                         LEFT JOIN section_room_assignments sra ON s.section_id = sra.section_id
-                         LEFT JOIN rooms r ON sra.room_id = r.room_id
-                         WHERE s.section_id = $sectionId
-                         GROUP BY s.section_id")->fetch_assoc();
+    $row = $conn->query("SELECT * FROM sections WHERE section_id = $sectionId")->fetch_assoc();
 
     $section = [
       'section_id'         => (int)$row['section_id'],
@@ -250,17 +250,22 @@ function createSection(mysqli $conn, array $data): void {
       'grade_level'        => $row['grade_level'],
       'strand'             => $row['strand'],
       'number_of_students' => isset($row['number_of_students']) ? (int)$row['number_of_students'] : 0,
-      'rooms'              => parseRooms($row['rooms'] ?? null),
+      'subject_ids'        => parseSubjectIds($row['subject_ids'] ?? null),
       'school_year'        => $row['school_year'] ?? null,
     ];
 
     $conn->commit();
-    @log_activity($conn,'sections','create','Created section: '.$name.' (ID: '.$sectionId.') | SY: '.($schoolYear ?? 'NULL'),$sectionId,null);
-    ok(["status"=>"success","message"=>"Section added successfully","section"=>$section], 201);
+    @log_activity($conn, 'sections', 'create', 'Created section: ' . $name . ' (ID: ' . $sectionId . ') | SY: ' . ($schoolYear ?? 'NULL'), $sectionId, null);
+    ok([
+      "status" => "success",
+      "message" => "Section added successfully",
+      "section_id" => $sectionId, 
+      "section" => $section
+    ], 201);
   } catch (Throwable $e) {
     $conn->rollback();
-    @log_activity($conn,'sections','create','FAILED create: '.$e->getMessage(),null,null);
-    fail("Error: ".$e->getMessage(), 500);
+    @log_activity($conn, 'sections', 'create', 'FAILED create: ' . $e->getMessage(), null, null);
+    fail("Error: " . $e->getMessage(), 500);
   }
 }
 
