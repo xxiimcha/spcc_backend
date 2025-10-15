@@ -4,27 +4,24 @@ header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type');
 
-// Handle preflight OPTIONS request
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
     exit();
 }
 
 require_once __DIR__ . '/connect.php';
-/** @var mysqli $conn */
+@include_once __DIR__ . '/activity_logger.php';
+
 if (!isset($conn) || !($conn instanceof mysqli)) {
     http_response_code(500);
     echo json_encode(['success' => false, 'message' => 'Database connection not available']);
     exit();
 }
 
-// Helpers
 function bind_params(mysqli_stmt $stmt, string $types, array &$params): bool {
     $refs = [];
     $refs[] = $types;
-    foreach ($params as $k => &$v) {
-        $refs[] = &$params[$k];
-    }
+    foreach ($params as $k => &$v) $refs[] = &$params[$k];
     return call_user_func_array([$stmt, 'bind_param'], $refs);
 }
 
@@ -53,20 +50,13 @@ switch ($method) {
         json_out(false, ['message' => 'Method not allowed']);
 }
 
-/**
- * POST /schedule.php
- */
 function handleCreateSchedule(mysqli $conn) {
     try {
         $raw = file_get_contents('php://input');
-        error_log("Create schedule raw input: " . $raw);
         $input = json_decode($raw, true);
 
-        if (!$input || !is_array($input)) {
-            json_out(false, ['message' => 'Invalid JSON input']);
-        }
+        if (!$input || !is_array($input)) json_out(false, ['message' => 'Invalid JSON input']);
 
-        // Base required columns (same as before)
         $required = ['school_year','semester','subj_id','prof_id','section_id','schedule_type','start_time','end_time','days'];
         foreach ($required as $f) {
             if (!array_key_exists($f, $input) || (is_array($input[$f]) ? empty($input[$f]) : trim((string)$input[$f]) === '')) {
@@ -74,38 +64,27 @@ function handleCreateSchedule(mysqli $conn) {
             }
         }
 
-        // Basic values
         $school_year   = (string)$input['school_year'];
         $semester      = (string)$input['semester'];
         $subj_id       = (int)$input['subj_id'];
         $prof_id       = (int)$input['prof_id'];
-        $schedule_type = (string)$input['schedule_type']; // 'Onsite' | 'Online'
-        $start_time    = (string)$input['start_time']; // 'HH:MM:SS' or 'HH:MM'
+        $schedule_type = (string)$input['schedule_type'];
+        $start_time    = (string)$input['start_time'];
         $end_time      = (string)$input['end_time'];
         $room_id       = isset($input['room_id']) && $input['room_id'] !== '' ? (int)$input['room_id'] : null;
         $section_id    = (int)$input['section_id'];
         $days_json     = json_encode($input['days']);
-
-        // NEW: online_mode
         $online_mode   = isset($input['online_mode']) && $input['online_mode'] !== '' ? (string)$input['online_mode'] : null;
 
-        // Validate schedule_type and online_mode relationship
-        if (!in_array($schedule_type, ['Onsite', 'Online'], true)) {
-            json_out(false, ['message' => "Invalid schedule_type. Must be 'Onsite' or 'Online'."]);
-        }
+        if (!in_array($schedule_type, ['Onsite', 'Online'], true)) json_out(false, ['message' => "Invalid schedule_type. Must be 'Onsite' or 'Online'."]);
 
         if ($schedule_type === 'Online') {
-            // online_mode is required for Online
             if (!$online_mode || !in_array($online_mode, ['Synchronous','Asynchronous'], true)) {
                 json_out(false, ['message' => "online_mode is required for Online schedules (Synchronous/Asynchronous)."]);
             }
-            // Guardrail: force room_id NULL for Online
             $room_id = null;
         } else {
-            // For Onsite: online_mode must be NULL
             $online_mode = null;
-            // You can enforce room_id presence here if you want strict backend validation:
-            // if ($room_id === null) json_out(false, ['message' => 'room_id is required for Onsite schedules']);
         }
 
         $sql = "INSERT INTO schedules
@@ -113,41 +92,38 @@ function handleCreateSchedule(mysqli $conn) {
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?)";
         $stmt = $conn->prepare($sql);
         if (!$stmt) {
-            error_log("Create prepare error: " . $conn->error);
+            @log_activity($conn, 'schedules', 'error', 'Create prepare failed: '.$conn->error, null, null);
             json_out(false, ['message' => 'Failed to prepare insert']);
         }
 
-        // Types: s s i i s s s s i i s
         $types = 'ssiissssiis';
-
         $params = [
             $school_year,
             $semester,
             $subj_id,
             $prof_id,
             $schedule_type,
-            $online_mode, // can be NULL for Onsite
+            $online_mode,
             $start_time,
             $end_time,
-            $room_id,     // forced NULL for Online above
+            $room_id,
             $section_id,
             $days_json
         ];
 
         if (!bind_params($stmt, $types, $params)) {
-            error_log("Bind params failed on create: " . $stmt->error);
+            @log_activity($conn, 'schedules', 'error', 'Create bind failed: '.$stmt->error, null, null);
             json_out(false, ['message' => 'Failed to bind parameters']);
         }
 
         $ok = $stmt->execute();
         if (!$ok) {
-            error_log("Insert execute error: " . $stmt->error);
+            @log_activity($conn, 'schedules', 'error', 'Create execute failed: '.$stmt->error, null, null);
             json_out(false, ['message' => 'Failed to create schedule']);
         }
 
         $id = $conn->insert_id;
 
-        // Optional sync (non-fatal)
         try {
             $syncFile = __DIR__ . '/realtime_firebase_sync.php';
             if (file_exists($syncFile)) {
@@ -160,6 +136,8 @@ function handleCreateSchedule(mysqli $conn) {
         } catch (Throwable $e) {
             error_log("Firebase sync failed for schedule $id: " . $e->getMessage());
         }
+
+        @log_activity($conn, 'schedules', 'success', 'Schedule created', null, $id);
 
         json_out(true, [
             'message' => 'Schedule created successfully',
@@ -179,14 +157,11 @@ function handleCreateSchedule(mysqli $conn) {
             ]
         ]);
     } catch (Throwable $e) {
-        error_log("Create schedule error: " . $e->getMessage());
+        @log_activity($conn, 'schedules', 'error', 'Create exception: '.$e->getMessage(), null, null);
         json_out(false, ['message' => 'Error creating schedule: ' . $e->getMessage()]);
     }
 }
 
-/**
- * GET /schedule.php?school_year=&semester=&professor_id=
- */
 function handleGetSchedules(mysqli $conn) {
     try {
         $school_year  = $_GET['school_year']  ?? '';
@@ -217,21 +192,21 @@ function handleGetSchedules(mysqli $conn) {
         if ($types === '') {
             $result = $conn->query($sql);
             if (!$result) {
-                error_log("Get schedules query error: " . $conn->error);
+                @log_activity($conn, 'schedules', 'error', 'Get query failed: '.$conn->error, null, null);
                 json_out(false, ['message' => 'Failed to retrieve schedules']);
             }
         } else {
             $stmt = $conn->prepare($sql);
             if (!$stmt) {
-                error_log("Get schedules prepare error: " . $conn->error);
+                @log_activity($conn, 'schedules', 'error', 'Get prepare failed: '.$conn->error, null, null);
                 json_out(false, ['message' => 'Failed to prepare query']);
             }
             if (!bind_params($stmt, $types, $params)) {
-                error_log("Get schedules bind error: " . $stmt->error);
+                @log_activity($conn, 'schedules', 'error', 'Get bind failed: '.$stmt->error, null, null);
                 json_out(false, ['message' => 'Failed to bind parameters']);
             }
             if (!$stmt->execute()) {
-                error_log("Get schedules execute error: " . $stmt->error);
+                @log_activity($conn, 'schedules', 'error', 'Get execute failed: '.$stmt->error, null, null);
                 json_out(false, ['message' => 'Failed to execute query']);
             }
             $result = $stmt->get_result();
@@ -239,37 +214,29 @@ function handleGetSchedules(mysqli $conn) {
 
         $rows = [];
         while ($row = $result->fetch_assoc()) {
-            if (isset($row['days'])) {
-                $row['days'] = json_decode($row['days'], true) ?: [];
-            }
-            // online_mode will already be in $row because we SELECT s.*
+            if (isset($row['days'])) $row['days'] = json_decode($row['days'], true) ?: [];
             $rows[] = $row;
         }
 
+        @log_activity($conn, 'schedules', 'success', 'Schedules retrieved', null, null);
+
         json_out(true, ['data' => $rows, 'message' => 'Schedules retrieved successfully']);
     } catch (Throwable $e) {
+        @log_activity($conn, 'schedules', 'error', 'Get exception: '.$e->getMessage(), null, null);
         json_out(false, ['message' => 'Error retrieving schedules: ' . $e->getMessage()]);
     }
 }
 
-/**
- * PUT /schedule.php?id=123
- */
 function handleUpdateSchedule(mysqli $conn) {
     try {
         $id = $_GET['id'] ?? '';
-        if ($id === '') {
-            json_out(false, ['message' => 'Schedule ID is required']);
-        }
+        if ($id === '') json_out(false, ['message' => 'Schedule ID is required']);
         $id = (int)$id;
 
         $raw = file_get_contents('php://input');
         $input = json_decode($raw, true);
-        if (!$input) {
-            json_out(false, ['message' => 'Invalid JSON input']);
-        }
+        if (!$input) json_out(false, ['message' => 'Invalid JSON input']);
 
-        // Allow updating online_mode and schedule_type as well
         $allowed = [
             'school_year','semester','subj_id','prof_id','section_id','room_id',
             'schedule_type','online_mode','start_time','end_time','days'
@@ -278,7 +245,6 @@ function handleUpdateSchedule(mysqli $conn) {
         $types = '';
         $params = [];
 
-        // If schedule_type present, validate it early to drive guardrails
         $incoming_type = array_key_exists('schedule_type', $input) ? (string)$input['schedule_type'] : null;
         $incoming_mode = array_key_exists('online_mode',   $input) ? (string)$input['online_mode']   : null;
 
@@ -289,11 +255,9 @@ function handleUpdateSchedule(mysqli $conn) {
             if (!$incoming_mode || !in_array($incoming_mode, ['Synchronous','Asynchronous'], true)) {
                 json_out(false, ['message' => "online_mode is required for Online schedules (Synchronous/Asynchronous)."]);
             }
-            // Force room_id to NULL for Online even if client passes a value
             $input['room_id'] = null;
         }
         if ($incoming_type === 'Onsite') {
-            // Ensure online_mode will be NULL if switching back to Onsite
             $input['online_mode'] = null;
         }
 
@@ -313,9 +277,7 @@ function handleUpdateSchedule(mysqli $conn) {
             }
         }
 
-        if (empty($set)) {
-            json_out(false, ['message' => 'No valid fields to update']);
-        }
+        if (empty($set)) json_out(false, ['message' => 'No valid fields to update']);
 
         $sql = "UPDATE schedules SET " . implode(', ', $set) . " WHERE schedule_id = ?";
         $types .= 'i';
@@ -323,21 +285,20 @@ function handleUpdateSchedule(mysqli $conn) {
 
         $stmt = $conn->prepare($sql);
         if (!$stmt) {
-            error_log("Update prepare error: " . $conn->error);
+            @log_activity($conn, 'schedules', 'error', 'Update prepare failed: '.$conn->error, null, $id);
             json_out(false, ['message' => 'Failed to prepare update']);
         }
 
         if (!bind_params($stmt, $types, $params)) {
-            error_log("Update bind error: " . $stmt->error);
+            @log_activity($conn, 'schedules', 'error', 'Update bind failed: '.$stmt->error, null, $id);
             json_out(false, ['message' => 'Failed to bind parameters']);
         }
 
         if (!$stmt->execute()) {
-            error_log("Update execute error: " . $stmt->error);
+            @log_activity($conn, 'schedules', 'error', 'Update execute failed: '.$stmt->error, null, $id);
             json_out(false, ['message' => 'Failed to update schedule']);
         }
 
-        // Optional sync (non-fatal)
         try {
             $syncFile = __DIR__ . '/realtime_firebase_sync.php';
             if (file_exists($syncFile)) {
@@ -351,21 +312,19 @@ function handleUpdateSchedule(mysqli $conn) {
             error_log("Firebase sync failed for schedule update $id: " . $e->getMessage());
         }
 
+        @log_activity($conn, 'schedules', 'success', 'Schedule updated', null, $id);
+
         json_out(true, ['message' => 'Schedule updated successfully']);
     } catch (Throwable $e) {
+        @log_activity($conn, 'schedules', 'error', 'Update exception: '.$e->getMessage(), null, null);
         json_out(false, ['message' => 'Error updating schedule: ' . $e->getMessage()]);
     }
 }
 
-/**
- * DELETE /schedule.php?id=123
- */
 function handleDeleteSchedule(mysqli $conn) {
     try {
         $id = $_GET['id'] ?? '';
-        if ($id === '') {
-            json_out(false, ['message' => 'Schedule ID is required']);
-        }
+        if ($id === '') json_out(false, ['message' => 'Schedule ID is required']);
         $id = (int)$id;
 
         $sql = "DELETE FROM schedules WHERE schedule_id = $id";
@@ -373,10 +332,12 @@ function handleDeleteSchedule(mysqli $conn) {
 
         if ($ok === false) {
             $err = $conn->error ?: 'Failed to delete schedule';
+            @log_activity($conn, 'schedules', 'error', 'Delete failed: '.$err, null, $id);
             json_out(false, ['message' => "Failed to delete schedule: $err"]);
         }
 
         if ($conn->affected_rows < 1) {
+            @log_activity($conn, 'schedules', 'error', 'Delete affected_rows=0', null, $id);
             json_out(false, ['message' => 'No schedule deleted (id not found).']);
         }
 
@@ -393,8 +354,11 @@ function handleDeleteSchedule(mysqli $conn) {
             error_log("Firebase sync failed for schedule deletion $id: " . $e->getMessage());
         }
 
+        @log_activity($conn, 'schedules', 'success', 'Schedule deleted', null, $id);
+
         json_out(true, ['message' => 'Schedule deleted successfully']);
     } catch (Throwable $e) {
+        @log_activity($conn, 'schedules', 'error', 'Delete exception: '.$e->getMessage(), null, null);
         json_out(false, ['message' => 'Error deleting schedule: ' . $e->getMessage()]);
     }
 }
