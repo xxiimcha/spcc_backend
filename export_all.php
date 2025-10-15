@@ -116,16 +116,9 @@ try {
   $sections   = $qAll($conn, "SELECT * FROM sections"   . ($colExists($conn,'sections','school_year')   ? $whereSy : ""), 'sections');
   $subjects   = $qAll($conn, "SELECT * FROM subjects"   . ($colExists($conn,'subjects','school_year')   ? $whereSy : ""), 'subjects');
   $professors = $qAll($conn, "SELECT * FROM professors" . ($colExists($conn,'professors','school_year') ? $whereSy : ""), 'professors');
-  // no rooms export
+  // no rooms sheet
 
   /* ---------- Schedules (schema-adaptive) ---------- */
-  // schedules: schedule_id, section_id, subj_id, prof_id, room_id, start_time, end_time, days, semester, school_year
-  // sections:  section_id, section_name
-  // subjects:  subj_id,   subj_code, subj_name
-  // professors: prof_id,  prof_name
-  // rooms:     room_id,   room_name (optional join only for display)
-
-  // Detect schedule columns
   $schedIdCol   = $firstExisting($conn, 'schedules', ['schedule_id','id']);
   $secIdCol     = $firstExisting($conn, 'schedules', ['section_id']);
   $subjIdCol    = $firstExisting($conn, 'schedules', ['subj_id','subject_id']);
@@ -133,11 +126,10 @@ try {
   $roomIdCol    = $firstExisting($conn, 'schedules', ['room_id','room']);
   $startCol     = $firstExisting($conn, 'schedules', ['start_time','time_start']);
   $endCol       = $firstExisting($conn, 'schedules', ['end_time','time_end']);
-  $dayCol       = $firstExisting($conn, 'schedules', ['days','day']); // your table has "days" (JSON)
+  $dayCol       = $firstExisting($conn, 'schedules', ['days','day']);
   $semCol       = $firstExisting($conn, 'schedules', ['semester']);
   $syCol        = $firstExisting($conn, 'schedules', ['school_year']);
 
-  // Detect joined table columns
   $secPK        = $firstExisting($conn, 'sections', ['section_id','id']);
   $secName      = $firstExisting($conn, 'sections', ['section_name','name']);
   $subjPK       = $firstExisting($conn, 'subjects', ['subj_id','id','subject_id']);
@@ -148,13 +140,11 @@ try {
   $roomPK       = $firstExisting($conn, 'rooms', ['room_id','id']);
   $roomName     = $firstExisting($conn, 'rooms', ['room_name','name']);
 
-  // WHERE builder for schedules
   $parts = [];
   if ($syCol)  $parts[] = "s.`$syCol` = '".$esc($sy)."'";
   if ($sem !== '' && $semCol) $parts[] = "s.`$semCol` = '".$esc($sem)."'";
   $schedWhere = count($parts) ? (' WHERE '.implode(' AND ', $parts)) : '';
 
-  // SELECT list (build only existing cols)
   $sel = [];
   if ($dayCol)     $sel[] = "s.`$dayCol`     AS days";
   if ($startCol)   $sel[] = "s.`$startCol`   AS start_time";
@@ -163,17 +153,19 @@ try {
   if ($semCol)     $sel[] = "s.`$semCol`     AS semester";
   if ($syCol)      $sel[] = "s.`$syCol`      AS school_year";
 
-  // Joined/display columns (safe fallbacks)
+  if ($secIdCol)   $sel[] = "s.`$secIdCol`   AS section_id";
+  if ($subjIdCol)  $sel[] = "s.`$subjIdCol`  AS subject_id";
+  if ($profIdCol)  $sel[] = "s.`$profIdCol`  AS professor_id";
+
   if ($secName)   $sel[] = "sec.`$secName`   AS section_name";
   if ($subjCode)  $sel[] = "sub.`$subjCode`  AS subject_code";
   if ($subjName)  $sel[] = "sub.`$subjName`  AS subject_name";
   if ($profName)  $sel[] = "prof.`$profName` AS professor_name";
-  if ($roomName)  $sel[] = "r.`$roomName`    AS room_name"; // optional, no separate Rooms sheet
+  if ($roomName)  $sel[] = "r.`$roomName`    AS room_name";
 
   if (empty($sel)) { $sel[] = "s.*"; }
   $selectList = implode(",\n      ", $sel);
 
-  // JOINs (only if the necessary FK column exists on schedules AND PK exists on the other table)
   $joins = [];
   if ($secIdCol && $secPK)   $joins[] = "LEFT JOIN sections   sec  ON sec.`$secPK`   = s.`$secIdCol`";
   if ($subjIdCol && $subjPK) $joins[] = "LEFT JOIN subjects   sub  ON sub.`$subjPK`   = s.`$subjIdCol`";
@@ -181,10 +173,9 @@ try {
   if ($roomIdCol && $roomPK) $joins[] = "LEFT JOIN rooms      r    ON r.`$roomPK`     = s.`$roomIdCol`";
   $joinSql = implode("\n    ", $joins);
 
-  // ORDER BY (use what exists)
   $order = [];
   if ($secName)   $order[] = "sec.`$secName`";
-  if ($dayCol)    $order[] = "s.`$dayCol`";
+  if ($subjCode)  $order[] = "sub.`$subjCode`";
   if ($startCol)  $order[] = "s.`$startCol`";
   $orderBy = count($order) ? (' ORDER BY '.implode(', ', $order)) : '';
 
@@ -198,10 +189,81 @@ try {
   ";
   $schedules = $qAll($conn, $schedulesSql, 'schedules_join');
 
+  /* ---------- Consolidate days & normalize to plain text ---------- */
+  // parse "days" (can be JSON like ["friday"] or string), normalize to full names
+  $parseDays = function($val): array {
+    $val = trim((string)$val);
+    if ($val === '') return [];
+    $decoded = json_decode($val, true);
+    if (is_array($decoded)) {
+      $list = $decoded;
+    } else {
+      // fallback: strip brackets/quotes and split by comma
+      $s = trim($val, "[]");
+      $s = str_replace(['"', "'"], '', $s);
+      $list = array_filter(array_map('trim', explode(',', $s)));
+    }
+    $map = [
+      'mon' => 'monday', 'monday' => 'monday',
+      'tue' => 'tuesday', 'tues' => 'tuesday', 'tuesday' => 'tuesday',
+      'wed' => 'wednesday', 'wednesday' => 'wednesday',
+      'thu' => 'thursday', 'thur' => 'thursday', 'thurs' => 'thursday', 'thursday' => 'thursday',
+      'fri' => 'friday', 'friday' => 'friday',
+      'sat' => 'saturday', 'saturday' => 'saturday',
+      'sun' => 'sunday', 'sunday' => 'sunday',
+    ];
+    $out = [];
+    foreach ($list as $d) {
+      $k = strtolower(preg_replace('/[^a-z]/i', '', (string)$d));
+      if (isset($map[$k])) $out[] = $map[$k];
+    }
+    // unique
+    $out = array_values(array_unique($out));
+    return $out;
+  };
+
+  $weekdayOrder = ['monday'=>1,'tuesday'=>2,'wednesday'=>3,'thursday'=>4,'friday'=>5,'saturday'=>6,'sunday'=>7];
+
+  // Group by Section + Subject + Start/End time (so same class at same time consolidates days)
+  $grouped = [];
+  foreach ($schedules as $row) {
+    $days = $parseDays($row['days'] ?? '');
+    // build key
+    $sec  = $row['section_name'] ?? ($row['section_id'] ?? '');
+    $subj = $row['subject_code'] ?? ($row['subject_name'] ?? ($row['subject_id'] ?? ''));
+    $start = $row['start_time'] ?? '';
+    $end   = $row['end_time'] ?? '';
+    $key = implode('|', [$sec, $subj, $start, $end]);
+
+    if (!isset($grouped[$key])) {
+      $row['__days_set'] = [];
+      $grouped[$key] = $row;
+    }
+    // merge days
+    $existing = $grouped[$key]['__days_set'];
+    foreach ($days as $d) { $existing[$d] = true; }
+    $grouped[$key]['__days_set'] = $existing;
+  }
+
+  // Flatten groups, sort days by weekday, and turn into "Monday, Wednesday" text
+  $consolidated = [];
+  foreach ($grouped as $row) {
+    $dset = array_keys($row['__days_set']);
+    usort($dset, function($a,$b) use ($weekdayOrder){
+      return ($weekdayOrder[$a] ?? 99) <=> ($weekdayOrder[$b] ?? 99);
+    });
+    // Capitalize
+    $pretty = implode(', ', array_map(fn($x)=>ucfirst($x), $dset));
+    $row['days'] = $pretty;                 // replace with plain text
+    unset($row['__days_set']);              // cleanup
+    $consolidated[] = $row;
+  }
+  $schedules = $consolidated;
+
   /* ---------- PhpSpreadsheet ---------- */
   $autoload = __DIR__ . '/vendor/autoload.php';
   if (!file_exists($autoload)) throw new RuntimeException('vendor/autoload.php not found. Run: composer require phpoffice/phpspreadsheet');
-  if (!extension_loaded('zip')) throw new RuntimeException('PHP extension \"zip\" is required. Enable it in php.ini and restart Apache.');
+  if (!extension_loaded('zip')) throw new RuntimeException('PHP extension "zip" is required. Enable it in php.ini and restart Apache.');
   require_once $autoload;
 
   // Universal addSheet helper (Coordinate class used fully-qualified)
