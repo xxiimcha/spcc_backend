@@ -12,8 +12,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 $host = "localhost";
-$user = "u341538466_spcc"; // Default XAMPP user
-$password = "9g1k~M|;D"; // Default XAMPP password (empty)
+$user = "u341538466_spcc";
+$password = "9g1k~M|;D";
 $database = "u341538466_spcc";
 
 $conn = new mysqli($host, $user, $password, $database);
