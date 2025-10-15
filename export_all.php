@@ -153,10 +153,6 @@ try {
   if ($semCol)     $sel[] = "s.`$semCol`     AS semester";
   if ($syCol)      $sel[] = "s.`$syCol`      AS school_year";
 
-  if ($secIdCol)   $sel[] = "s.`$secIdCol`   AS section_id";
-  if ($subjIdCol)  $sel[] = "s.`$subjIdCol`  AS subject_id";
-  if ($profIdCol)  $sel[] = "s.`$profIdCol`  AS professor_id";
-
   if ($secName)   $sel[] = "sec.`$secName`   AS section_name";
   if ($subjCode)  $sel[] = "sub.`$subjCode`  AS subject_code";
   if ($subjName)  $sel[] = "sub.`$subjName`  AS subject_name";
