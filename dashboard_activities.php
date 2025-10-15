@@ -13,12 +13,10 @@ if($_SERVER['REQUEST_METHOD'] == 'OPTIONS'){
     exit(0);
 }
 
-// Enable error reporting for debugging - REMOVE IN PRODUCTION
 ini_set('display_errors', 1);
 error_reporting(E_ALL);
 
 try {
-    // Include database connection
     include 'connect.php';
     
     // Check connection
@@ -26,11 +24,9 @@ try {
         throw new Exception("Connection failed: " . $conn->connect_error);
     }
     
-    // Function to get recent activities
     function getRecentActivities($conn) {
         $activities = [];
         
-        // Try-catch blocks for each query to prevent entire script failure
         try {
             // Get latest professors
             $sql = "SELECT prof_id, prof_name FROM professors ORDER BY prof_id DESC LIMIT 5";
