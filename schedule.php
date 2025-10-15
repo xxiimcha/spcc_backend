@@ -66,7 +66,7 @@ function handleCreateSchedule(mysqli $conn) {
             json_out(false, ['message' => 'Invalid JSON input']);
         }
 
-        // Validate required columns
+        // Base required columns (same as before)
         $required = ['school_year','semester','subj_id','prof_id','section_id','schedule_type','start_time','end_time','days'];
         foreach ($required as $f) {
             if (!array_key_exists($f, $input) || (is_array($input[$f]) ? empty($input[$f]) : trim((string)$input[$f]) === '')) {
@@ -74,31 +74,51 @@ function handleCreateSchedule(mysqli $conn) {
             }
         }
 
-        // Prepare values
+        // Basic values
         $school_year   = (string)$input['school_year'];
         $semester      = (string)$input['semester'];
         $subj_id       = (int)$input['subj_id'];
         $prof_id       = (int)$input['prof_id'];
-        $schedule_type = (string)$input['schedule_type'];
+        $schedule_type = (string)$input['schedule_type']; // 'Onsite' | 'Online'
         $start_time    = (string)$input['start_time']; // 'HH:MM:SS' or 'HH:MM'
         $end_time      = (string)$input['end_time'];
         $room_id       = isset($input['room_id']) && $input['room_id'] !== '' ? (int)$input['room_id'] : null;
         $section_id    = (int)$input['section_id'];
         $days_json     = json_encode($input['days']);
 
+        // NEW: online_mode
+        $online_mode   = isset($input['online_mode']) && $input['online_mode'] !== '' ? (string)$input['online_mode'] : null;
+
+        // Validate schedule_type and online_mode relationship
+        if (!in_array($schedule_type, ['Onsite', 'Online'], true)) {
+            json_out(false, ['message' => "Invalid schedule_type. Must be 'Onsite' or 'Online'."]);
+        }
+
+        if ($schedule_type === 'Online') {
+            // online_mode is required for Online
+            if (!$online_mode || !in_array($online_mode, ['Synchronous','Asynchronous'], true)) {
+                json_out(false, ['message' => "online_mode is required for Online schedules (Synchronous/Asynchronous)."]);
+            }
+            // Guardrail: force room_id NULL for Online
+            $room_id = null;
+        } else {
+            // For Onsite: online_mode must be NULL
+            $online_mode = null;
+            // You can enforce room_id presence here if you want strict backend validation:
+            // if ($room_id === null) json_out(false, ['message' => 'room_id is required for Onsite schedules']);
+        }
+
         $sql = "INSERT INTO schedules
-                (school_year, semester, subj_id, prof_id, schedule_type, start_time, end_time, created_at, room_id, section_id, days)
-                VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?)";
+                (school_year, semester, subj_id, prof_id, schedule_type, online_mode, start_time, end_time, created_at, room_id, section_id, days)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?)";
         $stmt = $conn->prepare($sql);
         if (!$stmt) {
             error_log("Create prepare error: " . $conn->error);
             json_out(false, ['message' => 'Failed to prepare insert']);
         }
 
-        // Types: s s i i s s s i i s
-        $types = 'ssii sss iis';
-        // spaces are just for readability above; remove for actual string:
-        $types = 'ssiisssiis';
+        // Types: s s i i s s s s i i s
+        $types = 'ssiissssiis';
 
         $params = [
             $school_year,
@@ -106,9 +126,10 @@ function handleCreateSchedule(mysqli $conn) {
             $subj_id,
             $prof_id,
             $schedule_type,
+            $online_mode, // can be NULL for Onsite
             $start_time,
             $end_time,
-            $room_id,     // can be NULL
+            $room_id,     // forced NULL for Online above
             $section_id,
             $days_json
         ];
@@ -143,17 +164,18 @@ function handleCreateSchedule(mysqli $conn) {
         json_out(true, [
             'message' => 'Schedule created successfully',
             'data' => [
-                'schedule_id'  => (int)$id,
-                'school_year'  => $school_year,
-                'semester'     => $semester,
-                'subj_id'      => $subj_id,
-                'prof_id'      => $prof_id,
-                'section_id'   => $section_id,
-                'room_id'      => $room_id,
-                'schedule_type'=> $schedule_type,
-                'start_time'   => $start_time,
-                'end_time'     => $end_time,
-                'days'         => json_decode($days_json, true),
+                'schedule_id'   => (int)$id,
+                'school_year'   => $school_year,
+                'semester'      => $semester,
+                'subj_id'       => $subj_id,
+                'prof_id'       => $prof_id,
+                'section_id'    => $section_id,
+                'room_id'       => $room_id,
+                'schedule_type' => $schedule_type,
+                'online_mode'   => $online_mode,
+                'start_time'    => $start_time,
+                'end_time'      => $end_time,
+                'days'          => json_decode($days_json, true),
             ]
         ]);
     } catch (Throwable $e) {
@@ -193,7 +215,6 @@ function handleGetSchedules(mysqli $conn) {
         $sql .= implode('', $conds) . " ORDER BY s.schedule_id DESC";
 
         if ($types === '') {
-            // no params -> simple query
             $result = $conn->query($sql);
             if (!$result) {
                 error_log("Get schedules query error: " . $conn->error);
@@ -221,6 +242,7 @@ function handleGetSchedules(mysqli $conn) {
             if (isset($row['days'])) {
                 $row['days'] = json_decode($row['days'], true) ?: [];
             }
+            // online_mode will already be in $row because we SELECT s.*
             $rows[] = $row;
         }
 
@@ -247,10 +269,33 @@ function handleUpdateSchedule(mysqli $conn) {
             json_out(false, ['message' => 'Invalid JSON input']);
         }
 
-        $allowed = ['school_year','semester','subj_id','prof_id','section_id','room_id','schedule_type','start_time','end_time','days'];
+        // Allow updating online_mode and schedule_type as well
+        $allowed = [
+            'school_year','semester','subj_id','prof_id','section_id','room_id',
+            'schedule_type','online_mode','start_time','end_time','days'
+        ];
         $set = [];
         $types = '';
         $params = [];
+
+        // If schedule_type present, validate it early to drive guardrails
+        $incoming_type = array_key_exists('schedule_type', $input) ? (string)$input['schedule_type'] : null;
+        $incoming_mode = array_key_exists('online_mode',   $input) ? (string)$input['online_mode']   : null;
+
+        if ($incoming_type !== null && !in_array($incoming_type, ['Onsite','Online'], true)) {
+            json_out(false, ['message' => "Invalid schedule_type. Must be 'Onsite' or 'Online'."]);
+        }
+        if ($incoming_type === 'Online') {
+            if (!$incoming_mode || !in_array($incoming_mode, ['Synchronous','Asynchronous'], true)) {
+                json_out(false, ['message' => "online_mode is required for Online schedules (Synchronous/Asynchronous)."]);
+            }
+            // Force room_id to NULL for Online even if client passes a value
+            $input['room_id'] = null;
+        }
+        if ($incoming_type === 'Onsite') {
+            // Ensure online_mode will be NULL if switching back to Onsite
+            $input['online_mode'] = null;
+        }
 
         foreach ($allowed as $f) {
             if (array_key_exists($f, $input)) {
@@ -263,7 +308,7 @@ function handleUpdateSchedule(mysqli $conn) {
                     $params[] = json_encode($input[$f]);
                 } else {
                     $types .= 's';
-                    $params[] = (string)$input[$f];
+                    $params[] = ($input[$f] === null ? null : (string)$input[$f]);
                 }
             }
         }

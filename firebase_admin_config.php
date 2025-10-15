@@ -17,7 +17,7 @@ class FirebaseAdminConfig {
     
     public function __construct() {
         // Path to your service account JSON file
-        $serviceAccountPath = __DIR__ . '/spcc-database-firebase-adminsdk-fbsvc-9d1c50f7b5.json';
+        $serviceAccountPath = __DIR__ . '/spcc-database-firebase-adminsdk-fbsvc-5f7afc98b9.json';
         
         if (!file_exists($serviceAccountPath)) {
             throw new Exception('Firebase service account file not found: ' . $serviceAccountPath);
