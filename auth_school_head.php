@@ -66,11 +66,6 @@ try {
   // Exact (case-sensitive) compare
   $valid = ($password === $dbPass);
 
-  // OPTIONAL legacy fallback: case-insensitive password compare for old accounts
-  // Uncomment this block if you want to accept CCATOR1 == ccator1:
-  // if (!$valid && strcasecmp($password, $dbPass) === 0) {
-  //   $valid = true;
-  // }
 
   if (!$valid) {
     echo json_encode(['status'=>'error','message'=>'Invalid username or password']); exit();
