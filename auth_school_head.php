@@ -15,8 +15,8 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') { echo json_encode(['success'=>false,
 
 $input = json_decode(file_get_contents('php://input'), true) ?: [];
 $identifier = trim((string)($input['username'] ?? ''));
-$password   = (string)($input['password'] ?? '');
-if ($identifier === '' || $password === '') { echo json_encode(['success'=>false,'message'=>'Username and password are required']); exit; }
+$pass   = (string)($input['password'] ?? '');
+if ($identifier === '' || $pass === '') { echo json_encode(['success'=>false,'message'=>'Username and password are required']); exit; }
 
 // ---- DB ----
 require_once __DIR__.'/connect.php';
@@ -64,9 +64,9 @@ $remove_nbsp = function(string $s){ return str_replace("\xC2\xA0", ' ', $s); };
 $rt = function(string $s){ $s = preg_replace("/(\r\n|\n|\r)+$/", "", $s); return trim($s); };
 
 $dbPassNorm = $rt($remove_nbsp($dbPassRaw));
-$inPassNorm = $rt($remove_nbsp($password));
+$inPassNorm = $rt($remove_nbsp($pass));
 
-$equalStrict   = hash_equals($dbPassRaw, $password);
+$equalStrict   = hash_equals($dbPassRaw, $pass);
 $equalTrimmed  = hash_equals($dbPassNorm, $inPassNorm);
 $equalIcase    = (strcasecmp($dbPassNorm, $inPassNorm) === 0); // just for debug
 
@@ -88,8 +88,8 @@ if (!$equalStrict && !$equalTrimmed) {
         'icase'=>$equalIcase
       ],
       'input'=>[
-        'len'=>strlen($password),
-        'hex'=>bin2hex($password)
+        'len'=>strlen($pass),
+        'hex'=>bin2hex($pass)
       ],
       'db_password'=>[
         'len'=>strlen($dbPassRaw),
