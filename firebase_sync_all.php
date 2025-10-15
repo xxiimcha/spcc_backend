@@ -1,6 +1,5 @@
 <?php
-// firebase_sync_all.php - Sync to Realtime DB + Import/Update Firebase Auth users (professors)
-// Keeps your existing firebase_config.php unchanged and uses firebase_admin_config.php (Kreait) for Auth.
+ini_set('display_errors', 1); ini_set('display_startup_errors', 1); error_reporting(E_ALL);
 
 declare(strict_types=1);
 

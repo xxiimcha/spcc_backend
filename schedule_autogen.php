@@ -62,9 +62,12 @@ try {
   $profMaxWeeklySchedules = isset($in['profMaxWeeklySchedules']) ? (int)$in['profMaxWeeklySchedules'] : 8;
   if ($profMaxWeeklySchedules <= 0) { $profMaxWeeklySchedules = 8; }
 
-  // NEW: minimum gap between classes for the same professor (minutes, default 10)
+  // Minimum gap for same professor (minutes, default 10)
   $profMinGapMinutes = isset($in['profMinGapMinutes']) ? (int)$in['profMinGapMinutes'] : 10;
   if ($profMinGapMinutes < 0) $profMinGapMinutes = 0;
+
+  // NEW: avoid placing the same subject at the exact same time across different days
+  $avoidSameTimeAcrossDays = (bool)($in['avoidSameTimeAcrossDays'] ?? true);
 
   if ($schoolYear === '' || $semester === '') throw new Exception('Missing school_year or semester');
   if (!is_array($daysIn) || count($daysIn) === 0) throw new Exception('At least one active day is required');
@@ -300,7 +303,16 @@ try {
                          AND (end_time='{$s}' OR start_time='{$e}')",0) > 0;
   };
 
-  // UPDATED: penalize touching; we don't "reward" adjacency anymore
+  // NEW: same subject same time on OTHER days?
+  $sameTimeOtherDay = function(int $sec,int $subj,string $day,string $s,string $e) use ($qOne,$sy,$sem) {
+    return (int)$qOne("SELECT COUNT(*) FROM schedules
+                       WHERE school_year='{$sy}' AND semester='{$sem}'
+                         AND section_id={$sec} AND subj_id={$subj}
+                         AND start_time='{$s}' AND end_time='{$e}'
+                         AND NOT JSON_CONTAINS(days, JSON_QUOTE('{$day}'))",0) > 0;
+  };
+
+  // Penalize touching / tiny gaps for professors
   $profAdjScore = function(int $pid,string $day,string $s,string $e,int $slotMin) use ($qOne,$sy,$sem) {
     $touch = (int)$qOne("SELECT COUNT(*) FROM schedules
                          WHERE school_year='{$sy}' AND semester='{$sem}' AND prof_id={$pid}
@@ -317,8 +329,8 @@ try {
                           AND TIMESTAMPDIFF(MINUTE, '{$e}', start_time) = {$slotMin}",0);
 
     $score = 0;
-    if ($touch>0) $score -= 100;      // strong penalty for touching blocks
-    if ($gapNeighbor>0) $score -= 25*$gapNeighbor; // also penalize 1-slot tiny gaps
+    if ($touch>0) $score -= 100;
+    if ($gapNeighbor>0) $score -= 25*$gapNeighbor;
     return $score;
   };
 
@@ -436,7 +448,7 @@ try {
                                  AND NOT (end_time<='{$sE}' OR start_time>='{$eE}')",0);
               if ($c>0) { $skipped++; $conflicts[]=["type"=>"prof","prof_id"=>$profId,"day"=>$day,"s"=>$s,"e"=>$e]; continue; }
 
-              // NEW: Professor minimum gap enforcement (no class within +/- profMinGapMinutes)
+              // Professor minimum gap
               if ($profMinGapMinutes > 0) {
                 $g = (int)$qOne("
                   SELECT COUNT(*) FROM schedules
@@ -455,11 +467,18 @@ try {
               }
             }
 
+            // NEW: Avoid same subject at the same time across different days
+            if ($avoidSameTimeAcrossDays && $sameTimeOtherDay($secId, $subjId, $day, $s, $e)) {
+              $skipped++;
+              $conflicts[] = ["type"=>"subject_same_time_pattern","section_id"=>$secId,"subj_id"=>$subjId,"day"=>$day,"s"=>$s,"e"=>$e];
+              continue;
+            }
+
             // Subject weekly target within this section
             $curr = $ignoreExisting ? ($target - $remain) : (int)$qOne($baseMinsSQL,0);
             if ($curr + $len > $target) continue;
 
-            // Avoid duplicates for this section+subject+exact slot
+            // Avoid duplicates for this section+subject+exact slot (same day)
             $dup = (int)$qOne("SELECT 1 FROM schedules
                                WHERE school_year='{$sy}' AND semester='{$sem}'
                                  AND section_id={$secId} AND subj_id={$subjId}
@@ -559,8 +578,9 @@ try {
         "lunchEnd"=>$lunchEnd,
         "addFixedBlocks"=>$addFixedBlocks,
         "profMaxWeeklySchedules"=>$profMaxWeeklySchedules,
-        // NEW: echo minimum gap back
-        "profMinGapMinutes"=>$profMinGapMinutes
+        "profMinGapMinutes"=>$profMinGapMinutes,
+        // NEW echo
+        "avoidSameTimeAcrossDays"=>$avoidSameTimeAcrossDays
       ],
       "metrics"=>$metrics
     ]
