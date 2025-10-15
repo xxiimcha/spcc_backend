@@ -111,20 +111,19 @@ try {
     }
   };
 
-  /* ---------- Simple sheets (auto-filter by school_year if present) ---------- */
+  /* ---------- Sheets (filter by school_year if present) ---------- */
   $whereSy    = " WHERE school_year = '".$esc($sy)."' ";
   $sections   = $qAll($conn, "SELECT * FROM sections"   . ($colExists($conn,'sections','school_year')   ? $whereSy : ""), 'sections');
   $subjects   = $qAll($conn, "SELECT * FROM subjects"   . ($colExists($conn,'subjects','school_year')   ? $whereSy : ""), 'subjects');
   $professors = $qAll($conn, "SELECT * FROM professors" . ($colExists($conn,'professors','school_year') ? $whereSy : ""), 'professors');
-  $rooms      = $qAll($conn, "SELECT * FROM rooms"      . ($colExists($conn,'rooms','school_year')      ? $whereSy : ""), 'rooms');
-  $sra        = $qAll($conn, "SELECT * FROM section_room_assignments" . ($colExists($conn,'section_room_assignments','school_year') ? $whereSy : ""), 'section_room_assignments');
+  // no rooms export
 
   /* ---------- Schedules (schema-adaptive) ---------- */
   // schedules: schedule_id, section_id, subj_id, prof_id, room_id, start_time, end_time, days, semester, school_year
   // sections:  section_id, section_name
   // subjects:  subj_id,   subj_code, subj_name
   // professors: prof_id,  prof_name
-  // rooms:     room_id,   room_name (assumed)
+  // rooms:     room_id,   room_name (optional join only for display)
 
   // Detect schedule columns
   $schedIdCol   = $firstExisting($conn, 'schedules', ['schedule_id','id']);
@@ -173,7 +172,7 @@ try {
   if ($subjCode)  $sel[] = "sub.`$subjCode`  AS subject_code";
   if ($subjName)  $sel[] = "sub.`$subjName`  AS subject_name";
   if ($profName)  $sel[] = "prof.`$profName` AS professor_name";
-  if ($roomName)  $sel[] = "r.`$roomName`    AS room_name";
+  if ($roomName)  $sel[] = "r.`$roomName`    AS room_name"; // optional, no separate Rooms sheet
 
   if (empty($sel)) { $sel[] = "s.*"; }
   $selectList = implode(",\n      ", $sel);
@@ -209,10 +208,7 @@ try {
   if (!extension_loaded('zip')) throw new RuntimeException('PHP extension \"zip\" is required. Enable it in php.ini and restart Apache.');
   require_once $autoload;
 
-  // Use Coordinate helper for universal compatibility
-  use PhpOffice\PhpSpreadsheet\Cell\Coordinate;
-
-  // Universal addSheet helper (no setCellValueByColumnAndRow)
+  // Universal addSheet helper (Coordinate class used fully-qualified)
   $addSheet = function(\PhpOffice\PhpSpreadsheet\Spreadsheet $wb, string $title, array $rows): void {
     $sheet = $wb->createSheet();
     $sheet->setTitle(substr(preg_replace('/[\\\\\\/*?:\\[\\]]/', '_', $title), 0, 31));
@@ -222,7 +218,7 @@ try {
 
     // Header row
     foreach ($headers as $i => $h) {
-      $col = Coordinate::stringFromColumnIndex($i + 1); // 1 => A, 2 => B, ...
+      $col = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($i + 1);
       $sheet->setCellValue("{$col}1", $h);
     }
 
@@ -230,17 +226,17 @@ try {
     $r = 2;
     foreach ($rows as $row) {
       foreach ($headers as $i => $h) {
-        $col = Coordinate::stringFromColumnIndex($i + 1);
+        $col = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($i + 1);
         $sheet->setCellValue("{$col}{$r}", $row[$h] ?? null);
       }
       $r++;
     }
 
     // Style
-    $lastCol = Coordinate::stringFromColumnIndex(count($headers));
+    $lastCol = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex(count($headers));
     $sheet->getStyle("A1:{$lastCol}1")->getFont()->setBold(true);
     for ($i = 1; $i <= count($headers); $i++) {
-      $sheet->getColumnDimension(Coordinate::stringFromColumnIndex($i))->setAutoSize(true);
+      $sheet->getColumnDimension(\PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($i))->setAutoSize(true);
     }
   };
 
@@ -266,12 +262,12 @@ try {
   $summary->getColumnDimension('A')->setAutoSize(true);
   $summary->getColumnDimension('B')->setAutoSize(true);
 
-  $addSheet($wb, 'Sections', $sections);
-  $addSheet($wb, 'Subjects', $subjects);
+  // Only the sheets you want:
+  $addSheet($wb, 'Sections',   $sections);
+  $addSheet($wb, 'Subjects',   $subjects);
   $addSheet($wb, 'Professors', $professors);
-  $addSheet($wb, 'Rooms', $rooms);
-  $addSheet($wb, 'Schedules', $schedules);
-  $addSheet($wb, 'Section_Room_Assign', $sra);
+  $addSheet($wb, 'Schedules',  $schedules);
+
   log_line('WORKBOOK_BUILT');
 
   /* ---------- Stream XLSX ---------- */
