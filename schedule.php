@@ -237,10 +237,41 @@ function handleUpdateSchedule(mysqli $conn) {
         $input = json_decode($raw, true);
         if (!$input) json_out(false, ['message' => 'Invalid JSON input']);
 
+        if (array_key_exists('professor_id', $input) && !array_key_exists('prof_id', $input)) {
+            $input['prof_id'] = (int)$input['professor_id'];
+        }
+
+        $curQ = $conn->query("SELECT s.schedule_id, s.prof_id, s.school_year, p.prof_name AS current_professor
+                                FROM schedules s
+                           LEFT JOIN professors p ON p.prof_id = s.prof_id
+                               WHERE s.schedule_id={$id} LIMIT 1");
+        if (!$curQ || $curQ->num_rows === 0) {
+            @log_activity($conn, 'schedules', 'error', "Update failed: schedule not found (ID {$id})", null, $id);
+            json_out(false, ['message' => 'Schedule not found']);
+        }
+        $cur = $curQ->fetch_assoc();
+        $oldProfId   = (int)($cur['prof_id'] ?? 0);
+        $oldProfName = (string)($cur['current_professor'] ?? '');
+        $schedSY     = (string)($cur['school_year'] ?? '');
+
+        $newProfRow = null;
+        if (array_key_exists('prof_id', $input)) {
+            $newPid = (int)$input['prof_id'];
+            if ($newPid <= 0) json_out(false, ['message' => 'Invalid prof_id']);
+            $profSql = "SELECT prof_id, prof_name, school_year FROM professors WHERE prof_id={$newPid} LIMIT 1";
+            $pr = $conn->query($profSql);
+            if (!$pr || $pr->num_rows === 0) {
+                @log_activity($conn, 'schedules', 'error', "Update failed: professor not found (prof_id {$newPid})", null, $id);
+                json_out(false, ['message' => 'Professor not found']);
+            }
+            $newProfRow = $pr->fetch_assoc();
+        }
+
         $allowed = [
             'school_year','semester','subj_id','prof_id','section_id','room_id',
             'schedule_type','online_mode','start_time','end_time','days'
         ];
+
         $set = [];
         $types = '';
         $params = [];
@@ -264,7 +295,7 @@ function handleUpdateSchedule(mysqli $conn) {
         foreach ($allowed as $f) {
             if (array_key_exists($f, $input)) {
                 $set[] = "$f = ?";
-                if ($f === 'subj_id' || $f === 'prof_id' || $f === 'section_id' || $f === 'room_id') {
+                if (in_array($f, ['subj_id','prof_id','section_id','room_id'], true)) {
                     $types .= 'i';
                     $params[] = ($input[$f] === null || $input[$f] === '') ? null : (int)$input[$f];
                 } elseif ($f === 'days') {
@@ -312,7 +343,13 @@ function handleUpdateSchedule(mysqli $conn) {
             error_log("Firebase sync failed for schedule update $id: " . $e->getMessage());
         }
 
-        @log_activity($conn, 'schedules', 'success', 'Schedule updated', null, $id);
+        if ($newProfRow && array_key_exists('prof_id', $input)) {
+            $newProfName = (string)($newProfRow['prof_name'] ?? '');
+            $desc = "Professor reassigned: {$oldProfName} (ID: {$oldProfId}) → {$newProfName} (ID: ".(int)$newProfRow['prof_id'].") for schedule ID {$id}";
+            @log_activity($conn, 'schedules', 'update', $desc, null, $id);
+        } else {
+            @log_activity($conn, 'schedules', 'success', 'Schedule updated', null, $id);
+        }
 
         json_out(true, ['message' => 'Schedule updated successfully']);
     } catch (Throwable $e) {
