@@ -58,9 +58,13 @@ try {
     ['label' => 'Recess',   'start' => '08:00', 'end' => '08:30', 'status' => 'fixed'],
   ];
 
-  // NEW: configurable weekly cap (defaults to 8)
+  // Weekly cap (defaults to 8)
   $profMaxWeeklySchedules = isset($in['profMaxWeeklySchedules']) ? (int)$in['profMaxWeeklySchedules'] : 8;
   if ($profMaxWeeklySchedules <= 0) { $profMaxWeeklySchedules = 8; }
+
+  // NEW: minimum gap between classes for the same professor (minutes, default 10)
+  $profMinGapMinutes = isset($in['profMinGapMinutes']) ? (int)$in['profMinGapMinutes'] : 10;
+  if ($profMinGapMinutes < 0) $profMinGapMinutes = 0;
 
   if ($schoolYear === '' || $semester === '') throw new Exception('Missing school_year or semester');
   if (!is_array($daysIn) || count($daysIn) === 0) throw new Exception('At least one active day is required');
@@ -125,7 +129,7 @@ try {
     ];
   }
 
-  // Existing load in MINUTES (for tie-breaks / balancing)
+  // Existing load in MINUTES (for balancing)
   $profLoad = [];
   foreach ($qAll("
     SELECT prof_id, COALESCE(SUM(TIME_TO_SEC(TIMEDIFF(end_time,start_time))/60),0) AS m
@@ -137,7 +141,7 @@ try {
     if (!isset($profLoad[$pid])) $profLoad[$pid] = 0;
   }
 
-  // NEW: Existing weekly schedule COUNT per professor (cap enforcement)
+  // Weekly schedule COUNT per professor (cap enforcement)
   $profWeeklyCount = [];
   foreach ($qAll("
     SELECT prof_id, COUNT(*) AS c
@@ -197,7 +201,7 @@ try {
       if ($profId === null) {
         $cands = $canTeach[$subjId] ?? [];
 
-        // NEW: filter out professors already at or above the weekly cap
+        // Filter out professors already at or above the weekly cap
         $cands = array_values(array_filter($cands, function($pid) use ($profWeeklyCount, $profMaxWeeklySchedules) {
           return ($profWeeklyCount[$pid] ?? 0) < $profMaxWeeklySchedules;
         }));
@@ -210,10 +214,6 @@ try {
         }
         if ($best===null) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId,"reason"=>"no_candidate_after_cap_filter"]; continue; }
         $profId = (int)$best;
-
-        // NOTE: we do NOT pre-increment weekly count here; we enforce strictly during insert,
-        //       and also track increments per successful insert below.
-        //       (Multiple section-subjects could still target the same prof; the generation loop will stop at cap.)
       } else {
         // If a fixed professor is specified AND already at cap, skip this assignment entirely
         if (($profWeeklyCount[$profId] ?? 0) >= $profMaxWeeklySchedules) {
@@ -254,7 +254,7 @@ try {
       if (!isset($triplesBySection[$secId])) $triplesBySection[$secId]=[];
       foreach ($subs as $subjId) {
         $cands = $canTeach[$subjId] ?? [];
-        // NEW: filter out professors at or above cap
+        // Filter out professors at or above cap
         $cands = array_values(array_filter($cands, function($pid) use ($profWeeklyCount, $profMaxWeeklySchedules) {
           return ($profWeeklyCount[$pid] ?? 0) < $profMaxWeeklySchedules;
         }));
@@ -299,23 +299,26 @@ try {
                          AND JSON_CONTAINS(days, JSON_QUOTE('{$day}'))
                          AND (end_time='{$s}' OR start_time='{$e}')",0) > 0;
   };
+
+  // UPDATED: penalize touching; we don't "reward" adjacency anymore
   $profAdjScore = function(int $pid,string $day,string $s,string $e,int $slotMin) use ($qOne,$sy,$sem) {
     $touch = (int)$qOne("SELECT COUNT(*) FROM schedules
                          WHERE school_year='{$sy}' AND semester='{$sem}' AND prof_id={$pid}
                            AND JSON_CONTAINS(days, JSON_QUOTE('{$day}'))
                            AND (end_time='{$s}' OR start_time='{$e}')",0);
-    $gap = 0;
-    $gap += (int)$qOne("SELECT COUNT(*) FROM schedules
+    $gapNeighbor = 0;
+    $gapNeighbor += (int)$qOne("SELECT COUNT(*) FROM schedules
                         WHERE school_year='{$sy}' AND semester='{$sem}' AND prof_id={$pid}
                           AND JSON_CONTAINS(days, JSON_QUOTE('{$day}'))
                           AND TIMESTAMPDIFF(MINUTE, end_time, '{$s}') = {$slotMin}",0);
-    $gap += (int)$qOne("SELECT COUNT(*) FROM schedules
+    $gapNeighbor += (int)$qOne("SELECT COUNT(*) FROM schedules
                         WHERE school_year='{$sy}' AND semester='{$sem}' AND prof_id={$pid}
                           AND JSON_CONTAINS(days, JSON_QUOTE('{$day}'))
                           AND TIMESTAMPDIFF(MINUTE, '{$e}', start_time) = {$slotMin}",0);
+
     $score = 0;
-    if ($touch>0) $score += 15;
-    if ($gap>0)   $score -= 25*$gap;
+    if ($touch>0) $score -= 100;      // strong penalty for touching blocks
+    if ($gapNeighbor>0) $score -= 25*$gapNeighbor; // also penalize 1-slot tiny gaps
     return $score;
   };
 
@@ -380,7 +383,7 @@ try {
       $subjId = (int)$t['subj_id'];
       $profId = (int)$t['prof_id'];
 
-      // NEW: If professor already at weekly cap, skip this section-subject pair entirely
+      // Weekly cap
       if (($profWeeklyCount[$profId] ?? 0) >= $profMaxWeeklySchedules) {
         $skipped++;
         $conflicts[] = ["type"=>"prof_weekly_cap", "prof_id"=>$profId, "section_id"=>$secId, "subj_id"=>$subjId];
@@ -399,9 +402,8 @@ try {
       $genForPair = 0;
 
       while ($remain > 0) {
-        // NEW: Re-check cap before each new row
+        // Re-check weekly cap before each row
         if (($profWeeklyCount[$profId] ?? 0) >= $profMaxWeeklySchedules) {
-          // Hit the cap; stop generating more rows for this professor
           $conflicts[] = ["type"=>"prof_weekly_cap_reached", "prof_id"=>$profId, "section_id"=>$secId, "subj_id"=>$subjId];
           break;
         }
@@ -417,6 +419,7 @@ try {
 
             $sE = $esc($s); $eE = $esc($e);
 
+            // Section-time overlap
             if ($enfSec) {
               $c = (int)$qOne("SELECT COUNT(*) FROM schedules
                                WHERE school_year='{$sy}' AND semester='{$sem}' AND section_id={$secId}
@@ -424,17 +427,39 @@ try {
                                  AND NOT (end_time<='{$sE}' OR start_time>='{$eE}')",0);
               if ($c>0) { $skipped++; $conflicts[]=["type"=>"section","section_id"=>$secId,"day"=>$day,"s"=>$s,"e"=>$e]; continue; }
             }
+
+            // Professor overlap
             if ($enfProf) {
               $c = (int)$qOne("SELECT COUNT(*) FROM schedules
                                WHERE school_year='{$sy}' AND semester='{$sem}' AND prof_id={$profId}
                                  AND JSON_CONTAINS(days, JSON_QUOTE('{$day}'))
                                  AND NOT (end_time<='{$sE}' OR start_time>='{$eE}')",0);
               if ($c>0) { $skipped++; $conflicts[]=["type"=>"prof","prof_id"=>$profId,"day"=>$day,"s"=>$s,"e"=>$e]; continue; }
+
+              // NEW: Professor minimum gap enforcement (no class within +/- profMinGapMinutes)
+              if ($profMinGapMinutes > 0) {
+                $g = (int)$qOne("
+                  SELECT COUNT(*) FROM schedules
+                    WHERE school_year='{$sy}' AND semester='{$sem}' AND prof_id={$profId}
+                      AND JSON_CONTAINS(days, JSON_QUOTE('{$day}'))
+                      AND NOT (
+                        end_time <= SUBTIME('{$sE}', SEC_TO_TIME({$profMinGapMinutes}*60))
+                        OR start_time >= ADDTIME('{$eE}', SEC_TO_TIME({$profMinGapMinutes}*60))
+                      )
+                ",0);
+                if ($g>0) {
+                  $skipped++;
+                  $conflicts[]=["type"=>"prof_gap","prof_id"=>$profId,"day"=>$day,"s"=>$s,"e"=>$e,"minGap"=>$profMinGapMinutes];
+                  continue;
+                }
+              }
             }
 
+            // Subject weekly target within this section
             $curr = $ignoreExisting ? ($target - $remain) : (int)$qOne($baseMinsSQL,0);
             if ($curr + $len > $target) continue;
 
+            // Avoid duplicates for this section+subject+exact slot
             $dup = (int)$qOne("SELECT 1 FROM schedules
                                WHERE school_year='{$sy}' AND semester='{$sem}'
                                  AND section_id={$secId} AND subj_id={$subjId}
@@ -444,6 +469,7 @@ try {
                                LIMIT 1",0);
             if ($dup>0) { $skipped++; continue; }
 
+            // Score (load balance + spacing preference)
             $score=0;
             $secLoad = $secDayLoad($secId,$day);
             $minLoad = PHP_INT_MAX;
@@ -488,7 +514,7 @@ try {
         $genForPair += $best['len'];
         $remain     -= $best['len'];
 
-        // NEW: increment in-memory weekly count for the professor
+        // Increment in-memory weekly count for the professor
         $profWeeklyCount[$profId] = ($profWeeklyCount[$profId] ?? 0) + 1;
 
         if (!$ignoreExisting) {
@@ -532,8 +558,9 @@ try {
         "lunchStart"=>$lunchStart,
         "lunchEnd"=>$lunchEnd,
         "addFixedBlocks"=>$addFixedBlocks,
-        // NEW: echo back the weekly cap used
-        "profMaxWeeklySchedules"=>$profMaxWeeklySchedules
+        "profMaxWeeklySchedules"=>$profMaxWeeklySchedules,
+        // NEW: echo minimum gap back
+        "profMinGapMinutes"=>$profMinGapMinutes
       ],
       "metrics"=>$metrics
     ]

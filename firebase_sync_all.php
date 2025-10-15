@@ -1,6 +1,6 @@
 <?php
-// firebase_sync_all.php - Sync professors, rooms, sections, schedules to Firebase Realtime DB
-// Uses your existing firebase_config.php class (no changes required).
+// firebase_sync_all.php - Sync to Realtime DB + Import/Update Firebase Auth users (professors)
+// Keeps your existing firebase_config.php unchanged and uses firebase_admin_config.php (Kreait) for Auth.
 
 declare(strict_types=1);
 
@@ -11,8 +11,12 @@ header("Access-Control-Allow-Credentials: true");
 header("Content-Type: application/json; charset=utf-8");
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') exit(0);
 
-require_once __DIR__.'/connect.php';          // $host, $user, $password, $database
-require_once __DIR__.'/firebase_config.php';  // $firebaseConfig -> FirebaseConfig instance
+require_once __DIR__.'/connect.php';                  // $host, $user, $password, $database
+require_once __DIR__.'/firebase_config.php';          // $firebaseConfig -> FirebaseConfig instance (Realtime DB via REST)
+require_once __DIR__.'/firebase_admin_config.php';    // class FirebaseAdminConfig (Kreait Admin SDK for Auth)
+
+use Kreait\Firebase\Exception\Auth\UserNotFound;
+
 $startedAt = microtime(true);
 
 function http_error(int $code, string $msg){
@@ -30,7 +34,7 @@ function db(): mysqli {
   return $c;
 }
 
-// -- helpers to use your FirebaseConfig ---------------------------------------
+// ------------ Realtime DB helpers (use your FirebaseConfig) ------------------
 /** @return array [ok(bool), body(mixed), raw(array)] */
 function fb_call(string $method, string $path, $data = null): array {
   global $firebaseConfig; // instance of FirebaseConfig
@@ -49,7 +53,7 @@ function fb_put($path, $data){ [$ok,$b,$r]=fb_call('PUT',$path,$data); if(!$ok) 
 function fb_patch($path,$data){ [$ok,$b,$r]=fb_call('PATCH',$path,$data); if(!$ok) http_error($r['status']?:500,"Firebase PATCH failed: ".$r['response']); return $b; }
 function fb_delete($path){ [$ok,$b,$r]=fb_call('DELETE',$path,null); if(!$ok) http_error($r['status']?:500,"Firebase DELETE failed: ".$r['response']); return $b; }
 
-// -- utils --------------------------------------------------------------------
+// ---------------------------- Utilities --------------------------------------
 function maybe_json($s){
   if ($s === null) return null;
   if (is_array($s) || is_object($s)) return $s;
@@ -67,9 +71,9 @@ function count_table(mysqli $c, string $table): int {
   return (int)$r['n'];
 }
 
-// -- fetchers using YOUR columns ----------------------------------------------
+// ----------------------- Fetchers (your columns) -----------------------------
 function fetch_professors(mysqli $c): array {
-  // IMPORTANT: DO NOT include prof_password in Firebase.
+  // IMPORTANT: DO NOT include prof_password in Firebase DB.
   $rows = [];
   $res = $c->query("
     SELECT prof_id, prof_name, prof_username, prof_email, prof_phone,
@@ -169,23 +173,104 @@ function stream_schedules(mysqli $c, int $chunkSize, array &$summary): void {
   $summary['schedules']['pushed'] = $pushed;
 }
 
-// -- main ---------------------------------------------------------------------
+// -------------------- Firebase Auth sync (Kreait) ----------------------------
+const SYNTHETIC_EMAIL_DOMAIN = 'spcc.local'; // username@spcc.local
+const MIN_PASSWORD_LEN       = 6;
+
+function synth_email(string $username): string {
+  $u = strtolower(trim($username));
+  $u = preg_replace('/[^a-z0-9._-]/i', '.', $u);
+  $u = trim($u, '.');
+  return $u.'@'.SYNTHETIC_EMAIL_DOMAIN;
+}
+
+/**
+ * Creates/updates Firebase Auth users for all professors.
+ * UID = prof_id, email = prof_username@spcc.local, password = prof_password, displayName = prof_name
+ */
+function sync_auth_professors(mysqli $c, FirebaseAdminConfig $admin, array &$summary): void {
+  $auth = $admin->getAuth();
+
+  $res = $c->query("SELECT prof_id, prof_name, prof_username, prof_password FROM professors");
+
+  $created = 0; $updated = 0; $skipped = 0; $errors = 0; $details = [];
+  while ($row = $res->fetch_assoc()) {
+    $profId   = (string)$row['prof_id'];         // use as UID
+    $name     = trim((string)$row['prof_name']);
+    $username = trim((string)$row['prof_username']);
+    $password = (string)$row['prof_password'];
+    $email    = synth_email($username);
+
+    if ($username === '' || $password === '') {
+      $skipped++; $details[] = ["prof_id"=>$profId,"username"=>$username,"action"=>"skipped","reason"=>"missing username or password"]; continue;
+    }
+    if (strlen($password) < MIN_PASSWORD_LEN) {
+      $skipped++; $details[] = ["prof_id"=>$profId,"username"=>$username,"action"=>"skipped","reason"=>"password too short (<6)"]; continue;
+    }
+
+    try {
+      // Prefer UID lookup
+      $userRecord = null;
+      try {
+        $userRecord = $auth->getUser($profId);
+      } catch (UserNotFound $e) {
+        try { $userRecord = $auth->getUserByEmail($email); } catch (UserNotFound $e2) { $userRecord = null; }
+      }
+
+      if ($userRecord) {
+        $auth->updateUser($userRecord->uid, [
+          'email'         => $email,
+          'password'      => $password,
+          'displayName'   => $name ?: $username,
+          'emailVerified' => true,
+          'disabled'      => false,
+        ]);
+        $updated++; $details[] = ["prof_id"=>$profId,"username"=>$username,"uid"=>$userRecord->uid,"action"=>"updated"];
+      } else {
+        $newUser = $auth->createUser([
+          'uid'           => $profId,
+          'email'         => $email,
+          'password'      => $password,
+          'displayName'   => $name ?: $username,
+          'emailVerified' => true,
+          'disabled'      => false,
+        ]);
+        $created++; $details[] = ["prof_id"=>$profId,"username"=>$username,"uid"=>$newUser->uid,"action"=>"created"];
+      }
+
+    } catch (Throwable $e) {
+      $errors++; $details[] = ["prof_id"=>$profId,"username"=>$username,"action"=>"error","error"=>$e->getMessage()];
+    }
+  }
+
+  $summary['auth'] = [
+    "created" => $created,
+    "updated" => $updated,
+    "skipped" => $skipped,
+    "errors"  => $errors,
+    "details" => $details,
+  ];
+}
+
+// ----------------------------- main ------------------------------------------
 $wipe    = isset($_GET['wipe']) && $_GET['wipe'] === '1';
 $chunkSz = isset($_GET['chunk']) ? max(100, (int)$_GET['chunk']) : 500;
 
 $conn = db();
 
 $summary = [
-  "success" => true,
-  "status" => "ok",
-  "wiped" => $wipe,
-  "counts" => [],
+  "success"   => true,
+  "status"    => "ok",
+  "wiped"     => $wipe,
+  "counts"    => [],
   "schedules" => ["chunkSize"=>$chunkSz, "totalRows"=>0, "pushed"=>0],
-  "syncedAt" => null,
-  "elapsedMs"=> 0,
+  "auth"      => ["created"=>0,"updated"=>0,"skipped"=>0,"errors"=>0,"details"=>[]],
+  "syncedAt"  => null,
+  "elapsedMs" => 0,
 ];
 
 try {
+  // ---- Realtime DB sync ----
   $professors = fetch_professors($conn);
   $rooms      = fetch_rooms($conn);
   $sections   = fetch_sections($conn);
@@ -203,16 +288,24 @@ try {
     fb_delete("/schedules");
   }
 
-  // upload full nodes
   fb_put("/professors", $professors ?: new stdClass());
   fb_put("/rooms",      $rooms      ?: new stdClass());
   fb_put("/sections",   $sections   ?: new stdClass());
 
-  // schedules in chunks
-  if (!$wipe) fb_put("/schedules", new stdClass()); // ensure exists
+  if (!$wipe) fb_put("/schedules", new stdClass());
   stream_schedules($conn, $chunkSz, $summary);
 
-  $summary['syncedAt'] = gmdate('c');
+  // ---- Firebase Auth users sync (professors) ----
+  try {
+    $admin = new FirebaseAdminConfig(); // uses your Kreait setup
+    sync_auth_professors($conn, $admin, $summary);
+  } catch (Throwable $e) {
+    // If Admin SDK init fails, report but keep DB sync successful
+    $summary['auth']['errors']++;
+    $summary['auth']['details'][] = ["action"=>"init_error","error"=>$e->getMessage()];
+  }
+
+  $summary['syncedAt']  = gmdate('c');
   $summary['elapsedMs'] = (int)round((microtime(true) - $startedAt)*1000);
   echo json_encode($summary, JSON_UNESCAPED_UNICODE);
 
