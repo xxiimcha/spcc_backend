@@ -252,14 +252,13 @@ function createProfessor(mysqli $conn, array $data) {
           )
         : ['sent'=>false,'message'=>'No email'];
 
-    // NEW: log success
     $desc = "Created professor: {$name} (ID: {$id}) | SY: " . ($schoolYear ?? 'N/A') . " | Subjects: {$subj_count}";
     log_activity($conn, 'professors', 'create', $desc, $id, null);
 
     echo json_encode([
         "status"=>"success",
         "message"=>"Professor added",
-        "id"=>$id,
+        'id'=>$id,
         "email"=>$emailResult,
         "firebase_sync"=>$syncResult
     ]);
@@ -267,38 +266,70 @@ function createProfessor(mysqli $conn, array $data) {
 
 function updateProfessor(mysqli $conn, int $id, array $data) {
     if ($id <= 0) {
-        log_activity($conn, 'professors', 'update', "FAILED update: missing ID", null, null); // NEW
+        log_activity($conn, 'professors', 'update', "FAILED update: missing ID", null, null);
         http_response_code(400);
         echo json_encode(["status"=>"error","message"=>"Professor ID is required"]);
         return;
     }
 
-    $name      = mysqli_real_escape_string($conn, (string)($data['name'] ?? ''));
-    $emailRaw  = trim((string)($data['email'] ?? ''));
-    $emailEsc  = mysqli_real_escape_string($conn, $emailRaw);
-    $phone     = mysqli_real_escape_string($conn, (string)($data['phone'] ?? ''));
-    $qualsArr  = normalize_array($data['qualifications'] ?? []);
-    $subjIds   = normalize_array($data['subject_ids'] ?? []);
-
-    if ($emailRaw !== '' && emailExists($conn, $emailRaw, $id)) {
-        log_activity($conn, 'professors', 'update', "FAILED update ID {$id}: email taken ({$emailRaw})", $id, null); // NEW
-        http_response_code(409);
-        echo json_encode(["status"=>"error","message"=>"Email already taken by another professor."]);
+    // Load current row (used for email + to avoid accidental overwrites)
+    $curRes = $conn->query("SELECT prof_name, prof_email, prof_username, prof_subject_ids FROM professors WHERE prof_id=".(int)$id." LIMIT 1");
+    if (!$curRes || $curRes->num_rows === 0) {
+        http_response_code(404);
+        echo json_encode(["status"=>"error","message"=>"Professor not found"]);
         return;
     }
+    $cur = $curRes->fetch_assoc();
+    $currentName     = $cur['prof_name'] ?? '';
+    $currentEmail    = $cur['prof_email'] ?? '';
+    $currentUsername = $cur['prof_username'] ?? '';
+    $currentSubjIds  = json_decode($cur['prof_subject_ids'] ?? '[]', true) ?: [];
 
-    $qualStr       = mysqli_real_escape_string($conn, json_encode(array_values($qualsArr), JSON_UNESCAPED_UNICODE));
-    $subjects_json = mysqli_real_escape_string($conn, json_encode(array_map('intval', $subjIds)));
-    $subj_count    = is_array($subjIds) ? count($subjIds) : 0;
-
+    // Build SET list only with provided keys
     $set = [];
-    $set[] = "prof_name='$name'";
-    $set[] = "prof_email='$emailEsc'";
-    $set[] = "prof_phone='$phone'";
-    $set[] = "prof_qualifications='$qualStr'";
-    $set[] = "prof_subject_ids='$subjects_json'";
-    $set[] = "subj_count=$subj_count";
 
+    // name
+    if (array_key_exists('name', $data)) {
+        $name = mysqli_real_escape_string($conn, (string)$data['name']);
+        $set[] = "prof_name='$name'";
+    }
+
+    // email (unique check only if email is being changed)
+    if (array_key_exists('email', $data)) {
+        $emailRaw = trim((string)$data['email']);
+        if ($emailRaw !== '' && emailExists($conn, $emailRaw, $id)) {
+            log_activity($conn, 'professors', 'update', "FAILED update ID {$id}: email taken ({$emailRaw})", $id, null);
+            http_response_code(409);
+            echo json_encode(["status"=>"error","message"=>"Email already taken by another professor."]);
+            return;
+        }
+        $emailEsc = mysqli_real_escape_string($conn, $emailRaw);
+        $set[] = "prof_email='$emailEsc'";
+    }
+
+    // phone
+    if (array_key_exists('phone', $data)) {
+        $phone = mysqli_real_escape_string($conn, (string)$data['phone']);
+        $set[] = "prof_phone='$phone'";
+    }
+
+    // qualifications
+    if (array_key_exists('qualifications', $data)) {
+        $qualsArr = normalize_array($data['qualifications']);
+        $qualStr  = mysqli_real_escape_string($conn, json_encode(array_values($qualsArr), JSON_UNESCAPED_UNICODE));
+        $set[] = "prof_qualifications='$qualStr'";
+    }
+
+    // subject_ids (+ subj_count) — only if provided
+    if (array_key_exists('subject_ids', $data)) {
+        $subjIds         = normalize_array($data['subject_ids']);
+        $subjects_json   = mysqli_real_escape_string($conn, json_encode(array_map('intval', $subjIds)));
+        $subj_count      = is_array($subjIds) ? count($subjIds) : 0;
+        $set[] = "prof_subject_ids='$subjects_json'";
+        $set[] = "subj_count=$subj_count";
+    }
+
+    // school_year
     if (array_key_exists('school_year', $data)) {
         $sy = trim((string)$data['school_year']);
         if ($sy === '') {
@@ -308,9 +339,32 @@ function updateProfessor(mysqli $conn, int $id, array $data) {
         }
     }
 
+    // password (only if provided and non-blank)
+    $passwordChanged = false;
+    $passwordRaw = '';
+    if (array_key_exists('password', $data)) {
+        $passwordRaw = (string)$data['password'];
+        if (trim($passwordRaw) !== '') {
+            $passwordEsc = mysqli_real_escape_string($conn, $passwordRaw);
+            $set[] = "prof_password='$passwordEsc'";
+            $passwordChanged = true;
+        }
+    }
+
+    if (empty($set)) {
+        // Nothing to update
+        echo json_encode([
+            "status"=>"success",
+            "message"=>"No changes",
+            "id"=>$id,
+            "password_changed"=>false
+        ]);
+        return;
+    }
+
     $sql = "UPDATE professors SET " . implode(',', $set) . " WHERE prof_id=".(int)$id;
     if (!$conn->query($sql)) {
-        log_activity($conn, 'professors', 'update', "FAILED update ID {$id}: ".$conn->error, $id, null); // NEW
+        log_activity($conn, 'professors', 'update', "FAILED update ID {$id}: ".$conn->error, $id, null);
         http_response_code(500);
         echo json_encode(["status"=>"error","message"=>$conn->error]);
         return;
@@ -318,15 +372,42 @@ function updateProfessor(mysqli $conn, int $id, array $data) {
 
     $syncResult = firebaseSync($conn)->syncSingleProfessor($id);
 
-    // NEW: log success
-    $desc = "Updated professor: {$name} (ID: {$id}) | Subjects: {$subj_count}";
+    // If password changed, send notification email
+    $emailResult = null;
+    if ($passwordChanged) {
+        // Use latest email/name/username (payload if provided, else current DB values)
+        $sendToEmail = array_key_exists('email', $data) ? trim((string)$data['email']) : $currentEmail;
+        $sendToName  = array_key_exists('name', $data)  ? (string)$data['name'] : $currentName;
+        $username    = array_key_exists('username', $data) ? (string)$data['username'] : $currentUsername;
+
+        // Subjects: use payload if provided (to reflect current), otherwise DB’s current
+        $subjIdsForEmail = array_key_exists('subject_ids', $data) ? normalize_array($data['subject_ids']) : $currentSubjIds;
+        $subjectRows = fetchSubjectsByIds($conn, $subjIdsForEmail);
+
+        if ($sendToEmail !== '') {
+            $emailResult = sendWelcomeProfessorEmail(
+                $sendToEmail,
+                $sendToName,
+                $username,
+                $passwordRaw,
+                'Systems Plus Computer College Caloocan',
+                'https://your-portal.example.com/login',
+                $subjectRows
+            );
+            log_activity($conn, 'professors', 'update', "Password reset email attempted for {$sendToEmail}", $id, null);
+        }
+    }
+
+    $desc = "Updated professor ID: {$id}" . ($passwordChanged ? " | Password Reset" : "");
     log_activity($conn, 'professors', 'update', $desc, $id, null);
 
     echo json_encode([
         "status"=>"success",
         "message"=>"Professor updated",
         "id"=>$id,
-        "firebase_sync"=>$syncResult
+        "firebase_sync"=>$syncResult,
+        "password_changed"=>$passwordChanged,
+        "email"=>$emailResult
     ]);
 }
 
@@ -438,7 +519,6 @@ function getProfessor(mysqli $conn, int $id) {
         'school_year'     => $row['school_year'] ?? null,
     ];
 
-    // NEW (optional): log successful view
     log_activity($conn, 'professors', 'read', "Viewed professor ID: {$id}", $id, null);
 
     $currentSY = ss_get_current_school_year($conn);
