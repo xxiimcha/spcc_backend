@@ -12,9 +12,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 $host = "localhost";
-$user = "root"; // Default XAMPP user
-$password = ""; // Default XAMPP password (empty)
-$database = "spcc_scheduling_system";
+$user = "u341538466_spcc"; // Default XAMPP user
+$password = "9g1k~M|;D"; // Default XAMPP password (empty)
+$database = "u341538466_spcc";
 
 $conn = new mysqli($host, $user, $password, $database);
 
