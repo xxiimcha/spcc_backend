@@ -18,7 +18,8 @@ $identifier = trim((string)($input['username'] ?? ''));
 $password   = (string)($input['password'] ?? '');
 if ($identifier === '' || $password === '') { echo json_encode(['success'=>false,'message'=>'Username and password are required']); exit; }
 
-require_once __DIR__.'/connect.php';
+include 'connect.php';
+
 mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
 if (!isset($conn) || !($conn instanceof mysqli) || $conn->connect_errno) {
   error_log('DB: '.($conn->connect_error ?? 'no mysqli')); echo json_encode(['success'=>false,'message'=>'Database connection error']); exit;
