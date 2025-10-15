@@ -22,3 +22,9 @@ Stack trace:
 #1 C:\xampp\htdocs\spcc_database\export_all.php(71): require_once('C:\\xampp\\htdocs...')
 #2 {main}
   thrown in C:\xampp\htdocs\spcc_database\connect.php on line 19
+[15-Oct-2025 17:48:37 Europe/Berlin] PHP Fatal error:  Uncaught mysqli_sql_exception: Access denied for user 'u341538466_spcc'@'localhost' (using password: YES) in C:\xampp\htdocs\spcc_database\connect.php:19
+Stack trace:
+#0 C:\xampp\htdocs\spcc_database\connect.php(19): mysqli->__construct('localhost', 'u341538466_spcc', Object(SensitiveParameterValue), 'u341538466_spcc')
+#1 C:\xampp\htdocs\spcc_database\export_all.php(59): require_once('C:\\xampp\\htdocs...')
+#2 {main}
+  thrown in C:\xampp\htdocs\spcc_database\connect.php on line 19

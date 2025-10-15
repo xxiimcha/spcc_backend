@@ -156,10 +156,6 @@ try {
 
   // SELECT list (build only existing cols)
   $sel = [];
-  if ($schedIdCol) $sel[] = "s.`$schedIdCol` AS schedule_id";
-  if ($secIdCol)   $sel[] = "s.`$secIdCol`   AS section_id";
-  if ($subjIdCol)  $sel[] = "s.`$subjIdCol`  AS subject_id";
-  if ($profIdCol)  $sel[] = "s.`$profIdCol`  AS professor_id";
   if ($dayCol)     $sel[] = "s.`$dayCol`     AS days";
   if ($startCol)   $sel[] = "s.`$startCol`   AS start_time";
   if ($endCol)     $sel[] = "s.`$endCol`     AS end_time";
