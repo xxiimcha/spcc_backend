@@ -368,21 +368,18 @@ function handleDeleteSchedule(mysqli $conn) {
         }
         $id = (int)$id;
 
-        $stmt = $conn->prepare("DELETE FROM schedules WHERE schedule_id = ?");
-        if (!$stmt) {
-            error_log("Delete prepare error: " . $conn->error);
-            json_out(false, ['message' => 'Failed to prepare delete']);
-        }
-        if (!bind_params($stmt, 'i', [$id])) {
-            error_log("Delete bind error: " . $stmt->error);
-            json_out(false, ['message' => 'Failed to bind parameters']);
-        }
-        if (!$stmt->execute()) {
-            error_log("Delete execute error: " . $stmt->error);
-            json_out(false, ['message' => 'Failed to delete schedule']);
+        $sql = "DELETE FROM schedules WHERE schedule_id = $id";
+        $ok  = $conn->query($sql);
+
+        if ($ok === false) {
+            $err = $conn->error ?: 'Failed to delete schedule';
+            json_out(false, ['message' => "Failed to delete schedule: $err"]);
         }
 
-        // Optional sync (non-fatal)
+        if ($conn->affected_rows < 1) {
+            json_out(false, ['message' => 'No schedule deleted (id not found).']);
+        }
+
         try {
             $syncFile = __DIR__ . '/realtime_firebase_sync.php';
             if (file_exists($syncFile)) {
