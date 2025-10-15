@@ -19,13 +19,11 @@ $database = "u341538466_spcc";
 $conn = new mysqli($host, $user, $password, $database);
 
 if ($conn->connect_error) {
-    // Only output JSON if this file is accessed directly, not when included
     if (basename($_SERVER['PHP_SELF']) === 'connect.php') {
         echo json_encode(["error" => "Database connection failed: " . $conn->connect_error]);
     }
     exit("Database connection failed: " . $conn->connect_error);
 } else {
-    // Only output JSON if this file is accessed directly
     if (basename($_SERVER['PHP_SELF']) === 'connect.php') {
         echo json_encode(["success" => "Database connection successful"]);
     }

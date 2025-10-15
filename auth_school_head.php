@@ -1,11 +1,14 @@
 <?php
+ini_set('display_errors', 1); ini_set('display_startup_errors', 1); error_reporting(E_ALL);
+
 // Handle CORS for multiple origins
 $allowed_origins = [
     'http://localhost:5174',
     'http://127.0.0.1:5500',
     'http://127.0.0.1:5501',
     'http://localhost:3000',
-    'http://localhost:5173'
+    'http://localhost:5173',
+    'https://spcc-web.vercel.app'
 ];
 
 $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
@@ -15,9 +18,9 @@ if (in_array($origin, $allowed_origins)) {
     header('Access-Control-Allow-Origin: *');
 }
 
-header('Content-Type: application/json');
+header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Allow-Methods: POST, GET, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type');
+header('Access-Control-Allow-Headers: Content-Type, Authorization');
 header('Access-Control-Allow-Credentials: true');
 
 // Handle preflight OPTIONS request
@@ -50,40 +53,39 @@ if (empty($username) || empty($password)) {
     exit();
 }
 
+require_once __DIR__ . '/connect.php'; // 
+mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+
 try {
-    // Database connection - update these values according to your database configuration
-    $host = 'localhost';
-    $dbname = 'spcc_scheduling_system'; // Update this to your actual database name
-    $dbuser = 'root'; // Update this to your database username
-    $dbpass = ''; // Update this to your database password
-    
-    $pdo = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8", $dbuser, $dbpass);
-    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    
-    // Prepare and execute query to find the school head
-    $stmt = $pdo->prepare("SELECT sh_id, sh_name, sh_username, sh_email, sh_password FROM school_heads WHERE sh_username = ?");
-    $stmt->execute([$username]);
-    $user = $stmt->fetch(PDO::FETCH_ASSOC);
-    
-    if (!$user) {
+    if (!isset($conn) || !($conn instanceof mysqli)) {
+        throw new Exception('Database connection not available');
+    }
+
+    $conn->set_charset('utf8mb4');
+
+    // Use prepared statement to prevent SQL injection
+    $stmt = $conn->prepare("SELECT sh_id, sh_name, sh_username, sh_email, sh_password FROM school_heads WHERE sh_username = ?");
+    $stmt->bind_param('s', $username);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    if ($result->num_rows === 0) {
         echo json_encode(['status' => 'error', 'message' => 'Invalid username or password']);
         exit();
     }
-    
-    // Verify password - assuming passwords are stored as plain text for now
-    // In production, you should use password_hash() and password_verify()
+
+    $user = $result->fetch_assoc();
+
     if ($password === $user['sh_password']) {
-        // Password is correct, return user data (without password)
         unset($user['sh_password']);
-        
-        // Map the database columns to frontend-friendly names
+
         $userData = [
             'id' => $user['sh_id'],
             'name' => $user['sh_name'],
             'username' => $user['sh_username'],
             'email' => $user['sh_email']
         ];
-        
+
         echo json_encode([
             'status' => 'success',
             'message' => 'Login successful',
@@ -92,21 +94,14 @@ try {
     } else {
         echo json_encode(['status' => 'error', 'message' => 'Invalid username or password']);
     }
-    
-} catch (PDOException $e) {
-    // Log the error (in production, log to a file, not output)
-    error_log("Database error: " . $e->getMessage());
-    
-    echo json_encode([
-        'status' => 'error', 
-        'message' => 'Database connection error. Please try again later.'
-    ]);
+
+    $stmt->close();
+    $conn->close();
+
 } catch (Exception $e) {
-    // Log the error
-    error_log("General error: " . $e->getMessage());
-    
+    error_log("Login error: " . $e->getMessage());
     echo json_encode([
-        'status' => 'error', 
+        'status' => 'error',
         'message' => 'An error occurred. Please try again later.'
     ]);
 }
