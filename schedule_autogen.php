@@ -65,7 +65,7 @@ try {
   $daysIn      = $in['days'] ?? [];
   $startTime   = trim((string)($in['startTime'] ?? '07:30'));
   $endTime     = trim((string)($in['endTime']   ?? '16:30'));
-  $slotMin     = (int)($in['slotMinutes'] ?? 60);
+  $slotMin     = (int)(60);
 
   $secMaxDaily    = isset($in['maxDailyLoad']) ? (int)$in['maxDailyLoad'] : null;
   $profMaxDaily   = isset($in['profMaxDailyLoad']) ? (int)$in['profMaxDailyLoad'] : null;
