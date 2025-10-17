@@ -26,7 +26,8 @@ function bind_params(mysqli_stmt $stmt, string $types, array &$params): bool {
 }
 
 function json_out($ok, $payload = []) {
-    echo json_encode(array_merge(['success' => (bool)$ok], $payload));
+    // normalized envelope to play nicely with your ApiService.makeRequest
+    echo json_encode(array_merge(['success' => (bool)$ok, 'status' => $ok ? 'success' : 'error'], $payload));
     exit();
 }
 
@@ -358,40 +359,55 @@ function handleUpdateSchedule(mysqli $conn) {
     }
 }
 
+
 function handleDeleteSchedule(mysqli $conn) {
     try {
-        // --- Try to decode JSON body for bulk operations
         $raw = file_get_contents('php://input');
         $body = json_decode($raw, true);
         $hasBody = is_array($body);
 
-        // ========== MODE A: bulk by explicit ids ==========
         if ($hasBody && isset($body['ids']) && is_array($body['ids']) && count($body['ids']) > 0) {
-            // sanitize -> unique ints
             $ids = array_values(array_unique(array_map('intval', array_filter($body['ids'], fn($v) => (int)$v > 0))));
             if (empty($ids)) json_out(false, ['message' => 'No valid schedule ids provided.']);
 
-            // Get existing ids first (for logging + Firebase)
+            // Find existing
             $inMarks = implode(',', array_fill(0, count($ids), '?'));
-            $types = str_repeat('i', count($ids));
+            $types   = str_repeat('i', count($ids));
 
-            $sel = $conn->prepare("SELECT schedule_id FROM schedules WHERE schedule_id IN ($inMarks)");
+            $conn->begin_transaction();
+
+            $sel = $conn->prepare("SELECT schedule_id FROM schedules WHERE schedule_id IN ($inMarks) FOR UPDATE");
+            if (!$sel) {
+                $conn->rollback();
+                json_out(false, ['message' => 'Failed to prepare pre-check: ' . $conn->error]);
+            }
             bind_params($sel, $types, $ids);
-            if (!$sel->execute()) json_out(false, ['message' => 'Failed to check existing schedules']);
+            if (!$sel->execute()) {
+                $conn->rollback();
+                json_out(false, ['message' => 'Failed to check existing schedules']);
+            }
             $res = $sel->get_result();
             $existing = [];
             while ($r = $res->fetch_assoc()) $existing[] = (int)$r['schedule_id'];
-            if (empty($existing)) json_out(false, ['message' => 'No matching schedules found.']);
+            if (empty($existing)) {
+                $conn->rollback();
+                json_out(false, ['message' => 'No matching schedules found.']);
+            }
 
-            // Delete
             $stmt = $conn->prepare("DELETE FROM schedules WHERE schedule_id IN ($inMarks)");
+            if (!$stmt) {
+                $conn->rollback();
+                json_out(false, ['message' => 'Failed to prepare bulk delete: ' . $conn->error]);
+            }
             bind_params($stmt, $types, $ids);
             if (!$stmt->execute()) {
+                $conn->rollback();
                 @log_activity($conn, 'schedules', 'error', 'Bulk delete failed: '.$stmt->error, null, null);
                 json_out(false, ['message' => 'Bulk delete failed']);
             }
 
-            // Firebase cleanup per id (best-effort)
+            $conn->commit();
+
             try {
                 $syncFile = __DIR__ . '/realtime_firebase_sync.php';
                 if (file_exists($syncFile)) {
@@ -408,7 +424,6 @@ function handleDeleteSchedule(mysqli $conn) {
             }
 
             @log_activity($conn, 'schedules', 'success', 'Bulk delete schedules', null, null);
-
             json_out(true, [
                 'message' => "Deleted ".count($existing)." schedule(s).",
                 'deleted_ids' => $existing
@@ -422,8 +437,8 @@ function handleDeleteSchedule(mysqli $conn) {
             $schoolYear  = isset($body['school_year'])  ? trim((string)$body['school_year'])  : null;
             $semester    = isset($body['semester'])     ? trim((string)$body['semester'])     : null;
 
-            $where = [];
-            $types = '';
+            $where  = [];
+            $types  = '';
             $params = [];
 
             if ($sectionId) {
@@ -443,32 +458,50 @@ function handleDeleteSchedule(mysqli $conn) {
 
             $whereSql = implode(' AND ', $where);
 
-            // collect ids first
+            $conn->begin_transaction();
+
             $selSql = "
                 SELECT s.schedule_id
                   FROM schedules s
                   JOIN sections sec ON sec.section_id = s.section_id
                  WHERE $whereSql
+                 FOR UPDATE
             ";
             $sel = $conn->prepare($selSql);
+            if (!$sel) {
+                $conn->rollback();
+                json_out(false, ['message' => 'Failed to prepare section lookup: ' . $conn->error]);
+            }
             bind_params($sel, $types, $params);
-            if (!$sel->execute()) json_out(false, ['message' => 'Failed to find schedules for section.']);
+            if (!$sel->execute()) {
+                $conn->rollback();
+                json_out(false, ['message' => 'Failed to find schedules for section.']);
+            }
             $r = $sel->get_result();
             $ids = [];
             while ($row = $r->fetch_assoc()) $ids[] = (int)$row['schedule_id'];
-            if (empty($ids)) json_out(false, ['message' => 'No schedules found for the given section filter.']);
+            if (empty($ids)) {
+                $conn->rollback();
+                json_out(false, ['message' => 'No schedules found for the given section filter.']);
+            }
 
-            // delete
             $inMarks = implode(',', array_fill(0, count($ids), '?'));
             $del = $conn->prepare("DELETE FROM schedules WHERE schedule_id IN ($inMarks)");
+            if (!$del) {
+                $conn->rollback();
+                json_out(false, ['message' => 'Failed to prepare bulk delete by section: ' . $conn->error]);
+            }
             $delTypes = str_repeat('i', count($ids));
             bind_params($del, $delTypes, $ids);
             if (!$del->execute()) {
+                $conn->rollback();
                 @log_activity($conn, 'schedules', 'error', 'Bulk delete by section failed: '.$del->error, null, null);
                 json_out(false, ['message' => 'Bulk delete by section failed']);
             }
 
-            // Firebase cleanup per id
+            $conn->commit();
+
+            // Firebase cleanup per id (best-effort)
             try {
                 $syncFile = __DIR__ . '/realtime_firebase_sync.php';
                 if (file_exists($syncFile)) {
@@ -485,7 +518,6 @@ function handleDeleteSchedule(mysqli $conn) {
             }
 
             @log_activity($conn, 'schedules', 'success', 'Bulk delete by section', null, null);
-
             json_out(true, [
                 'message' => "Deleted ".count($ids)." schedule(s) for section.",
                 'deleted_ids' => $ids
@@ -497,20 +529,20 @@ function handleDeleteSchedule(mysqli $conn) {
         if ($id === '') json_out(false, ['message' => 'Schedule ID is required']);
         $id = (int)$id;
 
-        $sql = "DELETE FROM schedules WHERE schedule_id = $id";
-        $ok  = $conn->query($sql);
-
-        if ($ok === false) {
+        $stmt = $conn->prepare("DELETE FROM schedules WHERE schedule_id = ?");
+        if (!$stmt) json_out(false, ['message' => 'Failed to prepare delete: ' . $conn->error]);
+        $stmt->bind_param('i', $id);
+        if (!$stmt->execute()) {
             $err = $conn->error ?: 'Failed to delete schedule';
             @log_activity($conn, 'schedules', 'error', 'Delete failed: '.$err, null, $id);
             json_out(false, ['message' => "Failed to delete schedule: $err"]);
         }
-
-        if ($conn->affected_rows < 1) {
+        if ($stmt->affected_rows < 1) {
             @log_activity($conn, 'schedules', 'error', 'Delete affected_rows=0', null, $id);
             json_out(false, ['message' => 'No schedule deleted (id not found).']);
         }
 
+        // Firebase best-effort
         try {
             $syncFile = __DIR__ . '/realtime_firebase_sync.php';
             if (file_exists($syncFile)) {
