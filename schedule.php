@@ -360,6 +360,139 @@ function handleUpdateSchedule(mysqli $conn) {
 
 function handleDeleteSchedule(mysqli $conn) {
     try {
+        // --- Try to decode JSON body for bulk operations
+        $raw = file_get_contents('php://input');
+        $body = json_decode($raw, true);
+        $hasBody = is_array($body);
+
+        // ========== MODE A: bulk by explicit ids ==========
+        if ($hasBody && isset($body['ids']) && is_array($body['ids']) && count($body['ids']) > 0) {
+            // sanitize -> unique ints
+            $ids = array_values(array_unique(array_map('intval', array_filter($body['ids'], fn($v) => (int)$v > 0))));
+            if (empty($ids)) json_out(false, ['message' => 'No valid schedule ids provided.']);
+
+            // Get existing ids first (for logging + Firebase)
+            $inMarks = implode(',', array_fill(0, count($ids), '?'));
+            $types = str_repeat('i', count($ids));
+
+            $sel = $conn->prepare("SELECT schedule_id FROM schedules WHERE schedule_id IN ($inMarks)");
+            bind_params($sel, $types, $ids);
+            if (!$sel->execute()) json_out(false, ['message' => 'Failed to check existing schedules']);
+            $res = $sel->get_result();
+            $existing = [];
+            while ($r = $res->fetch_assoc()) $existing[] = (int)$r['schedule_id'];
+            if (empty($existing)) json_out(false, ['message' => 'No matching schedules found.']);
+
+            // Delete
+            $stmt = $conn->prepare("DELETE FROM schedules WHERE schedule_id IN ($inMarks)");
+            bind_params($stmt, $types, $ids);
+            if (!$stmt->execute()) {
+                @log_activity($conn, 'schedules', 'error', 'Bulk delete failed: '.$stmt->error, null, null);
+                json_out(false, ['message' => 'Bulk delete failed']);
+            }
+
+            // Firebase cleanup per id (best-effort)
+            try {
+                $syncFile = __DIR__ . '/realtime_firebase_sync.php';
+                if (file_exists($syncFile)) {
+                    require_once $syncFile;
+                    if (class_exists('RealtimeFirebaseSync')) {
+                        $sync = new RealtimeFirebaseSync();
+                        foreach ($existing as $sid) {
+                            try { $sync->deleteSingleSchedule($sid); } catch (Throwable $e) {}
+                        }
+                    }
+                }
+            } catch (Throwable $e) {
+                error_log("Firebase bulk delete sync failed: " . $e->getMessage());
+            }
+
+            @log_activity($conn, 'schedules', 'success', 'Bulk delete schedules', null, null);
+
+            json_out(true, [
+                'message' => "Deleted ".count($existing)." schedule(s).",
+                'deleted_ids' => $existing
+            ]);
+        }
+
+        // ========== MODE B: bulk by section (name or id) ==========
+        if ($hasBody && (isset($body['section_id']) || isset($body['section_name']))) {
+            $sectionId   = isset($body['section_id'])   ? (int)$body['section_id'] : null;
+            $sectionName = isset($body['section_name']) ? trim((string)$body['section_name']) : null;
+            $schoolYear  = isset($body['school_year'])  ? trim((string)$body['school_year'])  : null;
+            $semester    = isset($body['semester'])     ? trim((string)$body['semester'])     : null;
+
+            $where = [];
+            $types = '';
+            $params = [];
+
+            if ($sectionId) {
+                $where[] = 'sec.section_id = ?';
+                $types  .= 'i';
+                $params[] = $sectionId;
+            } elseif ($sectionName !== null && $sectionName !== '') {
+                $where[] = 'sec.section_name = ?';
+                $types  .= 's';
+                $params[] = $sectionName;
+            } else {
+                json_out(false, ['message' => 'Provide section_id or section_name for bulk delete by section.']);
+            }
+
+            if ($schoolYear) { $where[] = 's.school_year = ?'; $types .= 's'; $params[] = $schoolYear; }
+            if ($semester)   { $where[] = 's.semester    = ?'; $types .= 's'; $params[] = $semester; }
+
+            $whereSql = implode(' AND ', $where);
+
+            // collect ids first
+            $selSql = "
+                SELECT s.schedule_id
+                  FROM schedules s
+                  JOIN sections sec ON sec.section_id = s.section_id
+                 WHERE $whereSql
+            ";
+            $sel = $conn->prepare($selSql);
+            bind_params($sel, $types, $params);
+            if (!$sel->execute()) json_out(false, ['message' => 'Failed to find schedules for section.']);
+            $r = $sel->get_result();
+            $ids = [];
+            while ($row = $r->fetch_assoc()) $ids[] = (int)$row['schedule_id'];
+            if (empty($ids)) json_out(false, ['message' => 'No schedules found for the given section filter.']);
+
+            // delete
+            $inMarks = implode(',', array_fill(0, count($ids), '?'));
+            $del = $conn->prepare("DELETE FROM schedules WHERE schedule_id IN ($inMarks)");
+            $delTypes = str_repeat('i', count($ids));
+            bind_params($del, $delTypes, $ids);
+            if (!$del->execute()) {
+                @log_activity($conn, 'schedules', 'error', 'Bulk delete by section failed: '.$del->error, null, null);
+                json_out(false, ['message' => 'Bulk delete by section failed']);
+            }
+
+            // Firebase cleanup per id
+            try {
+                $syncFile = __DIR__ . '/realtime_firebase_sync.php';
+                if (file_exists($syncFile)) {
+                    require_once $syncFile;
+                    if (class_exists('RealtimeFirebaseSync')) {
+                        $sync = new RealtimeFirebaseSync();
+                        foreach ($ids as $sid) {
+                            try { $sync->deleteSingleSchedule($sid); } catch (Throwable $e) {}
+                        }
+                    }
+                }
+            } catch (Throwable $e) {
+                error_log("Firebase bulk delete (section) sync failed: " . $e->getMessage());
+            }
+
+            @log_activity($conn, 'schedules', 'success', 'Bulk delete by section', null, null);
+
+            json_out(true, [
+                'message' => "Deleted ".count($ids)." schedule(s) for section.",
+                'deleted_ids' => $ids
+            ]);
+        }
+
+        // ========== MODE C: single id (existing behavior) ==========
         $id = $_GET['id'] ?? '';
         if ($id === '') json_out(false, ['message' => 'Schedule ID is required']);
         $id = (int)$id;
@@ -392,8 +525,8 @@ function handleDeleteSchedule(mysqli $conn) {
         }
 
         @log_activity($conn, 'schedules', 'success', 'Schedule deleted', null, $id);
-
         json_out(true, ['message' => 'Schedule deleted successfully']);
+
     } catch (Throwable $e) {
         @log_activity($conn, 'schedules', 'error', 'Delete exception: '.$e->getMessage(), null, null);
         json_out(false, ['message' => 'Error deleting schedule: ' . $e->getMessage()]);
