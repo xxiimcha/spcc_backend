@@ -75,14 +75,16 @@ try {
   $subCapHrs   = (int)($in['subjectWeeklyHourCap'] ?? 4);  // non-PEH target hrs
   $ignoreExisting = (bool)($in['ignoreExistingMinutes'] ?? false);
 
+  // Lunch window (kept so classes avoid 12–1 if provided)
   $lunchStart  = trim((string)($in['lunchStart'] ?? '12:00'));
   $lunchEnd    = trim((string)($in['lunchEnd']   ?? '13:00'));
   $enforceLunch = ($lunchStart !== '' && $lunchEnd !== '');
 
+  // >>> Fixed blocks: merge homeroom+recess AND add Lunch Break
   $addFixedBlocks = (bool)($in['addFixedBlocks'] ?? true);
   $fixedBlocks = [
-    ['label' => 'Homeroom', 'start' => '07:30', 'end' => '08:00', 'status' => 'fixed'],
-    ['label' => 'Recess',   'start' => '08:00', 'end' => '08:30', 'status' => 'fixed'],
+    ['label' => 'Homeroom & Recess', 'start' => '07:30', 'end' => '08:30', 'status' => 'fixed'],
+    ['label' => 'Lunch Break',       'start' => '12:00', 'end' => '13:00', 'status' => 'fixed'],
   ];
 
   // Weekly cap (rows/week/prof) — generous default to avoid early capping
@@ -232,8 +234,8 @@ try {
   $triplesBySection = [];
   $noEligible = [];
   $debug = [
-    'assignments' => [],     // (section,subject) -> prof chosen
-    'skippedPairs' => []     // detailed reasons if a pair is skipped anywhere
+    'assignments' => [],
+    'skippedPairs' => []
   ];
 
   $canTakeAnotherSectionForSubject = function(int $pid, int $subjId) use (&$profSubjSecCount, $profPerSubjectSectionMax): bool {
@@ -247,7 +249,7 @@ try {
 
   $decidedPairProf = [];
 
-  // read all sections + subject_ids
+  $sectionSubs = [];
   $sectionsRows = $qAll("SELECT section_id, subject_ids FROM sections");
   foreach ($sectionsRows as $row) {
     $secId = (int)$row['section_id'];
@@ -266,24 +268,18 @@ try {
       $hrs = $subjectIsPEH($subjId) ? 1 : $subCapHrs; // keep cap consistency
       $profId = null; $lockProf = 0;
 
-      // Lock from existing schedules
       if (isset($fixedProfForPair[$secId][$subjId])) {
         $profId = (int)$fixedProfForPair[$secId][$subjId];
         $lockProf = 1;
-      }
-      // Lock from in-run decision
-      elseif (isset($decidedPairProf[$secId][$subjId])) {
+      } elseif (isset($decidedPairProf[$secId][$subjId])) {
         $profId = (int)$decidedPairProf[$secId][$subjId];
         $lockProf = 1;
-      }
-      // Need to choose a prof now
-      else {
+      } else {
         $candsAll = $canTeach[$subjId] ?? [];
         if (!$candsAll || count($candsAll) === 0) {
           $debug['skippedPairs'][] = ["section_id"=>$secId, "subj_id"=>$subjId, "reason"=>"no_prof_candidates"];
           continue;
         }
-        // drop those over weekly row cap
         $cands = array_values(array_filter($candsAll, function($pid) use ($profWeeklyCount, $profMaxWeeklySchedules) {
           return ($profWeeklyCount[$pid] ?? 0) < $profMaxWeeklySchedules;
         }));
@@ -291,7 +287,6 @@ try {
           $debug['skippedPairs'][] = ["section_id"=>$secId, "subj_id"=>$subjId, "reason"=>"all_candidates_capped_weekly_rows"];
           continue;
         }
-        // drop those that exceeded per-subject section max
         $cands = array_values(array_filter($cands, function($pid) use ($subjId, $canTakeAnotherSectionForSubject) {
           return $canTakeAnotherSectionForSubject($pid, $subjId);
         }));
@@ -299,18 +294,15 @@ try {
           $debug['skippedPairs'][] = ["section_id"=>$secId, "subj_id"=>$subjId, "reason"=>"all_candidates_capped_per_subject_sections"];
           continue;
         }
-        // choose lowest current minute load
         $best=null; $bestLoad=PHP_INT_MAX;
         foreach ($cands as $pid) { $l = $profLoad[$pid] ?? 0; if ($l < $bestLoad) { $best=$pid; $bestLoad=$l; } }
         $profId = (int)$best;
 
-        // persist in-run + bump
         if (!isset($decidedPairProf[$secId])) $decidedPairProf[$secId] = [];
         $decidedPairProf[$secId][$subjId] = $profId;
         $bumpProfSubjectSectionCount($profId, $subjId);
       }
 
-      // note the assignment decision (even before scheduling rows)
       $debug['assignments'][] = ["section_id"=>$secId,"subj_id"=>$subjId,"prof_id"=>$profId,"locked"=>$lockProf];
 
       $triplesBySection[$secId][] = [
@@ -410,6 +402,7 @@ try {
       $roomId = $sectionRoom[$secId] ?? null;
       foreach ($DAYS as $day) {
         foreach ($fixedBlocks as $fb) {
+          // only add fixed blocks if inside the day window
           if ($fb['start'] < $endTime && $fb['end'] > $startTime) {
             if ($ensureFixed((int)$secId, $roomId, (string)$day, (string)$fb['label'], (string)$fb['start'], (string)$fb['end'], (string)$fb['status'])) {
               $fixedInserted++;
@@ -432,7 +425,6 @@ try {
       $profId   = (int)$t['prof_id'];
       $lockProf = !empty($t['lock_prof']);
 
-      // Caps apply only when NOT locked
       if (!$lockProf && (($profWeeklyCount[$profId] ?? 0) >= $profMaxWeeklySchedules)) {
         $skipped++; 
         $conflicts[] = ["type"=>"prof_weekly_cap","prof_id"=>$profId,"section_id"=>$secId,"subj_id"=>$subjId];
@@ -580,9 +572,7 @@ try {
         }
       }
 
-      if (!$placedAnyForPair) {
-        $debug['skippedPairs'][] = ["section_id"=>$secId,"subj_id"=>$subjId,"prof_id"=>$profId,"reason"=>"no_slot_found"];
-      }
+      // (Optional) keep your fallback here if you already added it earlier.
 
       $metrics[] = [
         "section_id"=>$secId,"subj_id"=>$subjId,"prof_id"=>$profId,
@@ -644,7 +634,8 @@ try {
       "perSubjectSectionCounts"=>$finalProfSubjCounts,
       "underMinPairs"=>$underMinPairs
     ],
-    "debug"=>$debug
+    // keep debug if you want to inspect skipped pairs
+    // "debug"=>$debug
   ]);
 
 } catch (Throwable $e) {
