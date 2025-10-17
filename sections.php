@@ -388,14 +388,6 @@ function deleteSection(mysqli $conn, int $id): void {
 
   $conn->begin_transaction();
   try {
-    // 3) Delete schedule_days for schedules under this section
-    //    (do this first to avoid orphan rows)
-    $conn->query("
-      DELETE sd
-      FROM schedule_days sd
-      INNER JOIN schedules s ON s.schedule_id = sd.schedule_id
-      WHERE s.section_id = $id
-    ");
 
     // 4) Delete schedules under this section
     $conn->query("DELETE FROM schedules WHERE section_id = $id");
