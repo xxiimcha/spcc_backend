@@ -1,4 +1,6 @@
 <?php
+declare(strict_types=1);
+
 header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: POST, OPTIONS');
@@ -6,6 +8,7 @@ header('Access-Control-Allow-Headers: Content-Type');
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
 
 require_once __DIR__ . '/connect.php';
+require_once __DIR__ . '/system_settings_helper.php';
 
 if (!isset($conn) || !($conn instanceof mysqli)) {
   http_response_code(500);
@@ -34,30 +37,31 @@ try {
   $in  = json_decode($raw, true);
   if (!is_array($in)) throw new Exception('Invalid JSON body');
 
-  // === Current school year computation (June flip) ===
+  // ------------------ School Year / Semester resolution (system_settings-first) ------------------
+  $forceSystemSettings = array_key_exists('forceSystemSettings', $in) ? (bool)$in['forceSystemSettings'] : true;
+
   $computeCurrentSY = function(): string {
     $y = (int)date('Y');
-    $m = (int)date('n');
+    $m = (int)date('n'); // 1..12
     return ($m >= 6) ? sprintf('%d-%d', $y, $y + 1) : sprintf('%d-%d', $y - 1, $y);
   };
-  $currentSY = $computeCurrentSY();
 
-  // If not provided, "current"/"auto", or force flag is true (default), use currentSY
-  $schoolYearInput = trim((string)($in['school_year'] ?? ''));
-  $forceCurrent    = array_key_exists('forceCurrentSchoolYear', $in) ? (bool)$in['forceCurrentSchoolYear'] : true;
+  $sys = ss_get_current_school_info($conn);        // ['school_year'=>?, 'semester'=>?]
+  $sysSY  = $sys['school_year'] ?? null;
+  $sysSem = $sys['semester'] ?? null;
 
-  if (
-    $forceCurrent ||
-    $schoolYearInput === '' ||
-    strtolower($schoolYearInput) === 'current' ||
-    strtolower($schoolYearInput) === 'auto'
-  ) {
-    $schoolYear = $currentSY;
+  $inSY   = trim((string)($in['school_year'] ?? ''));
+  $inSem  = trim((string)($in['semester'] ?? ''));
+
+  if ($forceSystemSettings) {
+    $schoolYear = $sysSY ?: $computeCurrentSY();
+    $semester   = $sysSem ?: $inSem; // if system setting missing, fall back to input
   } else {
-    $schoolYear = $schoolYearInput;
+    $schoolYear = $inSY !== '' ? $inSY : ($sysSY ?: $computeCurrentSY());
+    $semester   = $inSem !== '' ? $inSem : ($sysSem ?? '');
   }
 
-  $semester   = trim((string)($in['semester'] ?? ''));
+  // ------------------ Other inputs ------------------
   $daysIn     = $in['days'] ?? [];
   $startTime  = trim((string)($in['startTime'] ?? '07:30'));
   $endTime    = trim((string)($in['endTime'] ?? '16:30'));
@@ -80,15 +84,19 @@ try {
     ['label' => 'Recess',   'start' => '08:00', 'end' => '08:30', 'status' => 'fixed'],
   ];
 
+  // Weekly cap (defaults to 8)
   $profMaxWeeklySchedules = isset($in['profMaxWeeklySchedules']) ? (int)$in['profMaxWeeklySchedules'] : 8;
   if ($profMaxWeeklySchedules <= 0) { $profMaxWeeklySchedules = 8; }
 
+  // Minimum gap for same professor (minutes, default 10)
   $profMinGapMinutes = isset($in['profMinGapMinutes']) ? (int)$in['profMinGapMinutes'] : 10;
   if ($profMinGapMinutes < 0) $profMinGapMinutes = 0;
 
+  // Avoid same subject at same time across different days
   $avoidSameTimeAcrossDays = (bool)($in['avoidSameTimeAcrossDays'] ?? true);
 
-  if ($semester === '') throw new Exception('Missing semester');
+  // ------------------ Validation ------------------
+  if ($schoolYear === '' || $semester === '') throw new Exception('Missing school_year or semester');
   if (!is_array($daysIn) || count($daysIn) === 0) throw new Exception('At least one active day is required');
   if ($slotMin <= 0) throw new Exception('slotMinutes must be positive');
 
@@ -103,7 +111,7 @@ try {
   $toM   = $toMin($endTime);
   if ($fromM < 0 || $toM < 0 || $fromM >= $toM) throw new Exception('Invalid start/end time window');
 
-  /** Build slots */
+  // ------------------ Build slots ------------------
   $SLOTS = [];
   for ($m=$fromM; $m+$slotMin <= $toM; $m += $slotMin) {
     $sH=str_pad((string)intdiv($m,60),2,'0',STR_PAD_LEFT);
@@ -120,7 +128,7 @@ try {
     return $enforceLunch ? ($s < $lunchEnd && $e > $lunchStart) : false;
   };
 
-  /** Section -> latest room assignment */
+  // ------------------ Section → latest room assignment ------------------
   $sectionRoom = [];
   foreach ($qAll("
       SELECT s.section_id, sra.room_id
@@ -151,7 +159,7 @@ try {
     ];
   }
 
-  // Existing load in MINUTES (for balancing)
+  // ------------------ Existing load in minutes (for balancing) ------------------
   $profLoad = [];
   foreach ($qAll("
     SELECT prof_id, COALESCE(SUM(TIME_TO_SEC(TIMEDIFF(end_time,start_time))/60),0) AS m
@@ -163,7 +171,7 @@ try {
     if (!isset($profLoad[$pid])) $profLoad[$pid] = 0;
   }
 
-  // Weekly schedule COUNT per professor (cap enforcement)
+  // ------------------ Weekly schedule COUNT per professor (cap) ------------------
   $profWeeklyCount = [];
   foreach ($qAll("
     SELECT prof_id, COUNT(*) AS c
@@ -178,7 +186,7 @@ try {
     if (!isset($profWeeklyCount[$pid])) $profWeeklyCount[$pid] = 0;
   }
 
-  // Subject → professors who can teach
+  // ------------------ Subject → professors who can teach ------------------
   $canTeach = [];
   foreach ($qAll("SELECT prof_id, prof_subject_ids FROM professors") as $r) {
     $pid = (int)$r['prof_id'];
@@ -193,6 +201,7 @@ try {
     }
   }
 
+  // ------------------ Build assignments ------------------
   $triplesBySection = [];
   $noEligible = [];
 
@@ -223,6 +232,7 @@ try {
       if ($profId === null) {
         $cands = $canTeach[$subjId] ?? [];
 
+        // Filter out professors already at or above the weekly cap
         $cands = array_values(array_filter($cands, function($pid) use ($profWeeklyCount, $profMaxWeeklySchedules) {
           return ($profWeeklyCount[$pid] ?? 0) < $profMaxWeeklySchedules;
         }));
@@ -236,6 +246,7 @@ try {
         if ($best===null) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId,"reason"=>"no_candidate_after_cap_filter"]; continue; }
         $profId = (int)$best;
       } else {
+        // If a fixed professor is specified AND already at cap, skip this assignment entirely
         if (($profWeeklyCount[$profId] ?? 0) >= $profMaxWeeklySchedules) {
           $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId,"prof_id"=>$profId,"reason"=>"prof_cap_reached_fixed"];
           continue;
@@ -274,6 +285,7 @@ try {
       if (!isset($triplesBySection[$secId])) $triplesBySection[$secId]=[];
       foreach ($subs as $subjId) {
         $cands = $canTeach[$subjId] ?? [];
+        // Filter out professors at or above cap
         $cands = array_values(array_filter($cands, function($pid) use ($profWeeklyCount, $profMaxWeeklySchedules) {
           return ($profWeeklyCount[$pid] ?? 0) < $profMaxWeeklySchedules;
         }));
@@ -300,6 +312,7 @@ try {
     exit();
   }
 
+  // ------------------ Helpers for loads & conflicts ------------------
   $secDayLoad = function(int $sec, string $day) use ($qOne,$sy,$sem) {
     return (int)$qOne("SELECT COUNT(*) FROM schedules
                        WHERE school_year='{$sy}' AND semester='{$sem}' AND section_id={$sec}
@@ -318,6 +331,7 @@ try {
                          AND (end_time='{$s}' OR start_time='{$e}')",0) > 0;
   };
 
+  // Same subject at exactly same time on other days?
   $sameTimeOtherDay = function(int $sec,int $subj,string $day,string $s,string $e) use ($qOne,$sy,$sem) {
     return (int)$qOne("SELECT COUNT(*) FROM schedules
                        WHERE school_year='{$sy}' AND semester='{$sem}'
@@ -326,6 +340,7 @@ try {
                          AND NOT JSON_CONTAINS(days, JSON_QUOTE('{$day}'))",0) > 0;
   };
 
+  // Penalize touching / tiny gaps for professors
   $profAdjScore = function(int $pid,string $day,string $s,string $e,int $slotMin) use ($qOne,$sy,$sem) {
     $touch = (int)$qOne("SELECT COUNT(*) FROM schedules
                          WHERE school_year='{$sy}' AND semester='{$sem}' AND prof_id={$pid}
@@ -347,6 +362,7 @@ try {
     return $score;
   };
 
+  // ------------------ Insert fixed blocks ------------------
   $ensureFixed = function(int $sectionId, ?int $roomId, string $day, string $label, string $s, string $e, string $status='fixed') use ($conn, $esc, $sy, $sem) {
     $sE    = $esc($s);
     $eE    = $esc($e);
@@ -397,6 +413,7 @@ try {
     }
   }
 
+  // ------------------ Generate schedules ------------------
   $inserted=0; $skipped=0; $conflicts=[]; $metrics=[];
   foreach ($triplesBySection as $secId => $rows) {
     $hasRoom = array_key_exists($secId, $sectionRoom);
@@ -406,6 +423,7 @@ try {
       $subjId = (int)$t['subj_id'];
       $profId = (int)$t['prof_id'];
 
+      // Weekly cap
       if (($profWeeklyCount[$profId] ?? 0) >= $profMaxWeeklySchedules) {
         $skipped++;
         $conflicts[] = ["type"=>"prof_weekly_cap", "prof_id"=>$profId, "section_id"=>$secId, "subj_id"=>$subjId];
@@ -424,6 +442,7 @@ try {
       $genForPair = 0;
 
       while ($remain > 0) {
+        // Re-check weekly cap before each row
         if (($profWeeklyCount[$profId] ?? 0) >= $profMaxWeeklySchedules) {
           $conflicts[] = ["type"=>"prof_weekly_cap_reached", "prof_id"=>$profId, "section_id"=>$secId, "subj_id"=>$subjId];
           break;
@@ -440,6 +459,7 @@ try {
 
             $sE = $esc($s); $eE = $esc($e);
 
+            // Section-time overlap
             if ($enfSec) {
               $c = (int)$qOne("SELECT COUNT(*) FROM schedules
                                WHERE school_year='{$sy}' AND semester='{$sem}' AND section_id={$secId}
@@ -448,6 +468,7 @@ try {
               if ($c>0) { $skipped++; $conflicts[]=["type"=>"section","section_id"=>$secId,"day"=>$day,"s"=>$s,"e"=>$e]; continue; }
             }
 
+            // Professor overlap
             if ($enfProf) {
               $c = (int)$qOne("SELECT COUNT(*) FROM schedules
                                WHERE school_year='{$sy}' AND semester='{$sem}' AND prof_id={$profId}
@@ -455,6 +476,7 @@ try {
                                  AND NOT (end_time<='{$sE}' OR start_time>='{$eE}')",0);
               if ($c>0) { $skipped++; $conflicts[]=["type"=>"prof","prof_id"=>$profId,"day"=>$day,"s"=>$s,"e"=>$e]; continue; }
 
+              // Professor minimum gap
               if ($profMinGapMinutes > 0) {
                 $g = (int)$qOne("
                   SELECT COUNT(*) FROM schedules
@@ -473,15 +495,18 @@ try {
               }
             }
 
+            // Avoid same subject at the same time across different days
             if ($avoidSameTimeAcrossDays && $sameTimeOtherDay($secId, $subjId, $day, $s, $e)) {
               $skipped++;
               $conflicts[] = ["type"=>"subject_same_time_pattern","section_id"=>$secId,"subj_id"=>$subjId,"day"=>$day,"s"=>$s,"e"=>$e];
               continue;
             }
 
+            // Subject weekly target within this section
             $curr = $ignoreExisting ? ($target - $remain) : (int)$qOne($baseMinsSQL,0);
             if ($curr + $len > $target) continue;
 
+            // Avoid duplicates for this section+subject+exact slot (same day)
             $dup = (int)$qOne("SELECT 1 FROM schedules
                                WHERE school_year='{$sy}' AND semester='{$sem}'
                                  AND section_id={$secId} AND subj_id={$subjId}
@@ -491,6 +516,7 @@ try {
                                LIMIT 1",0);
             if ($dup>0) { $skipped++; continue; }
 
+            // Score (load balance + spacing preference)
             $score=0;
             $secLoad = $secDayLoad($secId,$day);
             $minLoad = PHP_INT_MAX;
@@ -513,6 +539,7 @@ try {
 
         if ($best === null) break;
 
+        // Online if section has no room, else Onsite
         $scheduleType = $hasRoom ? 'Onsite' : 'Online';
         $status='pending'; $origin='auto';
         $sE=$esc($best['s']); $eE=$esc($best['e']);
@@ -534,6 +561,7 @@ try {
         $genForPair += $best['len'];
         $remain     -= $best['len'];
 
+        // Increment in-memory weekly count for the professor
         $profWeeklyCount[$profId] = ($profWeeklyCount[$profId] ?? 0) + 1;
 
         if (!$ignoreExisting) {
@@ -563,10 +591,12 @@ try {
       "noEligible"=>$noEligible,
       "fixedInserted"=>$fixedInserted,
       "params"=>[
-        "school_year"=>$schoolYear,             // ← always current by default
-        "current_school_year_used"=>$currentSY, // for visibility
-        "forceCurrentSchoolYear"=>$forceCurrent,
+        "school_year"=>$schoolYear,
         "semester"=>$semester,
+        "source"=>[
+          "forceSystemSettings"=>$forceSystemSettings,
+          "system_settings"=>["school_year"=>$sysSY, "semester"=>$sysSem]
+        ],
         "days"=>$DAYS,
         "startTime"=>$startTime,
         "endTime"=>$endTime,
