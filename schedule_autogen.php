@@ -37,43 +37,44 @@ try {
   $in  = json_decode($raw, true);
   if (!is_array($in)) throw new Exception('Invalid JSON body');
 
+  // ------------------ School Year / Semester resolution ------------------
   $forceSystemSettings = array_key_exists('forceSystemSettings', $in) ? (bool)$in['forceSystemSettings'] : true;
 
   $computeCurrentSY = function(): string {
     $y = (int)date('Y');
-    $m = (int)date('n');
+    $m = (int)date('n'); // 1..12
     return ($m >= 6) ? sprintf('%d-%d', $y, $y + 1) : sprintf('%d-%d', $y - 1, $y);
   };
 
-  $sys = ss_get_current_school_info($conn);
-  $sysSY  = $sys['school_year'] ?? null;
-  $sysSem = $sys['semester'] ?? null;
+  $sys   = ss_get_current_school_info($conn);        // ['school_year'=>?, 'semester'=>?]
+  $sysSY = $sys['school_year'] ?? null;
+  $sysSe = $sys['semester'] ?? null;
 
-  $inSY   = trim((string)($in['school_year'] ?? ''));
-  $inSem  = trim((string)($in['semester'] ?? ''));
+  $inSY  = trim((string)($in['school_year'] ?? ''));
+  $inSem = trim((string)($in['semester'] ?? ''));
 
   if ($forceSystemSettings) {
     $schoolYear = $sysSY ?: $computeCurrentSY();
-    $semester   = $sysSem ?: $inSem;
+    $semester   = $sysSe ?: $inSem; // if system setting missing, fall back to input
   } else {
     $schoolYear = $inSY !== '' ? $inSY : ($sysSY ?: $computeCurrentSY());
-    $semester   = $inSem !== '' ? $inSem : ($sysSem ?? '');
+    $semester   = $inSem !== '' ? $inSem : ($sysSe ?? '');
   }
 
-  $daysIn     = $in['days'] ?? [];
-  $startTime  = trim((string)($in['startTime'] ?? '07:30'));
-  $endTime    = trim((string)($in['endTime'] ?? '16:30'));
-  $slotMin    = (int)($in['slotMinutes'] ?? 60);
-  $secMaxDaily= isset($in['maxDailyLoad']) ? (int)$in['maxDailyLoad'] : null;
+  // ------------------ Inputs ------------------
+  $daysIn      = $in['days'] ?? [];
+  $startTime   = trim((string)($in['startTime'] ?? '07:30'));
+  $endTime     = trim((string)($in['endTime']   ?? '16:30'));
+  $slotMin     = (int)($in['slotMinutes'] ?? 60);
+  $secMaxDaily = isset($in['maxDailyLoad']) ? (int)$in['maxDailyLoad'] : null;
   $profMaxDaily= isset($in['profMaxDailyLoad']) ? (int)$in['profMaxDailyLoad'] : null;
 
-  $enfSec     = (bool)($in['preventSameTimeSameSection'] ?? true);
-  $enfProf    = (bool)($in['preventProfDoubleBooking'] ?? true);
-  $subCapHrs  = (int)($in['subjectWeeklyHourCap'] ?? 4);
+  $enfSec      = (bool)($in['preventSameTimeSameSection'] ?? true);
+  $enfProf     = (bool)($in['preventProfDoubleBooking'] ?? true);
+  $subCapHrs   = (int)($in['subjectWeeklyHourCap'] ?? 4);
   $ignoreExisting = (bool)($in['ignoreExistingMinutes'] ?? false);
-  $seedFrom   = strtolower((string)($in['seedFrom'] ?? 'assignments'));
-  $lunchStart = trim((string)($in['lunchStart'] ?? '12:00'));
-  $lunchEnd   = trim((string)($in['lunchEnd']   ?? '13:00'));
+  $lunchStart  = trim((string)($in['lunchStart'] ?? '12:00'));
+  $lunchEnd    = trim((string)($in['lunchEnd']   ?? '13:00'));
   $enforceLunch = ($lunchStart !== '' && $lunchEnd !== '');
 
   $addFixedBlocks = (bool)($in['addFixedBlocks'] ?? true);
@@ -82,17 +83,22 @@ try {
     ['label' => 'Recess',   'start' => '08:00', 'end' => '08:30', 'status' => 'fixed'],
   ];
 
+  // Weekly cap (rows/week/prof)
   $profMaxWeeklySchedules = isset($in['profMaxWeeklySchedules']) ? (int)$in['profMaxWeeklySchedules'] : 8;
-  if ($profMaxWeeklySchedules <= 0) { $profMaxWeeklySchedules = 8; }
+  if ($profMaxWeeklySchedules <= 0) $profMaxWeeklySchedules = 8;
 
+  // Minimum gap for same professor (minutes)
   $profMinGapMinutes = isset($in['profMinGapMinutes']) ? (int)$in['profMinGapMinutes'] : 10;
   if ($profMinGapMinutes < 0) $profMinGapMinutes = 0;
 
+  // Avoid same subject at the same time across different days
   $avoidSameTimeAcrossDays = (bool)($in['avoidSameTimeAcrossDays'] ?? true);
 
+  // per-prof-per-subject distinct section window (reporting & optional cap)
   $profPerSubjectSectionMax = isset($in['profPerSubjectSectionMax']) ? (int)$in['profPerSubjectSectionMax'] : 8;
   $profPerSubjectSectionMin = isset($in['profPerSubjectSectionMin']) ? (int)$in['profPerSubjectSectionMin'] : 6;
 
+  // ------------------ Validation ------------------
   if ($schoolYear === '' || $semester === '') throw new Exception('Missing school_year or semester');
   if (!is_array($daysIn) || count($daysIn) === 0) throw new Exception('At least one active day is required');
   if ($slotMin <= 0) throw new Exception('slotMinutes must be positive');
@@ -108,6 +114,7 @@ try {
   $toM   = $toMin($endTime);
   if ($fromM < 0 || $toM < 0 || $fromM >= $toM) throw new Exception('Invalid start/end time window');
 
+  // ------------------ Build slots ------------------
   $SLOTS = [];
   for ($m=$fromM; $m+$slotMin <= $toM; $m += $slotMin) {
     $sH=str_pad((string)intdiv($m,60),2,'0',STR_PAD_LEFT);
@@ -124,56 +131,50 @@ try {
     return $enforceLunch ? ($s < $lunchEnd && $e > $lunchStart) : false;
   };
 
-  // Remove 13:30–14:30, force 13:00–14:00
-  $SLOTS = array_values(array_filter($SLOTS, function($slt) {
-    return !($slt[0] === '13:30' && $slt[1] === '14:30');
-  }));
+  // Slot adjustment: remove 13:30–14:30, ensure 13:00–14:00
+  $SLOTS = array_values(array_filter($SLOTS, fn($slt)=>!($slt[0]==='13:30' && $slt[1]==='14:30')));
   $has1300 = false;
-  foreach ($SLOTS as $slt) if ($slt[0]==='13:00' && $slt[1]==='14:00') { $has1300=true; break; }
+  foreach ($SLOTS as $slt) if ($slt[0]==='13:00' && $slt[1]==='14:00') { $has1300 = true; break; }
   if (!$has1300) {
     $slot13s = 13*60; $slot13e = 14*60;
-    if ($slot13s >= $fromM && $slot13e <= $toM && !$overlapsLunch('13:00','14:00')) {
-      $SLOTS[] = ['13:00','14:00',60];
-    }
+    if ($slot13s >= $fromM && $slot13e <= $toM && !$overlapsLunch('13:00','14:00')) $SLOTS[] = ['13:00','14:00', 60];
   }
-  usort($SLOTS, fn($a,$b)=>strcmp($a[0],$b[0]));
+  usort($SLOTS, fn($a,$b)=>strcmp($a[0], $b[0]));
 
-  // Section → latest room
+  // ------------------ Section → latest room assignment ------------------
   $sectionRoom = [];
   foreach ($qAll("
-    SELECT s.section_id, sra.room_id
-    FROM sections s
-    JOIN (
-      SELECT section_id, MAX(assignment_id) AS latest_assignment_id
-      FROM section_room_assignments GROUP BY section_id
-    ) t ON t.section_id = s.section_id
-    JOIN section_room_assignments sra ON sra.assignment_id = t.latest_assignment_id
+      SELECT s.section_id, sra.room_id
+      FROM sections s
+      JOIN (SELECT section_id, MAX(assignment_id) AS latest_assignment_id FROM section_room_assignments GROUP BY section_id) t
+        ON t.section_id = s.section_id
+      JOIN section_room_assignments sra ON sra.assignment_id = t.latest_assignment_id
   ") as $r) $sectionRoom[(int)$r['section_id']] = (int)$r['room_id'];
 
   $sectionInfo = [];
   foreach ($qAll("SELECT section_id, grade_level, strand FROM sections") as $r) {
     $sectionInfo[(int)$r['section_id']] = [
-      'grade_level'=>(string)$r['grade_level'],
-      'strand'=>strtolower((string)$r['strand'])
+      'grade_level' => (string)$r['grade_level'],
+      'strand'      => strtolower((string)$r['strand'])
     ];
   }
 
-  // Subject meta (with code for PEH)
+  // ------------------ Subjects meta (with subj_code for PEH) ------------------
   $subjectMeta = [];
   foreach ($qAll("SELECT subj_id, subj_code, grade_level, strand FROM subjects") as $r) {
     $subjectMeta[(int)$r['subj_id']] = [
-      'code'=>(string)$r['subj_code'],
-      'grade_level'=>(string)$r['grade_level'],
-      'strand'=>strtolower((string)$r['strand']),
-      'hours'=>4
+      'code'        => (string)$r['subj_code'],
+      'grade_level' => (string)$r['grade_level'],
+      'strand'      => strtolower((string)$r['strand']),
+      'hours'       => 4
     ];
   }
-  $subjectIsPEH = function(int $sid) use ($subjectMeta): bool {
-    $code = $subjectMeta[$sid]['code'] ?? '';
+  $subjectIsPEH = function(int $subjId) use ($subjectMeta): bool {
+    $code = $subjectMeta[$subjId]['code'] ?? '';
     return strncasecmp($code, 'PEH', 3) === 0;
   };
 
-  // Existing load minutes / weekly row counts
+  // ------------------ Loads & counts ------------------
   $profLoad = [];
   foreach ($qAll("
     SELECT prof_id, COALESCE(SUM(TIME_TO_SEC(TIMEDIFF(end_time,start_time))/60),0) AS m
@@ -184,13 +185,14 @@ try {
 
   $profWeeklyCount = [];
   foreach ($qAll("
-    SELECT prof_id, COUNT(*) AS c FROM schedules
+    SELECT prof_id, COUNT(*) AS c
+    FROM schedules
     WHERE school_year='{$sy}' AND semester='{$sem}'
     GROUP BY prof_id
   ") as $r) $profWeeklyCount[(int)$r['prof_id']] = (int)$r['c'];
   foreach ($qAll("SELECT prof_id FROM professors") as $r) { $pid=(int)$r['prof_id']; if(!isset($profWeeklyCount[$pid])) $profWeeklyCount[$pid]=0; }
 
-  // Per-prof-per-subject distinct section counts
+  // Per-prof-per-subject distinct section counts (for optional cap + reporting)
   $profSubjSecCount = [];
   foreach ($qAll("
     SELECT prof_id, subj_id, COUNT(DISTINCT section_id) AS c
@@ -198,9 +200,9 @@ try {
     WHERE school_year='{$sy}' AND semester='{$sem}'
       AND subj_id IS NOT NULL AND prof_id IS NOT NULL AND section_id IS NOT NULL
     GROUP BY prof_id, subj_id
-  ") as $r) { $profSubjSecCount[(int)$r['prof_id']][(int)$r['subj_id']] = (int)$r['c']; }
+  ") as $r) $profSubjSecCount[(int)$r['prof_id']][(int)$r['subj_id']] = (int)$r['c'];
 
-  // Subject → list of profs who can teach (from professors.prof_subject_ids)
+  // ------------------ Subject → professors who can teach ------------------
   $canTeach = [];
   foreach ($qAll("SELECT prof_id, prof_subject_ids FROM professors") as $r) {
     $pid = (int)$r['prof_id'];
@@ -209,21 +211,15 @@ try {
       $tmp = json_decode($r['prof_subject_ids'], true);
       if (is_array($tmp)) $ids = array_map('intval', $tmp);
     }
-    foreach ($ids as $sj) { if ($sj>0) $canTeach[$sj][] = $pid; }
+    foreach ($ids as $sj) if ($sj>0) $canTeach[$sj][] = $pid;
   }
 
-  // -------- NEW: Lock one professor per (section, subject) --------
-  // Priority 1: section_subjects.prof_id (current SY/sem)
-  $fixedProfForPair = []; // [section_id][subj_id] => prof_id
-  foreach ($qAll("
-    SELECT section_id, subj_id, prof_id
-    FROM section_subjects
-    WHERE school_year='{$sy}' AND semester='{$sem}' AND prof_id IS NOT NULL
-  ") as $r) {
-    $fixedProfForPair[(int)$r['section_id']][(int)$r['subj_id']] = (int)$r['prof_id'];
-  }
-  // Priority 2: existing schedules for the same SY/sem (most rows wins)
-  $existCounts = []; // [sec][subj] => ['prof_id'=>..., 'c'=>...]
+  // ------------------ LOCK: One prof per (section, subject) ------------------
+  // Priority (without section_subjects):
+  // 1) Existing schedules in this SY/sem (most rows wins) → locked.
+  // 2) Otherwise pick 1 prof now, lock it in-run; future runs will reuse from schedules.
+  $fixedProfForPair = [];
+  $existCounts = [];
   foreach ($qAll("
     SELECT section_id, subj_id, prof_id, COUNT(*) AS c
     FROM schedules
@@ -232,7 +228,6 @@ try {
     GROUP BY section_id, subj_id, prof_id
   ") as $r) {
     $sec=(int)$r['section_id']; $sub=(int)$r['subj_id']; $pid=(int)$r['prof_id']; $c=(int)$r['c'];
-    if (isset($fixedProfForPair[$sec][$sub])) continue; // section_subjects takes priority
     $curr = $existCounts[$sec][$sub]['c'] ?? -1;
     if ($c > $curr) {
       $existCounts[$sec][$sub] = ['prof_id'=>$pid,'c'=>$c];
@@ -240,122 +235,89 @@ try {
     }
   }
 
-  // Helpers
+  // ------------------ Build assignments from sections.subject_ids ------------------
+  $triplesBySection = [];
+  $noEligible = [];
+
+  // helper to check per-subject cap for a candidate prof
   $canTakeAnotherSectionForSubject = function(int $pid, int $subjId) use (&$profSubjSecCount, $profPerSubjectSectionMax): bool {
     $curr = $profSubjSecCount[$pid][$subjId] ?? 0;
     return $curr < $profPerSubjectSectionMax;
   };
+  // bump when we newly bind a prof to a section for that subject
   $bumpProfSubjectSectionCount = function(int $pid, int $subjId) use (&$profSubjSecCount): void {
     if (!isset($profSubjSecCount[$pid])) $profSubjSecCount[$pid] = [];
     $profSubjSecCount[$pid][$subjId] = ($profSubjSecCount[$pid][$subjId] ?? 0) + 1;
   };
 
-  // -------- Build assignments (triples) --------
-  $triplesBySection = [];
-  $noEligible = [];
+  // in-run decisions so multiple rows for same pair keep the same prof
+  $decidedPairProf = [];
 
-  if ($seedFrom === 'section_subjects') {
-    foreach ($qAll("
-      SELECT ss.section_id, ss.subj_id, ss.prof_id, ss.weekly_hours_needed AS wh
-      FROM section_subjects ss
-      WHERE ss.school_year='{$sy}' AND ss.semester='{$sem}'
-    ") as $r) {
-      $secId = (int)$r['section_id'];
-      $subjId = (int)$r['subj_id'];
-      if (!isset($sectionInfo[$secId]) || !isset($subjectMeta[$subjId])) continue;
+  $sectionSubs = [];
+  foreach ($qAll("SELECT section_id, subject_ids, grade_level, strand FROM sections") as $r) {
+    $secId = (int)$r['section_id'];
+    $secGL = (string)$r['grade_level'];
+    $secStr= strtolower((string)$r['strand']);
 
-      $secGL = $sectionInfo[$secId]['grade_level']; $secStr = $sectionInfo[$secId]['strand'];
-      $subGL = $subjectMeta[$subjId]['grade_level']; $subStr = $subjectMeta[$subjId]['strand'];
-      if ($secGL !== $subGL || $secStr !== $subStr) continue;
+    $lst = [];
+    if (!empty($r['subject_ids'])) {
+      $dec = json_decode($r['subject_ids'], true);
+      if (is_array($dec)) foreach ($dec as $v) { $n=(int)$v; if ($n>0) $lst[]=$n; }
+    }
+    $lst = array_values(array_filter($lst, function($sid) use ($subjectMeta, $secGL, $secStr) {
+      if (!isset($subjectMeta[$sid])) return false;
+      $m = $subjectMeta[$sid];
+      return ((string)$m['grade_level'] === $secGL) && ((string)$m['strand'] === $secStr);
+    }));
+    $sectionSubs[$secId] = $lst;
+  }
 
-      $hrs = isset($r['wh']) && $r['wh'] !== null && $r['wh'] !== '' ? (float)$r['wh'] : 4.0;
-      if ($subjectIsPEH($subjId)) $hrs = 1.0;
+  foreach ($sectionSubs as $secId => $subs) {
+    if (!isset($triplesBySection[$secId])) $triplesBySection[$secId]=[];
 
-      // Choose prof: lock order → explicit section_subjects → existing schedules → otherwise assign
-      $profId = null;
-      if (!empty($r['prof_id'])) {
-        $profId = (int)$r['prof_id']; // explicit lock
-        $lockProf = true;
-      } elseif (isset($fixedProfForPair[$secId][$subjId])) {
+    foreach ($subs as $subjId) {
+      $hrs = $subjectIsPEH($subjId) ? 1 : 4;
+
+      // Choose / lock professor
+      if (isset($fixedProfForPair[$secId][$subjId])) {
+        // Locked by existing schedules
         $profId = (int)$fixedProfForPair[$secId][$subjId];
-        $lockProf = true;
+        $lockProf = 1;
+      } elseif (isset($decidedPairProf[$secId][$subjId])) {
+        // Locked by an earlier decision in this run
+        $profId = (int)$decidedPairProf[$secId][$subjId];
+        $lockProf = 1;
       } else {
-        $lockProf = false;
+        // fresh decision
+        $lockProf = 0;
         $cands = $canTeach[$subjId] ?? [];
+        // Filter out professors at/over weekly rows cap
         $cands = array_values(array_filter($cands, function($pid) use ($profWeeklyCount, $profMaxWeeklySchedules) {
           return ($profWeeklyCount[$pid] ?? 0) < $profMaxWeeklySchedules;
         }));
+        // Filter out professors at per-subject section cap
         $cands = array_values(array_filter($cands, function($pid) use ($subjId, $canTakeAnotherSectionForSubject) {
           return $canTakeAnotherSectionForSubject($pid, $subjId);
         }));
         if (!$cands) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId,"reason"=>"no_candidates"]; continue; }
+
+        // Choose lowest current minute-load
         $best=null; $bestLoad=PHP_INT_MAX;
-        foreach ($cands as $pid) { $l=$profLoad[$pid] ?? 0; if ($l<$bestLoad){$best=$pid;$bestLoad=$l;} }
+        foreach ($cands as $pid) { $l = $profLoad[$pid] ?? 0; if ($l < $bestLoad) { $best=$pid; $bestLoad=$l; } }
         $profId = (int)$best;
+
+        // Persist in-run and bump subject-section load window
+        if (!isset($decidedPairProf[$secId])) $decidedPairProf[$secId] = [];
+        $decidedPairProf[$secId][$subjId] = $profId;
+        $bumpProfSubjectSectionCount($profId, $subjId);
       }
 
-      // If we just decided a NEW professor (not locked from existing), bump per-subject section count
-      if (!$lockProf) $bumpProfSubjectSectionCount($profId, $subjId);
-
-      if (!isset($triplesBySection[$secId])) $triplesBySection[$secId]=[];
       $triplesBySection[$secId][] = [
-        "subj_id"=>$subjId,
-        "prof_id"=>$profId,
-        "weekly_minutes"=>$subjectIsPEH($subjId)?60:max(0,(int)round($hrs*60)),
-        "lock_prof"=>$lockProf ? 1 : 0
+        "subj_id" => $subjId,
+        "prof_id" => $profId,
+        "weekly_minutes" => $subjectIsPEH($subjId) ? 60 : max(0, $hrs*60),
+        "lock_prof" => $lockProf
       ];
-    }
-  } else {
-    // From sections.subject_ids
-    $sectionSubs = [];
-    foreach ($qAll("SELECT section_id, subject_ids, grade_level, strand FROM sections") as $r) {
-      $secId=(int)$r['section_id'];
-      $secGL=(string)$r['grade_level']; $secStr=strtolower((string)$r['strand']);
-      $lst=[];
-      if (!empty($r['subject_ids'])) {
-        $dec=json_decode($r['subject_ids'],true);
-        if (is_array($dec)) foreach ($dec as $v){ $n=(int)$v; if($n>0)$lst[]=$n; }
-      }
-      $lst = array_values(array_filter($lst, function($sid) use ($subjectMeta,$secGL,$secStr){
-        if (!isset($subjectMeta[$sid])) return false;
-        $m=$subjectMeta[$sid];
-        return ((string)$m['grade_level']===$secGL) && ((string)$m['strand']===$secStr);
-      }));
-      $sectionSubs[$secId]=$lst;
-    }
-
-    foreach ($sectionSubs as $secId=>$subs) {
-      if (!isset($triplesBySection[$secId])) $triplesBySection[$secId]=[];
-      foreach ($subs as $subjId) {
-        $hrs = $subjectIsPEH($subjId) ? 1 : 4;
-
-        // Try lock: section_subjects / existing schedules
-        if (isset($fixedProfForPair[$secId][$subjId])) {
-          $profId = (int)$fixedProfForPair[$secId][$subjId];
-          $lockProf = 1;
-        } else {
-          $lockProf = 0;
-          $cands = $canTeach[$subjId] ?? [];
-          $cands = array_values(array_filter($cands, function($pid) use ($profWeeklyCount, $profMaxWeeklySchedules) {
-            return ($profWeeklyCount[$pid] ?? 0) < $profMaxWeeklySchedules;
-          }));
-          $cands = array_values(array_filter($cands, function($pid) use ($subjId, $canTakeAnotherSectionForSubject) {
-            return $canTakeAnotherSectionForSubject($pid, $subjId);
-          }));
-          if (!$cands) { $noEligible[]=["section_id"=>$secId,"subj_id"=>$subjId,"reason"=>"no_candidates"]; continue; }
-          $best=null; $bestLoad=PHP_INT_MAX;
-          foreach ($cands as $pid){ $l=$profLoad[$pid] ?? 0; if($l<$bestLoad){$best=$pid;$bestLoad=$l;} }
-          $profId=(int)$best;
-          $bumpProfSubjectSectionCount($profId, $subjId);
-        }
-
-        $triplesBySection[$secId][] = [
-          "subj_id"=>$subjId,
-          "prof_id"=>$profId,
-          "weekly_minutes"=>$subjectIsPEH($subjId)?60:max(0,$hrs*60),
-          "lock_prof"=>$lockProf
-        ];
-      }
     }
   }
 
@@ -365,7 +327,7 @@ try {
     exit();
   }
 
-  // Helpers for loads & conflicts
+  // ------------------ Helpers for loads & conflicts ------------------
   $secDayLoad = function(int $sec, string $day) use ($qOne,$sy,$sem) {
     return (int)$qOne("SELECT COUNT(*) FROM schedules
                        WHERE school_year='{$sy}' AND semester='{$sem}' AND section_id={$sec}
@@ -410,7 +372,7 @@ try {
     return $score;
   };
 
-  // Fixed blocks (for ALL sections)
+  // ------------------ Insert fixed blocks (all sections) ------------------
   $ensureFixed = function(int $sectionId, ?int $roomId, string $day, string $label, string $s, string $e, string $status='fixed') use ($conn, $esc, $sy, $sem) {
     $sE=$esc($s); $eE=$esc($e); $dayE=$esc($day); $labE=$esc($label); $statusE=$esc($status);
     $roomSql = $roomId === null ? "NULL" : (string)((int)$roomId);
@@ -457,26 +419,26 @@ try {
     }
   }
 
-  // Generate schedules
+  // ------------------ Generate schedules ------------------
   $inserted=0; $skipped=0; $conflicts=[]; $metrics=[];
   foreach ($triplesBySection as $secId => $rows) {
     $hasRoom = array_key_exists($secId, $sectionRoom);
     $roomId  = $hasRoom ? (int)$sectionRoom[$secId] : null;
 
     foreach ($rows as $t) {
-      $subjId = (int)$t['subj_id'];
-      $profId = (int)$t['prof_id'];
+      $subjId   = (int)$t['subj_id'];
+      $profId   = (int)$t['prof_id'];
       $lockProf = !empty($t['lock_prof']);
 
-      // If prof is locked for this (section, subject), ignore weekly cap at selection stage
+      // Caps only apply when NOT locked (locked = previously chosen for this pair)
       if (!$lockProf && (($profWeeklyCount[$profId] ?? 0) >= $profMaxWeeklySchedules)) {
-        $skipped++; $conflicts[]=["type"=>"prof_weekly_cap","prof_id"=>$profId,"section_id"=>$secId,"subj_id"=>$subjId]; continue;
+        $skipped++; $conflicts[] = ["type"=>"prof_weekly_cap","prof_id"=>$profId,"section_id"=>$secId,"subj_id"=>$subjId];
+        continue;
       }
-
-      // Redundant guard for per-subject-section cap — skip ONLY when not locked
       $currSecForSubj = $profSubjSecCount[$profId][$subjId] ?? 0;
       if (!$lockProf && $currSecForSubj > $profPerSubjectSectionMax) {
-        $skipped++; $conflicts[]=["type"=>"prof_subject_section_cap_insert_guard","prof_id"=>$profId,"section_id"=>$secId,"subj_id"=>$subjId]; continue;
+        $skipped++; $conflicts[] = ["type"=>"prof_subject_section_cap_insert_guard","prof_id"=>$profId,"section_id"=>$secId,"subj_id"=>$subjId];
+        continue;
       }
 
       $target = min((int)$t['weekly_minutes'], $subCapHrs*60);
@@ -486,12 +448,11 @@ try {
                       FROM schedules
                       WHERE school_year='{$sy}' AND semester='{$sem}'
                         AND section_id={$secId} AND subj_id={$subjId}";
-      $done = $ignoreExisting ? 0 : (int)$qOne($baseMinsSQL,0);
+      $done   = $ignoreExisting ? 0 : (int)$qOne($baseMinsSQL,0);
       $remain = max(0, $target - $done);
       $genForPair = 0;
 
       while ($remain > 0) {
-        // Weekly cap check only if NOT locked
         if (!$lockProf && (($profWeeklyCount[$profId] ?? 0) >= $profMaxWeeklySchedules)) {
           $conflicts[] = ["type"=>"prof_weekly_cap_reached","prof_id"=>$profId,"section_id"=>$secId,"subj_id"=>$subjId];
           break;
@@ -508,6 +469,7 @@ try {
 
             $sE = $esc($s); $eE = $esc($e);
 
+            // Section-time overlap
             if ($enfSec) {
               $c = (int)$qOne("SELECT COUNT(*) FROM schedules
                                WHERE school_year='{$sy}' AND semester='{$sem}' AND section_id={$secId}
@@ -516,6 +478,7 @@ try {
               if ($c>0) { $skipped++; $conflicts[]=["type"=>"section","section_id"=>$secId,"day"=>$day,"s"=>$s,"e"=>$e]; continue; }
             }
 
+            // Professor overlap
             if ($enfProf) {
               $c = (int)$qOne("SELECT COUNT(*) FROM schedules
                                WHERE school_year='{$sy}' AND semester='{$sem}' AND prof_id={$profId}
@@ -523,6 +486,7 @@ try {
                                  AND NOT (end_time<='{$sE}' OR start_time>='{$eE}')",0);
               if ($c>0) { $skipped++; $conflicts[]=["type"=>"prof","prof_id"=>$profId,"day"=>$day,"s"=>$s,"e"=>$e]; continue; }
 
+              // Professor minimum gap
               if ($profMinGapMinutes > 0) {
                 $g = (int)$qOne("
                   SELECT COUNT(*) FROM schedules
@@ -537,14 +501,17 @@ try {
               }
             }
 
+            // Avoid same subject at same time on other days
             if ($avoidSameTimeAcrossDays && $sameTimeOtherDay($secId, $subjId, $day, $s, $e)) {
               $skipped++; $conflicts[] = ["type"=>"subject_same_time_pattern","section_id"=>$secId,"subj_id"=>$subjId,"day"=>$day,"s"=>$s,"e"=>$e];
               continue;
             }
 
+            // Respect target minutes for this pair
             $curr = $ignoreExisting ? ($target - $remain) : (int)$qOne($baseMinsSQL,0);
             if ($curr + $len > $target) continue;
 
+            // Avoid duplicate exact slot
             $dup = (int)$qOne("SELECT 1 FROM schedules
                                WHERE school_year='{$sy}' AND semester='{$sem}'
                                  AND section_id={$secId} AND subj_id={$subjId}
@@ -554,10 +521,11 @@ try {
                                LIMIT 1",0);
             if ($dup>0) { $skipped++; continue; }
 
+            // Score
             $score=0;
             $secLoad = $secDayLoad($secId,$day);
             $minLoad = PHP_INT_MAX;
-            foreach ($DAYS as $d) { $minLoad = min($minLoad, $secDayLoad($secId,$d)); }
+            foreach ($DAYS as $d) $minLoad = min($minLoad, $secDayLoad($secId,$d));
             if ($secLoad === $minLoad) $score += 40;
 
             $sM = (int)substr($s,0,2)*60 + (int)substr($s,3,2);
@@ -576,11 +544,14 @@ try {
 
         if ($best === null) break;
 
+        // Online if section has no room, else Onsite
         $scheduleType = $hasRoom ? 'Onsite' : 'Online';
         $status='pending'; $origin='auto';
         $sE=$esc($best['s']); $eE=$esc($best['e']);
-        $schTypeE=$esc($scheduleType); $statusE=$esc($status); $originE=$esc($origin);
-        $roomSql = $roomId === null ? "NULL" : (string)((int)$roomId);
+        $schTypeE = $esc($scheduleType);
+        $statusE  = $esc($status);
+        $originE  = $esc($origin);
+        $roomSql  = $roomId === null ? "NULL" : (string)((int)$roomId);
 
         $ok = $conn->query("
           INSERT INTO schedules
@@ -595,6 +566,7 @@ try {
         $genForPair += $best['len'];
         $remain     -= $best['len'];
 
+        // Increment in-memory weekly count for the professor
         $profWeeklyCount[$profId] = ($profWeeklyCount[$profId] ?? 0) + 1;
 
         if (!$ignoreExisting) {
@@ -615,7 +587,7 @@ try {
 
   $conn->commit();
 
-  // Summary: distinct-section counts again
+  // ------------------ Post summary ------------------
   $finalProfSubjCounts = [];
   foreach ($qAll("
     SELECT prof_id, subj_id, COUNT(DISTINCT section_id) AS c
@@ -623,7 +595,7 @@ try {
     WHERE school_year='{$sy}' AND semester='{$sem}'
       AND subj_id IS NOT NULL AND prof_id IS NOT NULL AND section_id IS NOT NULL
     GROUP BY prof_id, subj_id
-  ") as $r) $finalProfSubjCounts[]=["prof_id"=>(int)$r['prof_id'],"subj_id"=>(int)$r['subj_id'],"sections"=>(int)$r['c']];
+  ") as $r) $finalProfSubjCounts[] = ["prof_id"=>(int)$r['prof_id'], "subj_id"=>(int)$r['subj_id'], "sections"=>(int)$r['c']];
 
   $underMinPairs = array_values(array_filter($finalProfSubjCounts, function($row) use ($profPerSubjectSectionMin) {
     return ($row['sections'] ?? 0) > 0 && $row['sections'] < $profPerSubjectSectionMin;
@@ -640,6 +612,10 @@ try {
       "params"=>[
         "school_year"=>$schoolYear,
         "semester"=>$semester,
+        "source"=>[
+          "forceSystemSettings"=>$forceSystemSettings,
+          "system_settings"=>["school_year"=>$sysSY, "semester"=>$sysSe]
+        ],
         "days"=>$DAYS,
         "startTime"=>$startTime,
         "endTime"=>$endTime,
@@ -648,7 +624,6 @@ try {
         "profMaxDailyLoad"=>$profMaxDaily,
         "subjectWeeklyHourCap"=>$subCapHrs,
         "ignoreExistingMinutes"=>$ignoreExisting,
-        "seedFrom"=>$seedFrom,
         "lunchStart"=>$lunchStart,
         "lunchEnd"=>$lunchEnd,
         "addFixedBlocks"=>$addFixedBlocks,
