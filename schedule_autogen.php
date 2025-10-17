@@ -86,7 +86,7 @@ try {
   // Weekly cap (rows/week/prof)
   $profMaxWeeklySchedules = isset($in['profMaxWeeklySchedules']) ? (int)$in['profMaxWeeklySchedules'] : 32;
 
-  if ($profMaxWeeklySchedules <= 0) $profMaxWeeklySchedules = 8;
+  if ($profMaxWeeklySchedules <= 0) $profMaxWeeklySchedules = 32;
 
   // Minimum gap for same professor (minutes)
   $profMinGapMinutes = isset($in['profMinGapMinutes']) ? (int)$in['profMinGapMinutes'] : 10;
