@@ -35,8 +35,9 @@ class FirebaseSync {
                 prof_id,
                 prof_name,
                 prof_email,
-                prof_password,
                 prof_phone,
+                prof_username,        -- ADD
+                prof_password,        -- ADD
                 prof_qualifications,
                 prof_subject_ids,
                 subj_count,
@@ -44,6 +45,7 @@ class FirebaseSync {
             FROM professors
             ORDER BY prof_name
         ";
+
         $res = $this->conn->query($sql);
         if (!$res) {
             return ['success' => false, 'message' => 'Failed to fetch professors: ' . $this->conn->error];
@@ -55,12 +57,13 @@ class FirebaseSync {
             if (!is_array($quals)) $quals = [];
             $quals = array_values(array_filter(array_map('strval', $quals), fn($q) => $q !== ''));
 
-            $list[] = [
+           $list[] = [
                 'id'             => (int)$row['prof_id'],
                 'name'           => $row['prof_name'],
                 'email'          => $row['prof_email'],
-                'passwor'        => $row['prof_password'],
                 'phone'          => $row['prof_phone'],
+                'username'       => $row['prof_username'],     
+                'password'       => $row['prof_password'],     
                 'qualifications' => $quals,
                 'subject_ids'    => json_decode($row['prof_subject_ids'] ?? '[]', true) ?: [],
                 'subject_count'  => (int)($row['subj_count'] ?? 0),
@@ -102,6 +105,8 @@ class FirebaseSync {
             'name'           => $row['prof_name'],
             'email'          => $row['prof_email'],
             'phone'          => $row['prof_phone'],
+            'username'       => $row['prof_username'],    
+            'password'       => $row['prof_password'],    
             'qualifications' => $quals,
             'subject_ids'    => json_decode($row['prof_subject_ids'] ?? '[]', true) ?: [],
             'subject_count'  => (int)($row['subj_count'] ?? 0),
