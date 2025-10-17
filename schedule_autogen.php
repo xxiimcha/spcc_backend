@@ -84,7 +84,7 @@ try {
     ['label' => 'Recess',   'start' => '08:00', 'end' => '08:30', 'status' => 'fixed'],
   ];
 
-  // Weekly cap (defaults to 8)
+  // Weekly cap (defaults to 8) — this is a cap on *rows* scheduled for a prof within the week
   $profMaxWeeklySchedules = isset($in['profMaxWeeklySchedules']) ? (int)$in['profMaxWeeklySchedules'] : 8;
   if ($profMaxWeeklySchedules <= 0) { $profMaxWeeklySchedules = 8; }
 
@@ -94,6 +94,10 @@ try {
 
   // Avoid same subject at same time across different days
   $avoidSameTimeAcrossDays = (bool)($in['avoidSameTimeAcrossDays'] ?? true);
+
+  // NEW: per-prof-per-subject distinct section load window (per week)
+  $profPerSubjectSectionMax = isset($in['profPerSubjectSectionMax']) ? (int)$in['profPerSubjectSectionMax'] : 8; // hard cap
+  $profPerSubjectSectionMin = isset($in['profPerSubjectSectionMin']) ? (int)$in['profPerSubjectSectionMin'] : 6; // soft target (report)
 
   // ------------------ Validation ------------------
   if ($schoolYear === '' || $semester === '') throw new Exception('Missing school_year or semester');
@@ -186,6 +190,21 @@ try {
     if (!isset($profWeeklyCount[$pid])) $profWeeklyCount[$pid] = 0;
   }
 
+  // ------------------ NEW: per-prof-per-subject distinct section counts ------------------
+  // Counts how many DISTINCT sections a prof already handles for a given subject this SY/semester.
+  $profSubjSecCount = []; // [prof_id][subj_id] => distinct section_count
+  foreach ($qAll("
+    SELECT prof_id, subj_id, COUNT(DISTINCT section_id) AS c
+    FROM schedules
+    WHERE school_year='{$sy}' AND semester='{$sem}'
+      AND subj_id IS NOT NULL AND prof_id IS NOT NULL AND section_id IS NOT NULL
+    GROUP BY prof_id, subj_id
+  ") as $r) {
+    $pid = (int)$r['prof_id'];
+    $sid = (int)$r['subj_id'];
+    $profSubjSecCount[$pid][$sid] = (int)$r['c'];
+  }
+
   // ------------------ Subject → professors who can teach ------------------
   $canTeach = [];
   foreach ($qAll("SELECT prof_id, prof_subject_ids FROM professors") as $r) {
@@ -204,6 +223,18 @@ try {
   // ------------------ Build assignments ------------------
   $triplesBySection = [];
   $noEligible = [];
+
+  // helper to check per-subject cap for a candidate prof
+  $canTakeAnotherSectionForSubject = function(int $pid, int $subjId) use (&$profSubjSecCount, $profPerSubjectSectionMax): bool {
+    $curr = $profSubjSecCount[$pid][$subjId] ?? 0;
+    return $curr < $profPerSubjectSectionMax;
+  };
+
+  // Whenever we assign a prof to a NEW section for this subject, update the counter immediately
+  $bumpProfSubjectSectionCount = function(int $pid, int $subjId) use (&$profSubjSecCount): void {
+    if (!isset($profSubjSecCount[$pid])) $profSubjSecCount[$pid] = [];
+    $profSubjSecCount[$pid][$subjId] = ($profSubjSecCount[$pid][$subjId] ?? 0) + 1;
+  };
 
   if ($seedFrom === 'section_subjects') {
     foreach ($qAll("
@@ -232,26 +263,41 @@ try {
       if ($profId === null) {
         $cands = $canTeach[$subjId] ?? [];
 
-        // Filter out professors already at or above the weekly cap
+        // Filter out professors already at or above the weekly row cap
         $cands = array_values(array_filter($cands, function($pid) use ($profWeeklyCount, $profMaxWeeklySchedules) {
           return ($profWeeklyCount[$pid] ?? 0) < $profMaxWeeklySchedules;
         }));
 
-        if (!$cands) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId,"reason"=>"prof_cap_reached"]; continue; }
+        // NEW: filter out professors who already reached per-subject section cap
+        $cands = array_values(array_filter($cands, function($pid) use ($subjId, $canTakeAnotherSectionForSubject) {
+          return $canTakeAnotherSectionForSubject($pid, $subjId);
+        }));
+
+        if (!$cands) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId,"reason"=>"prof_subject_section_cap_reached"]; continue; }
+
+        // Pick the candidate with the lowest current minutes load
         $best=null; $bestLoad=PHP_INT_MAX;
         foreach ($cands as $pid) {
           $l = $profLoad[$pid] ?? 0;
           if ($l < $bestLoad) { $best=$pid; $bestLoad=$l; }
         }
-        if ($best===null) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId,"reason"=>"no_candidate_after_cap_filter"]; continue; }
+        if ($best===null) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId,"reason"=>"no_candidate_after_filters"]; continue; }
         $profId = (int)$best;
       } else {
         // If a fixed professor is specified AND already at cap, skip this assignment entirely
-        if (($profWeeklyCount[$profId] ?? 0) >= $profMaxWeeklySchedules) {
-          $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId,"prof_id"=>$profId,"reason"=>"prof_cap_reached_fixed"];
+        $overRowCap = (($profWeeklyCount[$profId] ?? 0) >= $profMaxWeeklySchedules);
+        $overPerSubjCap = !$canTakeAnotherSectionForSubject($profId, $subjId);
+        if ($overRowCap || $overPerSubjCap) {
+          $noEligible[] = [
+            "section_id"=>$secId,"subj_id"=>$subjId,"prof_id"=>$profId,
+            "reason"=>$overRowCap ? "prof_weekly_cap_reached_fixed" : "prof_subject_section_cap_reached_fixed"
+          ];
           continue;
         }
       }
+
+      // NEW: increment per-subject section count now that we decided the prof for this section
+      $bumpProfSubjectSectionCount($profId, $subjId);
 
       if (!isset($triplesBySection[$secId])) $triplesBySection[$secId]=[];
       $triplesBySection[$secId][] = [
@@ -285,17 +331,26 @@ try {
       if (!isset($triplesBySection[$secId])) $triplesBySection[$secId]=[];
       foreach ($subs as $subjId) {
         $cands = $canTeach[$subjId] ?? [];
-        // Filter out professors at or above cap
+        // Filter out professors at or above row cap
         $cands = array_values(array_filter($cands, function($pid) use ($profWeeklyCount, $profMaxWeeklySchedules) {
           return ($profWeeklyCount[$pid] ?? 0) < $profMaxWeeklySchedules;
         }));
-        if (!$cands) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId,"reason"=>"prof_cap_reached"]; continue; }
+        // Filter out professors at per-subject section cap
+        $cands = array_values(array_filter($cands, function($pid) use ($subjId, $canTakeAnotherSectionForSubject) {
+          return $canTakeAnotherSectionForSubject($pid, $subjId);
+        }));
+        if (!$cands) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId,"reason"=>"prof_subject_section_cap_reached"]; continue; }
         $best=null; $bestLoad=PHP_INT_MAX;
         foreach ($cands as $pid) {
           $l = $profLoad[$pid] ?? 0;
           if ($l < $bestLoad) { $best=$pid; $bestLoad=$l; }
         }
-        if ($best===null) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId,"reason"=>"no_candidate_after_cap_filter"]; continue; }
+        if ($best===null) { $noEligible[] = ["section_id"=>$secId,"subj_id"=>$subjId,"reason"=>"no_candidate_after_filters"]; continue; }
+
+        $profId = (int)$best;
+        // NEW: increment per-subject section count now that we decided the prof for this section
+        $bumpProfSubjectSectionCount($profId, $subjId);
+
         $hrs = 4;
         $triplesBySection[$secId][] = [
           "subj_id" => (int)$subjId,
@@ -423,10 +478,19 @@ try {
       $subjId = (int)$t['subj_id'];
       $profId = (int)$t['prof_id'];
 
-      // Weekly cap
+      // Weekly cap (row-level)
       if (($profWeeklyCount[$profId] ?? 0) >= $profMaxWeeklySchedules) {
         $skipped++;
         $conflicts[] = ["type"=>"prof_weekly_cap", "prof_id"=>$profId, "section_id"=>$secId, "subj_id"=>$subjId];
+        continue;
+      }
+
+      // Redundant guard: ensure we still respect per-subject section cap at insertion time
+      $currSecForSubj = $profSubjSecCount[$profId][$subjId] ?? 0;
+      if ($currSecForSubj > $profPerSubjectSectionMax) {
+        // This shouldn't happen since we bumped on assignment; skip to be safe
+        $skipped++;
+        $conflicts[] = ["type"=>"prof_subject_section_cap_insert_guard", "prof_id"=>$profId, "section_id"=>$secId, "subj_id"=>$subjId];
         continue;
       }
 
@@ -582,6 +646,23 @@ try {
 
   $conn->commit();
 
+  // ------------------ Post summary: under-minimum pairs ------------------
+  // Recalculate final per-prof-per-subject distinct section counts after inserts
+  $finalProfSubjCounts = [];
+  foreach ($qAll("
+    SELECT prof_id, subj_id, COUNT(DISTINCT section_id) AS c
+    FROM schedules
+    WHERE school_year='{$sy}' AND semester='{$sem}'
+      AND subj_id IS NOT NULL AND prof_id IS NOT NULL AND section_id IS NOT NULL
+    GROUP BY prof_id, subj_id
+  ") as $r) {
+    $pid = (int)$r['prof_id']; $sid = (int)$r['subj_id']; $c = (int)$r['c'];
+    $finalProfSubjCounts[] = ["prof_id"=>$pid, "subj_id"=>$sid, "sections"=>$c];
+  }
+  $underMinPairs = array_values(array_filter($finalProfSubjCounts, function($row) use ($profPerSubjectSectionMin) {
+    return ($row['sections'] ?? 0) > 0 && $row['sections'] < $profPerSubjectSectionMin;
+  }));
+
   echo json_encode([
     "success"=>true,
     "inserted"=>$inserted,
@@ -611,9 +692,13 @@ try {
         "addFixedBlocks"=>$addFixedBlocks,
         "profMaxWeeklySchedules"=>$profMaxWeeklySchedules,
         "profMinGapMinutes"=>$profMinGapMinutes,
-        "avoidSameTimeAcrossDays"=>$avoidSameTimeAcrossDays
+        "avoidSameTimeAcrossDays"=>$avoidSameTimeAcrossDays,
+        "profPerSubjectSectionMax"=>$profPerSubjectSectionMax,
+        "profPerSubjectSectionMin"=>$profPerSubjectSectionMin
       ],
-      "metrics"=>$metrics
+      "metrics"=>$metrics,
+      "perSubjectSectionCounts"=>$finalProfSubjCounts,
+      "underMinPairs"=>$underMinPairs
     ]
   ]);
 
