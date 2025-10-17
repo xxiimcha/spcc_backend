@@ -373,34 +373,62 @@ function updateSection(mysqli $conn, int $id, array $data): void {
 }
 
 function deleteSection(mysqli $conn, int $id): void {
-  $cascade = isset($_GET['cascade']) ? ($_GET['cascade']=='1') : ss_bool('sections_delete_cascade_default', false);
-
+  // 1) Ensure the section exists
   $exists = $conn->query("SELECT section_id FROM sections WHERE section_id = $id")->num_rows > 0;
-  if (!$exists) { @log_activity($conn,'sections','delete','FAILED delete: section not found (ID '.$id.')',$id,null); fail("Section not found", 404); return; }
-
-  $c = (int)($conn->query("SELECT COUNT(*) AS c FROM schedules WHERE section_id = $id")->fetch_assoc()['c'] ?? 0);
-  if ($c > 0 && !$cascade) {
-    @log_activity($conn,'sections','delete','FAILED delete ID '.$id.': has '.$c.' schedules, cascade not allowed',$id,null);
-    fail("This section is referenced by $c schedule(s). Delete them first or pass cascade=1.", 409);
+  if (!$exists) {
+    @log_activity($conn,'sections','delete','FAILED delete: section not found (ID '.$id.')',$id,null);
+    http_response_code(404);
+    echo json_encode(["success"=>false, "status"=>"error", "message"=>"Section not found"]);
     return;
   }
 
+  // 2) Count schedules (just for reporting)
+  $cRow = $conn->query("SELECT COUNT(*) AS c FROM schedules WHERE section_id = $id")->fetch_assoc();
+  $schedCount = (int)($cRow['c'] ?? 0);
+
   $conn->begin_transaction();
   try {
-    if ($c > 0) {
-      $conn->query("DELETE sd FROM schedule_days sd INNER JOIN schedules s ON s.schedule_id = sd.schedule_id WHERE s.section_id = $id");
-      $conn->query("DELETE FROM schedules WHERE section_id = $id");
-    }
+    // 3) Delete schedule_days for schedules under this section
+    //    (do this first to avoid orphan rows)
+    $conn->query("
+      DELETE sd
+      FROM schedule_days sd
+      INNER JOIN schedules s ON s.schedule_id = sd.schedule_id
+      WHERE s.section_id = $id
+    ");
+
+    // 4) Delete schedules under this section
+    $conn->query("DELETE FROM schedules WHERE section_id = $id");
+
+    // 5) Remove room assignments
     $conn->query("DELETE FROM section_room_assignments WHERE section_id = $id");
+
+    // 6) Finally delete the section
     $conn->query("DELETE FROM sections WHERE section_id = $id");
 
     $conn->commit();
-    @log_activity($conn,'sections','delete','Deleted section ID: '.$id.' (cascade='.(int)$cascade.')',$id,null);
-    ok(["success"=>true, "status"=>"success", "message"=>"Section deleted successfully"]);
+
+    @log_activity(
+      $conn,
+      'sections',
+      'delete',
+      'Deleted section ID: '.$id.' with '.$schedCount.' related schedule(s)',
+      $id,
+      null
+    );
+
+    http_response_code(200);
+    echo json_encode([
+      "success" => true,
+      "status"  => "success",
+      "message" => "Section and its related schedules were deleted successfully",
+      "deleted_schedules" => $schedCount
+    ]);
   } catch (Throwable $e) {
     $conn->rollback();
     @log_activity($conn,'sections','delete','FAILED delete ID '.$id.': '.$e->getMessage(),$id,null);
-    fail("Error: ".$e->getMessage(), 500);
+    http_response_code(500);
+    echo json_encode(["success"=>false, "status"=>"error", "message"=>"Error: ".$e->getMessage()]);
   }
 }
 
