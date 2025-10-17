@@ -132,6 +132,25 @@ try {
     return $enforceLunch ? ($s < $lunchEnd && $e > $lunchStart) : false;
   };
 
+  // ---- SLOT ADJUSTMENT: remove 13:30–14:30 and ensure 13:00–14:00 is present (if within window & not overlapping lunch)
+  $SLOTS = array_values(array_filter($SLOTS, function($slt) {
+    return !($slt[0] === '13:30' && $slt[1] === '14:30');
+  }));
+  $has1300 = false;
+  foreach ($SLOTS as $slt) {
+    if ($slt[0] === '13:00' && $slt[1] === '14:00') { $has1300 = true; break; }
+  }
+  if (!$has1300) {
+    $slot13s = 13*60; // 13:00
+    $slot13e = 14*60; // 14:00
+    if ($slot13s >= $fromM && $slot13e <= $toM) {
+      if (!$overlapsLunch('13:00', '14:00')) {
+        $SLOTS[] = ['13:00','14:00', 60];
+      }
+    }
+  }
+  usort($SLOTS, function($a,$b){ return strcmp($a[0], $b[0]); });
+
   // ------------------ Section → latest room assignment ------------------
   $sectionRoom = [];
   foreach ($qAll("
@@ -154,14 +173,20 @@ try {
     ];
   }
 
+  // --- Subject meta now includes subj_code (to detect PEH*)
   $subjectMeta = [];
-  foreach ($qAll("SELECT subj_id, grade_level, strand FROM subjects") as $r) {
+  foreach ($qAll("SELECT subj_id, subj_code, grade_level, strand FROM subjects") as $r) {
     $subjectMeta[(int)$r['subj_id']] = [
+      'code'        => (string)$r['subj_code'],
       'grade_level' => (string)$r['grade_level'],
       'strand'      => (string)$r['strand'],
       'hours'       => 4
     ];
   }
+  $subjectIsPEH = function(int $subjId) use ($subjectMeta): bool {
+    $code = $subjectMeta[$subjId]['code'] ?? '';
+    return strncasecmp($code, 'PEH', 3) === 0;
+  };
 
   // ------------------ Existing load in minutes (for balancing) ------------------
   $profLoad = [];
@@ -258,6 +283,8 @@ try {
       if ($secGL !== $subGL || $secStr !== $subStr) continue;
 
       $hrs = isset($r['wh']) && $r['wh'] !== null && $r['wh'] !== '' ? (float)$r['wh'] : 4.0;
+      if ($subjectIsPEH($subjId)) { $hrs = 1.0; } // force 1 hr total for PEH
+
       $profId = $givenProf;
 
       if ($profId === null) {
@@ -303,7 +330,7 @@ try {
       $triplesBySection[$secId][] = [
         "subj_id" => $subjId,
         "prof_id" => $profId,
-        "weekly_minutes" => max(0, (int)round($hrs * 60)),
+        "weekly_minutes" => $subjectIsPEH($subjId) ? 60 : max(0, (int)round($hrs * 60)),
       ];
     }
   } else {
@@ -352,10 +379,12 @@ try {
         $bumpProfSubjectSectionCount($profId, $subjId);
 
         $hrs = 4;
+        if ($subjectIsPEH($subjId)) { $hrs = 1; }
+
         $triplesBySection[$secId][] = [
           "subj_id" => (int)$subjId,
           "prof_id" => (int)$best,
-          "weekly_minutes" => max(0, $hrs*60),
+          "weekly_minutes" => $subjectIsPEH($subjId) ? 60 : max(0, $hrs*60),
         ];
       }
     }
@@ -453,7 +482,8 @@ try {
 
   $fixedInserted = 0;
   if ($addFixedBlocks) {
-    $sectionsNeedingBlocks = array_keys($triplesBySection);
+    // Ensure ALL sections receive the fixed blocks (not just those with assignment triples)
+    $sectionsNeedingBlocks = array_keys($sectionInfo);
     foreach ($sectionsNeedingBlocks as $secId) {
       $roomId = $sectionRoom[$secId] ?? null;
       foreach ($DAYS as $day) {
@@ -488,7 +518,6 @@ try {
       // Redundant guard: ensure we still respect per-subject section cap at insertion time
       $currSecForSubj = $profSubjSecCount[$profId][$subjId] ?? 0;
       if ($currSecForSubj > $profPerSubjectSectionMax) {
-        // This shouldn't happen since we bumped on assignment; skip to be safe
         $skipped++;
         $conflicts[] = ["type"=>"prof_subject_section_cap_insert_guard", "prof_id"=>$profId, "section_id"=>$secId, "subj_id"=>$subjId];
         continue;
