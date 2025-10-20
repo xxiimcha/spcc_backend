@@ -227,15 +227,18 @@ switch ($effectiveMethod) {
         }
         break;
 }
-
 function createProfessor(mysqli $conn, array $data) {
+    // ---- Gather & validate inputs -----------------------------------------
     $name      = mysqli_real_escape_string($conn, (string)($data['name'] ?? ''));
     $username  = mysqli_real_escape_string($conn, (string)($data['username'] ?? ''));
     $password  = mysqli_real_escape_string($conn, (string)($data['password'] ?? ''));
     $email     = trim((string)($data['email'] ?? ''));
     $phone     = mysqli_real_escape_string($conn, (string)($data['phone'] ?? ''));
     $qualsArr  = normalize_array($data['qualifications'] ?? []);
-    $subjIds   = normalize_array($data['subject_ids'] ?? []);
+
+    // ⛔️ Ignore any incoming subject_ids on creation
+    $subjects_json  = mysqli_real_escape_string($conn, json_encode([]));
+    $subj_count     = 0;
 
     if ($email !== '' && emailExists($conn, $email)) {
         log_activity($conn, 'professors', 'create', "FAILED create: email exists for {$email}", null, null);
@@ -260,64 +263,89 @@ function createProfessor(mysqli $conn, array $data) {
     }
 
     $qualStr       = mysqli_real_escape_string($conn, json_encode(array_values($qualsArr), JSON_UNESCAPED_UNICODE));
-    $subjects_json = mysqli_real_escape_string($conn, json_encode(array_map('intval', $subjIds)));
-    $subj_count    = is_array($subjIds) ? count($subjIds) : 0;
 
     $schoolYear    = ss_get_current_school_year($conn);
     $schoolYearSQL = $schoolYear !== null ? "'" . mysqli_real_escape_string($conn, $schoolYear) . "'" : "NULL";
 
-    $emailSQL = $email === '' ? "NULL" : "'".mysqli_real_escape_string($conn, $email)."'";
-    $now = date('Y-m-d H:i:s');
-    $sqlUser = "
-        INSERT INTO users (username, password, email, role, status, created_at, updated_at)
-        VALUES ('{$username}', '{$password}', {$emailSQL}, 'professor', 'active', '{$now}', '{$now}')
-    ";
-    if (!$conn->query($sqlUser)) {
-        log_activity($conn, 'users', 'create', "FAILED user create for professor {$name}: ".$conn->error, null, null);
+    $emailSQL      = $email === '' ? "NULL" : "'" . mysqli_real_escape_string($conn, $email) . "'";
+    $now           = date('Y-m-d H:i:s');
+
+    // ---- Transaction: professors first, then users, then link --------------
+    $conn->begin_transaction();
+    try {
+        // 1) Insert into professors FIRST (user_id will be linked later)
+        $sqlProf = "
+            INSERT INTO professors
+                (prof_name, prof_username, prof_password, prof_email, prof_phone,
+                 prof_qualifications, prof_subject_ids, subj_count, school_year)
+            VALUES
+                ('$name', '$username', '$password', $emailSQL, '$phone',
+                 '$qualStr', '$subjects_json', $subj_count, $schoolYearSQL)
+        ";
+        if (!$conn->query($sqlProf)) {
+            throw new Exception("Failed inserting professor: " . $conn->error);
+        }
+        $profId = (int)$conn->insert_id;
+
+        // 2) Insert into users
+        $sqlUser = "
+            INSERT INTO users (username, password, email, role, status, created_at, updated_at)
+            VALUES ('{$username}', '{$password}', {$emailSQL}, 'professor', 'active', '{$now}', '{$now}')
+        ";
+        if (!$conn->query($sqlUser)) {
+            throw new Exception("Failed creating linked user: " . $conn->error);
+        }
+        $userId = (int)$conn->insert_id;
+
+        // 3) Link professors.user_id to the new user
+        $sqlLink = "UPDATE professors SET user_id={$userId} WHERE prof_id={$profId} LIMIT 1";
+        if (!$conn->query($sqlLink)) {
+            throw new Exception("Failed linking user to professor: " . $conn->error);
+        }
+
+        // Commit all three steps
+        $conn->commit();
+
+        // ---- Post-commit side effects -------------------------------------
+        $syncResult = firebaseSync($conn)->syncSingleProfessor($profId);
+
+        // Email with NO subjects (explicitly empty list)
+        $emailResult = $email !== ''
+            ? sendWelcomeProfessorEmail(
+                $email, $name, $username, (string)($data['password'] ?? ''),
+                'Systems Plus Computer College Caloocan',
+                'https://your-portal.example.com/login',
+                /* subjectRows */ []
+              )
+            : ['sent'=>false,'message'=>'No email'];
+
+        $desc = "Created professor: {$name} (ID: {$profId}) | SY: " . ($schoolYear ?? 'N/A');
+        log_activity($conn, 'professors', 'create', $desc, $profId, $userId);
+
+        echo json_encode([
+            "status"         => "success",
+            "message"        => "Professor added",
+            "id"             => $profId,
+            "user_id"        => $userId,
+            "email"          => $emailResult,
+            "firebase_sync"  => $syncResult
+        ]);
+
+    } catch (Throwable $e) {
+        // Roll back everything
+        $conn->rollback();
+
+        // Best-effort cleanup if professor row was created but something failed after
+        if (!empty($profId ?? 0)) {
+            // If you prefer hard cleanup, uncomment:
+            // $conn->query("DELETE FROM professors WHERE prof_id={$profId} LIMIT 1");
+        }
+
+        log_activity($conn, 'professors', 'create', "FAILED create: " . $e->getMessage(), null, null);
         http_response_code(500);
-        echo json_encode(["status"=>"error","message"=>"Failed creating linked user: ".$conn->error]);
+        echo json_encode(["status"=>"error","message"=>$e->getMessage()]);
         return;
     }
-    $userId = (int)$conn->insert_id;
-
-    $sql = "
-        INSERT INTO professors 
-        (user_id, prof_name, prof_username, prof_password, prof_email, prof_phone, prof_qualifications, prof_subject_ids, subj_count, school_year)
-        VALUES ($userId, '$name', '$username', '$password', ".($emailSQL).", '$phone', '$qualStr', '$subjects_json', $subj_count, $schoolYearSQL)
-    ";
-    if (!$conn->query($sql)) {
-        log_activity($conn, 'professors', 'create', "FAILED create professor {$name}: ".$conn->error, null, null);
-        $conn->query("DELETE FROM users WHERE user_id=".$userId." LIMIT 1");
-        http_response_code(500);
-        echo json_encode(["status"=>"error","message"=>$conn->error]);
-        return;
-    }
-
-    $id = $conn->insert_id;
-
-    $syncResult = firebaseSync($conn)->syncSingleProfessor($id);
-
-    $subjectRows = fetchSubjectsByIds($conn, $subjIds);
-    $emailResult = $email !== ''
-        ? sendWelcomeProfessorEmail(
-            $email, $name, $username, (string)($data['password'] ?? ''),
-            'Systems Plus Computer College Caloocan',
-            'https://your-portal.example.com/login',
-            $subjectRows
-          )
-        : ['sent'=>false,'message'=>'No email'];
-
-    $desc = "Created professor: {$name} (ID: {$id}) | SY: " . ($schoolYear ?? 'N/A') . " | Subjects: {$subj_count}";
-    log_activity($conn, 'professors', 'create', $desc, $id, $userId);
-
-    echo json_encode([
-        "status"=>"success",
-        "message"=>"Professor added",
-        'id'=>$id,
-        "user_id"=>$userId,
-        "email"=>$emailResult,
-        "firebase_sync"=>$syncResult
-    ]);
 }
 
 function updateProfessor(mysqli $conn, int $id, array $data) {
