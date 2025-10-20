@@ -227,8 +227,8 @@ switch ($effectiveMethod) {
         }
         break;
 }
+
 function createProfessor(mysqli $conn, array $data) {
-    // ---- Gather & validate inputs -----------------------------------------
     $name      = mysqli_real_escape_string($conn, (string)($data['name'] ?? ''));
     $username  = mysqli_real_escape_string($conn, (string)($data['username'] ?? ''));
     $password  = mysqli_real_escape_string($conn, (string)($data['password'] ?? ''));
@@ -236,7 +236,6 @@ function createProfessor(mysqli $conn, array $data) {
     $phone     = mysqli_real_escape_string($conn, (string)($data['phone'] ?? ''));
     $qualsArr  = normalize_array($data['qualifications'] ?? []);
 
-    // ⛔️ Ignore any incoming subject_ids on creation
     $subjects_json  = mysqli_real_escape_string($conn, json_encode([]));
     $subj_count     = 0;
 
@@ -270,16 +269,14 @@ function createProfessor(mysqli $conn, array $data) {
     $emailSQL      = $email === '' ? "NULL" : "'" . mysqli_real_escape_string($conn, $email) . "'";
     $now           = date('Y-m-d H:i:s');
 
-    // ---- Transaction: professors first, then users, then link --------------
     $conn->begin_transaction();
     try {
-        // 1) Insert into professors FIRST (user_id will be linked later)
         $sqlProf = "
             INSERT INTO professors
-                (prof_name, prof_username, prof_password, prof_email, prof_phone,
+                (prof_name, prof_username, prof_email, prof_phone,
                  prof_qualifications, prof_subject_ids, subj_count, school_year)
             VALUES
-                ('$name', '$username', '$password', $emailSQL, '$phone',
+                ('$name', '$username', $emailSQL, '$phone',
                  '$qualStr', '$subjects_json', $subj_count, $schoolYearSQL)
         ";
         if (!$conn->query($sqlProf)) {
@@ -287,7 +284,6 @@ function createProfessor(mysqli $conn, array $data) {
         }
         $profId = (int)$conn->insert_id;
 
-        // 2) Insert into users
         $sqlUser = "
             INSERT INTO users (username, password, email, role, status, created_at, updated_at)
             VALUES ('{$username}', '{$password}', {$emailSQL}, 'professor', 'active', '{$now}', '{$now}')
@@ -297,25 +293,21 @@ function createProfessor(mysqli $conn, array $data) {
         }
         $userId = (int)$conn->insert_id;
 
-        // 3) Link professors.user_id to the new user
         $sqlLink = "UPDATE professors SET user_id={$userId} WHERE prof_id={$profId} LIMIT 1";
         if (!$conn->query($sqlLink)) {
             throw new Exception("Failed linking user to professor: " . $conn->error);
         }
 
-        // Commit all three steps
         $conn->commit();
 
-        // ---- Post-commit side effects -------------------------------------
         $syncResult = firebaseSync($conn)->syncSingleProfessor($profId);
 
-        // Email with NO subjects (explicitly empty list)
         $emailResult = $email !== ''
             ? sendWelcomeProfessorEmail(
                 $email, $name, $username, (string)($data['password'] ?? ''),
                 'Systems Plus Computer College Caloocan',
                 'https://your-portal.example.com/login',
-                /* subjectRows */ []
+                []
               )
             : ['sent'=>false,'message'=>'No email'];
 
@@ -332,15 +324,9 @@ function createProfessor(mysqli $conn, array $data) {
         ]);
 
     } catch (Throwable $e) {
-        // Roll back everything
         $conn->rollback();
-
-        // Best-effort cleanup if professor row was created but something failed after
         if (!empty($profId ?? 0)) {
-            // If you prefer hard cleanup, uncomment:
-            // $conn->query("DELETE FROM professors WHERE prof_id={$profId} LIMIT 1");
         }
-
         log_activity($conn, 'professors', 'create', "FAILED create: " . $e->getMessage(), null, null);
         http_response_code(500);
         echo json_encode(["status"=>"error","message"=>$e->getMessage()]);
@@ -429,10 +415,9 @@ function updateProfessor(mysqli $conn, int $id, array $data) {
     $passwordRaw = '';
     if (array_key_exists('password', $data)) {
         $passwordRaw = (string)$data['password'];
-        if (trim($passwordRaw) !== '') {
+        if (trim($passwordRaw) !== '' && $userId > 0) {
             $passwordEsc = mysqli_real_escape_string($conn, $passwordRaw);
-            $set[] = "prof_password='$passwordEsc'";
-            if ($userId > 0) $userSet[] = "password='$passwordEsc'";
+            $userSet[] = "password='$passwordEsc'";
             $passwordChanged = true;
         }
     }
@@ -591,7 +576,6 @@ function getAllProfessors(mysqli $conn) {
                 'prof_email'     => $row['prof_email'],
                 'prof_phone'     => $row['prof_phone'],
                 'prof_username'  => $row['prof_username'] ?? null,
-                'prof_password'  => $row['prof_password'] ?? null,
                 'qualifications' => json_decode($row['prof_qualifications'] ?? '[]', true) ?: [],
                 'subject_ids'    => $ids,
                 'subj_count'     => $derivedCount > 0 ? $derivedCount : (int)($row['subj_count'] ?? 0),
@@ -633,7 +617,6 @@ function getProfessor(mysqli $conn, int $id) {
         'email'           => $row['prof_email'],
         'phone'           => $row['prof_phone'],
         'username'        => $row['prof_username'] ?? null,
-        'password'        => $row['prof_password'] ?? null,
         'qualifications'  => json_decode($row['prof_qualifications'] ?? '[]', true) ?: [],
         'subjects'        => $subjects,
         'subject_ids'     => $ids,
