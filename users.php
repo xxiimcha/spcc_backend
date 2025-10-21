@@ -50,40 +50,29 @@ function usernameExists(mysqli $conn, string $username, ?int $excludeId = null):
 function send_account_email(string $toEmail, string $toName, string $username, ?string $password, string $role): bool {
   $mailer = new PHPMailer(true);
   try {
-    // NOTE: replace with envs or config as needed
     $smtpHost = 'smtp.gmail.com';
     $smtpUser = 'ssassist028@gmail.com';
     $smtpPass = 'qans jgft ggrl nplb';
-    $smtpPort = '465'; // 465 -> SMTPS, 587 -> STARTTLS
+    $smtpPort = '465';
     $fromEmail = 'no-reply@spcc.edu.ph';
     $fromName  = 'SPCC Scheduler';
 
-    if ($smtpHost && $smtpUser && $smtpPass) {
-      $mailer->isSMTP();
-      $mailer->Host = $smtpHost;
-      $mailer->SMTPAuth = true;
-      $mailer->Username = $smtpUser;
-      $mailer->Password = $smtpPass;
-      if ((int)$smtpPort === 465) {
-        $mailer->SMTPSecure = PHPMailer::ENCRYPTION_SMTPS;
-      } else {
-        $mailer->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
-      }
-      $mailer->Port = (int)$smtpPort;
-    } else {
-      $mailer->isMail();
-    }
+    $mailer->isSMTP();
+    $mailer->Host = $smtpHost;
+    $mailer->SMTPAuth = true;
+    $mailer->Username = $smtpUser;
+    $mailer->Password = $smtpPass;
+    $mailer->SMTPSecure = PHPMailer::ENCRYPTION_SMTPS;
+    $mailer->Port = (int)$smtpPort;
 
     $mailer->setFrom($fromEmail, $fromName);
     $mailer->addAddress($toEmail, $toName ?: $toEmail);
     $mailer->isHTML(true);
     $mailer->Subject = 'Your SPCC Scheduler account';
-
     $pwdLine = $password ? "<p><strong>Temporary Password:</strong> {$password}</p>" : "<p>Please set your password via the provided reset flow.</p>";
     $roleLabel = $role === 'acad_head' ? 'Academic Head' : ucfirst($role);
-
-    $mailer->Body =
-      "<div style='font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#0B2333'>
+    $mailer->Body = "
+      <div style='font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#0B2333'>
         <p>Hello " . htmlspecialchars($toName ?: $username) . ",</p>
         <p>Your {$roleLabel} account has been created.</p>
         <p><strong>Username:</strong> " . htmlspecialchars($username) . "</p>
@@ -91,14 +80,11 @@ function send_account_email(string $toEmail, string $toName, string $username, ?
         <p>You can now sign in to the SPCC Scheduler.</p>
         <p>— SPCC Scheduler</p>
       </div>";
-
     $mailer->AltBody = "Your {$roleLabel} account has been created.\nUsername: {$username}\n"
       . ($password ? "Temporary Password: {$password}\n" : "Please set your password via the provided reset flow.\n")
       . "You can now sign in to the SPCC Scheduler.";
-
     return $mailer->send();
   } catch (Exception $e) {
-    // You can log $e->getMessage() if needed
     return false;
   }
 }
@@ -106,22 +92,11 @@ function send_account_email(string $toEmail, string $toName, string $username, ?
 $method = $_SERVER['REQUEST_METHOD'];
 
 switch ($method) {
-
   case 'GET': {
-    // Single user by id
     $id = isset($_GET['id']) ? (int)$_GET['id'] : null;
     if ($id) {
-      $sql = "SELECT 
-                user_id AS id,
-                username,
-                email,
-                NULL AS name,       -- your table has no 'name' column
-                role,
-                status,
-                NULL AS last_login  -- your table has no 'last_login' column
-              FROM users
-              WHERE user_id = {$id}
-              LIMIT 1";
+      $sql = "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
+              FROM users WHERE user_id = {$id} LIMIT 1";
       $res = $conn->query($sql);
       if ($res && $row = $res->fetch_assoc()) {
         echo json_encode($row);
@@ -131,25 +106,14 @@ switch ($method) {
       }
       exit();
     }
-
-    // All users
-    $sql = "SELECT 
-              user_id AS id,
-              username,
-              email,
-              NULL AS name,         -- not in schema
-              role,
-              status,
-              NULL AS last_login    -- not in schema
-            FROM users
-            ORDER BY user_id DESC";
+    $sql = "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
+            FROM users ORDER BY user_id DESC";
     $res = $conn->query($sql);
     if (!$res) {
       http_response_code(500);
       echo json_encode(["status" => "error", "message" => "Query failed", "error" => $conn->error]);
       exit();
     }
-
     $rows = [];
     while ($r = $res->fetch_assoc()) { $rows[] = $r; }
     echo json_encode($rows);
@@ -157,7 +121,6 @@ switch ($method) {
   }
 
   case 'POST': {
-    // super_admin gate (header)
     $reqRole = $_SERVER['HTTP_X_USER_ROLE'] ?? $_SERVER['HTTP_X_ROLE'] ?? '';
     if ($reqRole !== 'super_admin') {
       http_response_code(403);
@@ -166,16 +129,18 @@ switch ($method) {
     }
 
     $data = read_json_body();
-    $name = trim((string)($data['name'] ?? ''));          // ignored in insert (schema has no 'name')
+    $name = trim((string)($data['name'] ?? ''));
     $username = trim((string)($data['username'] ?? ''));
     $email = trim((string)($data['email'] ?? ''));
     $role = trim((string)($data['role'] ?? ''));
     $status = trim((string)($data['status'] ?? 'active'));
     $password = (string)($data['password'] ?? '');
+    $department = trim((string)($data['department'] ?? ''));
+    $phone = trim((string)($data['phone'] ?? ''));
 
     if ($username === '' || $email === '' || $role === '') {
       http_response_code(400);
-      echo json_encode(["status" => "error", "message" => "username, email, role are required"]);
+      echo json_encode(["status" => "error", "message" => "username, email, and role are required"]);
       exit();
     }
 
@@ -200,11 +165,8 @@ switch ($method) {
     $emailEsc = esc($conn, $email);
     $roleEsc = esc($conn, $role);
     $statusEsc = esc($conn, $status);
-
-    // You likely want to hash this; keeping as-is to match current DB.
     $pwdVal = $password !== '' ? esc($conn, $password) : null;
 
-    // Insert using columns that actually exist
     $sql = "INSERT INTO users (username, email, role, status, password, created_at, updated_at)
             VALUES ('{$usernameEsc}', '{$emailEsc}', '{$roleEsc}', '{$statusEsc}', "
             . ($pwdVal !== null ? "'{$pwdVal}'" : "NULL")
@@ -218,6 +180,18 @@ switch ($method) {
     }
 
     $newId = (int)$conn->insert_id;
+
+    if ($role === 'acad_head') {
+      $q = "INSERT INTO school_heads (user_id, sh_name, sh_email, sh_phone, department)
+            VALUES ({$newId}, '{$name}', '{$emailEsc}', '{$phone}', '{$department}')";
+      $conn->query($q);
+    }
+
+    if ($role === 'admin') {
+      $q = "INSERT INTO admins (user_id, full_name, contact_number, department)
+            VALUES ({$newId}, '{$name}', '{$phone}', '{$department}')";
+      $conn->query($q);
+    }
 
     $mailOk = send_account_email($email, $name, $username, $password !== '' ? $password : null, $role);
     log_activity($conn, 'users', 'create', "Created {$role} user {$username} (id={$newId})" . ($mailOk ? " + email sent" : " + email failed"), $newId, null);
