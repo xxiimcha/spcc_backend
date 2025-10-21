@@ -236,8 +236,8 @@ function createProfessor(mysqli $conn, array $data) {
     $phone     = mysqli_real_escape_string($conn, (string)($data['phone'] ?? ''));
     $qualsArr  = normalize_array($data['qualifications'] ?? []);
 
-    $subjects_json  = mysqli_real_escape_string($conn, json_encode([]));
-    $subj_count     = 0;
+    $subjects_json = mysqli_real_escape_string($conn, json_encode([]));
+    $subj_count    = 0;
 
     if ($email !== '' && emailExists($conn, $email)) {
         log_activity($conn, 'professors', 'create', "FAILED create: email exists for {$email}", null, null);
@@ -262,28 +262,14 @@ function createProfessor(mysqli $conn, array $data) {
     }
 
     $qualStr       = mysqli_real_escape_string($conn, json_encode(array_values($qualsArr), JSON_UNESCAPED_UNICODE));
-
     $schoolYear    = ss_get_current_school_year($conn);
     $schoolYearSQL = $schoolYear !== null ? "'" . mysqli_real_escape_string($conn, $schoolYear) . "'" : "NULL";
-
     $emailSQL      = $email === '' ? "NULL" : "'" . mysqli_real_escape_string($conn, $email) . "'";
     $now           = date('Y-m-d H:i:s');
 
     $conn->begin_transaction();
     try {
-        $sqlProf = "
-            INSERT INTO professors
-                (prof_name, prof_username, prof_email, prof_phone,
-                 prof_qualifications, prof_subject_ids, subj_count, school_year)
-            VALUES
-                ('$name', '$username', $emailSQL, '$phone',
-                 '$qualStr', '$subjects_json', $subj_count, $schoolYearSQL)
-        ";
-        if (!$conn->query($sqlProf)) {
-            throw new Exception("Failed inserting professor: " . $conn->error);
-        }
-        $profId = (int)$conn->insert_id;
-
+        // 1) create USER first
         $sqlUser = "
             INSERT INTO users (username, password, email, role, status, created_at, updated_at)
             VALUES ('{$username}', '{$password}', {$emailSQL}, 'professor', 'active', '{$now}', '{$now}')
@@ -293,10 +279,19 @@ function createProfessor(mysqli $conn, array $data) {
         }
         $userId = (int)$conn->insert_id;
 
-        $sqlLink = "UPDATE professors SET user_id={$userId} WHERE prof_id={$profId} LIMIT 1";
-        if (!$conn->query($sqlLink)) {
-            throw new Exception("Failed linking user to professor: " . $conn->error);
+        // 2) then insert PROFESSOR with that user_id
+        $sqlProf = "
+            INSERT INTO professors
+                (user_id, prof_name, prof_username, prof_email, prof_phone,
+                 prof_qualifications, prof_subject_ids, subj_count, school_year)
+            VALUES
+                ({$userId}, '$name', '$username', $emailSQL, '$phone',
+                 '$qualStr', '$subjects_json', $subj_count, $schoolYearSQL)
+        ";
+        if (!$conn->query($sqlProf)) {
+            throw new Exception("Failed inserting professor: " . $conn->error);
         }
+        $profId = (int)$conn->insert_id;
 
         $conn->commit();
 
@@ -325,8 +320,6 @@ function createProfessor(mysqli $conn, array $data) {
 
     } catch (Throwable $e) {
         $conn->rollback();
-        if (!empty($profId ?? 0)) {
-        }
         log_activity($conn, 'professors', 'create', "FAILED create: " . $e->getMessage(), null, null);
         http_response_code(500);
         echo json_encode(["status"=>"error","message"=>$e->getMessage()]);
