@@ -21,6 +21,9 @@ use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\Exception;
 require __DIR__ . '/vendor/autoload.php';
 
+$DEBUG = isset($_GET['debug']) && $_GET['debug'] == '1';
+$NOEMAIL = isset($_GET['noemail']) && $_GET['noemail'] == '1';
+
 function read_json_body(): array {
   $raw = file_get_contents('php://input');
   if (!$raw) return [];
@@ -28,12 +31,15 @@ function read_json_body(): array {
   return is_array($data) ? $data : [];
 }
 
+function json_fail(int $code, string $msg, array $extra = []): void {
+  http_response_code($code);
+  echo json_encode(['success'=>false,'status'=>'error','message'=>$msg] + $extra);
+  exit();
+}
+
 function random_password(int $len = 10): string {
-  try {
-    return substr(str_replace(['/', '+', '='], '', base64_encode(random_bytes(16))), 0, $len);
-  } catch (Throwable $e) {
-    return 'Temp' . mt_rand(100000, 999999);
-  }
+  try { return substr(str_replace(['/', '+', '='], '', base64_encode(random_bytes(16))), 0, $len); }
+  catch (Throwable $e) { return 'Temp' . mt_rand(100000, 999999); }
 }
 
 function send_account_email(string $toEmail, string $toName, string $username, ?string $password, string $role): bool {
@@ -86,7 +92,7 @@ function send_account_email(string $toEmail, string $toName, string $username, ?
 }
 
 function emailExists(mysqli $conn, string $email, ?int $excludeId = null): bool {
-  $sql = "SELECT user_id FROM users WHERE email = ?" . ($excludeId ? " AND user_id <> ?" : "") . " LIMIT 1";
+  $sql = "SELECT `user_id` FROM `users` WHERE `email` = ?" . ($excludeId ? " AND `user_id` <> ?" : "") . " LIMIT 1";
   $stmt = $conn->prepare($sql);
   if ($excludeId) $stmt->bind_param('si', $email, $excludeId); else $stmt->bind_param('s', $email);
   $stmt->execute(); $stmt->store_result();
@@ -96,7 +102,7 @@ function emailExists(mysqli $conn, string $email, ?int $excludeId = null): bool 
 }
 
 function usernameExists(mysqli $conn, string $username, ?int $excludeId = null): bool {
-  $sql = "SELECT user_id FROM users WHERE username = ?" . ($excludeId ? " AND user_id <> ?" : "") . " LIMIT 1";
+  $sql = "SELECT `user_id` FROM `users` WHERE `username` = ?" . ($excludeId ? " AND `user_id` <> ?" : "") . " LIMIT 1";
   $stmt = $conn->prepare($sql);
   if ($excludeId) $stmt->bind_param('si', $username, $excludeId); else $stmt->bind_param('s', $username);
   $stmt->execute(); $stmt->store_result();
@@ -105,16 +111,26 @@ function usernameExists(mysqli $conn, string $username, ?int $excludeId = null):
   return $exists;
 }
 
+/** Throws with clear message if prepare() fails */
+function safe_prepare(mysqli $conn, string $sql): mysqli_stmt {
+  $stmt = $conn->prepare($sql);
+  if ($stmt === false) {
+    throw new Exception("SQL prepare failed: " . $conn->error . " | SQL: " . $sql);
+  }
+  return $stmt;
+}
+
 $method = $_SERVER['REQUEST_METHOD'];
 
-switch ($method) {
-  case 'GET': {
+try {
+
+  if ($method === 'GET') {
     $id = isset($_GET['id']) ? (int)$_GET['id'] : null;
 
     if ($id) {
-      $stmt = $conn->prepare(
-        "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
-         FROM users WHERE user_id = ? LIMIT 1"
+      $stmt = safe_prepare($conn,
+        "SELECT `user_id` AS `id`, `username`, `email`, NULL AS `name`, `role`, `status`, NULL AS `last_login`
+         FROM `users` WHERE `user_id` = ? LIMIT 1"
       );
       $stmt->bind_param('i', $id);
       $stmt->execute();
@@ -122,37 +138,27 @@ switch ($method) {
       $row = $res->fetch_assoc();
       $stmt->close();
 
-      if ($row) {
-        echo json_encode($row);
-      } else {
-        http_response_code(404);
-        echo json_encode(["status" => "error", "message" => "User not found"]);
-      }
+      if ($row) echo json_encode($row);
+      else json_fail(404, "User not found");
       exit();
     }
 
     $rows = [];
     $res = $conn->query(
-      "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
-       FROM users ORDER BY user_id DESC"
+      "SELECT `user_id` AS `id`, `username`, `email`, NULL AS `name`, `role`, `status`, NULL AS `last_login`
+       FROM `users` ORDER BY `user_id` DESC"
     );
-    if (!$res) {
-      http_response_code(500);
-      echo json_encode(["status" => "error", "message" => "Query failed", "error" => $conn->error]);
-      exit();
-    }
+    if (!$res) json_fail(500, "Query failed", ["error"=>$conn->error]);
     while ($r = $res->fetch_assoc()) $rows[] = $r;
     echo json_encode($rows);
     exit();
   }
 
-  case 'POST': {
+  if ($method === 'POST') {
     $reqRole = $_SERVER['HTTP_X_USER_ROLE'] ?? $_SERVER['HTTP_X_ROLE'] ?? '';
 
     if (!in_array($reqRole, ['super_admin', 'admin'], true)) {
-      http_response_code(403);
-      echo json_encode(["status" => "error", "message" => "Only super_admin/admin can create users"]);
-      exit();
+      json_fail(403, "Only super_admin/admin can create users");
     }
 
     $data = read_json_body();
@@ -167,80 +173,61 @@ switch ($method) {
     $phone      = trim((string)($data['phone'] ?? ''));
 
     if ($username === '' || $email === '' || $role === '') {
-      http_response_code(400);
-      echo json_encode(["status" => "error", "message" => "username, email, and role are required"]);
-      exit();
+      json_fail(400, "username, email, and role are required");
     }
 
     if (!in_array($role, ['admin', 'acad_head'], true)) {
-      http_response_code(400);
-      echo json_encode(["status" => "error", "message" => "Role must be admin or acad_head"]);
-      exit();
+      json_fail(400, "Role must be admin or acad_head");
     }
 
-    // Admins can only create acad_head
     if ($reqRole === 'admin' && $role !== 'acad_head') {
-      http_response_code(403);
-      echo json_encode(["status" => "error", "message" => "Admin can only create Academic Head"]);
-      exit();
+      json_fail(403, "Admin can only create Academic Head");
     }
 
-    if (emailExists($conn, $email)) {
-      http_response_code(409);
-      echo json_encode(["status" => "error", "message" => "Email already exists"]);
-      exit();
-    }
-    if (usernameExists($conn, $username)) {
-      http_response_code(409);
-      echo json_encode(["status" => "error", "message" => "Username already exists"]);
-      exit();
-    }
+    if (emailExists($conn, $email))   json_fail(409, "Email already exists");
+    if (usernameExists($conn, $username)) json_fail(409, "Username already exists");
 
-    // Ensure a password value (in case users.password is NOT NULL)
     $finalPassword = $password !== '' ? $password : random_password(10);
 
     $conn->begin_transaction();
 
     try {
-      // users insert (users table DOES have created_at/updated_at)
-      $stmt = $conn->prepare(
-        "INSERT INTO users (username, email, role, status, password, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, NOW(), NOW())"
+      $stmt = safe_prepare($conn,
+        "INSERT INTO `users` (`username`,`email`,`role`,`status`,`password`,`created_at`,`updated_at`)
+         VALUES (?,?,?,?,?,NOW(),NOW())"
       );
       $stmt->bind_param('sssss', $username, $email, $role, $status, $finalPassword);
-      $ok = $stmt->execute();
-      if (!$ok) throw new Exception("users insert failed: " . $stmt->error);
+      $stmt->execute();
       $newId = (int)$stmt->insert_id;
       $stmt->close();
 
-      // role-specific details
       if ($role === 'acad_head') {
-        // school_heads has NO created_at/updated_at in your schema
-        $stmt2 = $conn->prepare(
-          "INSERT INTO school_heads (user_id, sh_name, sh_email, sh_phone, department)
-           VALUES (?, ?, ?, ?, ?)"
+        $stmt2 = safe_prepare($conn,
+          "INSERT INTO `school_heads` (`user_id`,`sh_name`,`sh_email`,`sh_phone`,`department`)
+           VALUES (?,?,?,?,?)"
         );
         $stmt2->bind_param('issss', $newId, $name, $email, $phone, $department);
-        $ok2 = $stmt2->execute();
-        if (!$ok2) throw new Exception("school_heads insert failed: " . $stmt2->error);
+        $stmt2->execute();
         $stmt2->close();
       }
 
       if ($role === 'admin') {
-        // admins has NO created_at/updated_at in your schema
-        $stmt3 = $conn->prepare(
-          "INSERT INTO admins (user_id, full_name, contact_number, department)
-           VALUES (?, ?, ?, ?)"
+        $stmt3 = safe_prepare($conn,
+          "INSERT INTO `admins` (`user_id`,`full_name`,`contact_number`,`department`)
+           VALUES (?,?,?,?)"
         );
         $stmt3->bind_param('isss', $newId, $name, $phone, $department);
-        $ok3 = $stmt3->execute();
-        if (!$ok3) throw new Exception("admins insert failed: " . $stmt3->error);
+        $stmt3->execute();
         $stmt3->close();
       }
 
       $conn->commit();
 
-      $mailOk = send_account_email($email, $name, $username, $finalPassword, $role);
+      $mailOk = true;
+      if (!$NOEMAIL) {
+        $mailOk = send_account_email($email, $name, $username, $finalPassword, $role);
+      }
+
       log_activity(
         $conn,
         'users',
@@ -250,9 +237,9 @@ switch ($method) {
         null
       );
 
-      $stmt4 = $conn->prepare(
-        "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
-         FROM users WHERE user_id = ? LIMIT 1"
+      $stmt4 = safe_prepare($conn,
+        "SELECT `user_id` AS `id`, `username`, `email`, NULL AS `name`, `role`, `status`, NULL AS `last_login`
+         FROM `users` WHERE `user_id` = ? LIMIT 1"
       );
       $stmt4->bind_param('i', $newId);
       $stmt4->execute();
@@ -261,24 +248,24 @@ switch ($method) {
       $stmt4->close();
 
       echo json_encode([
-        "success" => true,
-        "status" => "success",
-        "message" => "User created",
+        "success"    => true,
+        "status"     => "success",
+        "message"    => "User created",
         "email_sent" => $mailOk,
-        "data" => $row
+        "data"       => $row
       ]);
       exit();
 
     } catch (Exception $e) {
       $conn->rollback();
-      http_response_code(500);
-      echo json_encode(["success" => false, "status" => "error", "message" => $e->getMessage()]);
-      exit();
+      if ($GLOBALS['DEBUG']) json_fail(500, $e->getMessage(), ["trace"=>$e->getTraceAsString()]);
+      json_fail(500, "Create failed");
     }
   }
 
-  default:
-    http_response_code(405);
-    echo json_encode(["status" => "error", "message" => "Method not allowed"]);
-    exit();
+  json_fail(405, "Method not allowed");
+
+} catch (Throwable $e) {
+  if ($DEBUG) json_fail(500, $e->getMessage(), ["trace"=>$e->getTraceAsString()]);
+  json_fail(500, "Server error");
 }
