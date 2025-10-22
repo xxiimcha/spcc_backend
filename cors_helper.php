@@ -12,7 +12,8 @@ function handleCORS() {
         'http://localhost:4173',
         'http://localhost:5000',
         'https://spcc-web.vercel.app',
-        'https://spcc-smartsched.vercel.app'
+        'https://spcc-smartsched.vercel.app',
+        'https://spcc-scheduler.site'
     ];
 
     $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
