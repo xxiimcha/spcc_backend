@@ -1,6 +1,5 @@
 <?php
 function handleCORS() {
-    // List of allowed origins
     $allowed_origins = [
         'http://localhost:5174',
         'http://127.0.0.1:5500',
@@ -17,22 +16,22 @@ function handleCORS() {
     ];
 
     $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
-    
-    if (in_array($origin, $allowed_origins)) {
+    if (in_array($origin, $allowed_origins, true)) {
         header('Access-Control-Allow-Origin: ' . $origin);
+        header('Access-Control-Allow-Credentials: true');
     } else {
         header('Access-Control-Allow-Origin: *');
     }
 
+    // IMPORTANT: allow the custom headers you actually send
     header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
-    header('Access-Control-Allow-Headers: Content-Type, Authorization');
-    header('Access-Control-Allow-Credentials: true');
-    header('Content-Type: application/json');
+    header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, X-User-Role, X-Role');
+    header('Access-Control-Max-Age: 86400'); // cache preflight for a day
+    header('Vary: Origin');                  // for caches/CDNs
+    header('Content-Type: application/json; charset=utf-8');
 
-    // Handle preflight OPTIONS request
     if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-        http_response_code(200);
+        http_response_code(204);
         exit();
     }
 }
-?>
