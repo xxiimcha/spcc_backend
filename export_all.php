@@ -186,7 +186,6 @@ try {
   $schedules = $qAll($conn, $schedulesSql, 'schedules_join');
 
   /* ---------- Consolidate days & normalize to plain text ---------- */
-  // parse "days" (can be JSON like ["friday"] or string), normalize to full names
   $parseDays = function($val): array {
     $val = trim((string)$val);
     if ($val === '') return [];
@@ -194,7 +193,6 @@ try {
     if (is_array($decoded)) {
       $list = $decoded;
     } else {
-      // fallback: strip brackets/quotes and split by comma
       $s = trim($val, "[]");
       $s = str_replace(['"', "'"], '', $s);
       $list = array_filter(array_map('trim', explode(',', $s)));
@@ -213,18 +211,15 @@ try {
       $k = strtolower(preg_replace('/[^a-z]/i', '', (string)$d));
       if (isset($map[$k])) $out[] = $map[$k];
     }
-    // unique
     $out = array_values(array_unique($out));
     return $out;
   };
 
   $weekdayOrder = ['monday'=>1,'tuesday'=>2,'wednesday'=>3,'thursday'=>4,'friday'=>5,'saturday'=>6,'sunday'=>7];
 
-  // Group by Section + Subject + Start/End time (so same class at same time consolidates days)
   $grouped = [];
   foreach ($schedules as $row) {
     $days = $parseDays($row['days'] ?? '');
-    // build key
     $sec  = $row['section_name'] ?? ($row['section_id'] ?? '');
     $subj = $row['subject_code'] ?? ($row['subject_name'] ?? ($row['subject_id'] ?? ''));
     $start = $row['start_time'] ?? '';
@@ -235,26 +230,89 @@ try {
       $row['__days_set'] = [];
       $grouped[$key] = $row;
     }
-    // merge days
     $existing = $grouped[$key]['__days_set'];
     foreach ($days as $d) { $existing[$d] = true; }
     $grouped[$key]['__days_set'] = $existing;
   }
 
-  // Flatten groups, sort days by weekday, and turn into "Monday, Wednesday" text
   $consolidated = [];
   foreach ($grouped as $row) {
     $dset = array_keys($row['__days_set']);
     usort($dset, function($a,$b) use ($weekdayOrder){
       return ($weekdayOrder[$a] ?? 99) <=> ($weekdayOrder[$b] ?? 99);
     });
-    // Capitalize
     $pretty = implode(', ', array_map(fn($x)=>ucfirst($x), $dset));
-    $row['days'] = $pretty;                 // replace with plain text
-    unset($row['__days_set']);              // cleanup
+    $row['days'] = $pretty;
+    unset($row['__days_set']);
     $consolidated[] = $row;
   }
   $schedules = $consolidated;
+
+  /* ---------- Report: Student Count per Strand / Year Level ---------- */
+  $studentCounts = [];
+  if ($colExists($conn, 'students', 'student_id') || $colExists($conn, 'students', 'id') || $colExists($conn, 'students', 'section_id')) {
+
+    $stuStrandCol  = $firstExisting($conn, 'students',  ['strand','track','program','course_strand']);
+    $stuYearCol    = $firstExisting($conn, 'students',  ['year_level','yearlvl','grade_level','grade','year']);
+    $stuSectionCol = $firstExisting($conn, 'students',  ['section_id','sec_id','section']);
+    $stuSyCol      = $firstExisting($conn, 'students',  ['school_year','sy']);
+
+    $secPKRpt      = $firstExisting($conn, 'sections',  ['section_id','id']);
+    $secStrandCol  = $firstExisting($conn, 'sections',  ['strand','track','program']);
+    $secYearCol    = $firstExisting($conn, 'sections',  ['year_level','yearlvl','grade_level','grade','year']);
+    $secSyCol      = $firstExisting($conn, 'sections',  ['school_year','sy']);
+
+    $wherePartsRpt = [];
+    if ($stuSyCol) {
+      $wherePartsRpt[] = "st.`$stuSyCol` = '".$esc($sy)."'";
+    } elseif ($secSyCol) {
+      $wherePartsRpt[] = "sec.`$secSyCol` = '".$esc($sy)."'";
+    }
+    $reportWhere = count($wherePartsRpt) ? (' WHERE '.implode(' AND ', $wherePartsRpt)) : '';
+
+    if ($stuStrandCol && $stuYearCol) {
+      $sql = "
+        SELECT
+          COALESCE(NULLIF(TRIM(st.`$stuStrandCol`),''), 'Unspecified') AS strand,
+          COALESCE(NULLIF(TRIM(st.`$stuYearCol`),''), 'Unspecified')   AS year_level,
+          COUNT(*) AS student_count
+        FROM students st
+        $reportWhere
+        GROUP BY 1,2
+        ORDER BY 1,2
+      ";
+      $studentCounts = $qAll($conn, $sql, 'report_students_strand_year');
+    } elseif ($stuSectionCol && $secPKRpt && ($secStrandCol || $secYearCol)) {
+      $selects = [];
+      $selects[] = $secStrandCol ? "COALESCE(NULLIF(TRIM(sec.`$secStrandCol`),''), 'Unspecified') AS strand"
+                                 : "'Unspecified' AS strand";
+      $selects[] = $secYearCol   ? "COALESCE(NULLIF(TRIM(sec.`$secYearCol`),''), 'Unspecified')   AS year_level"
+                                 : "'Unspecified' AS year_level";
+      $sql = "
+        SELECT
+          ".implode(",\n          ", $selects).",
+          COUNT(*) AS student_count
+        FROM students st
+        LEFT JOIN sections sec ON sec.`$secPKRpt` = st.`$stuSectionCol`
+        $reportWhere
+        GROUP BY 1,2
+        ORDER BY 1,2
+      ";
+      $studentCounts = $qAll($conn, $sql, 'report_students_via_sections');
+    }
+
+    if (empty($studentCounts)) {
+      $studentCounts = [];
+    } else {
+      $studentCounts = array_map(function($r){
+        return [
+          'strand'        => $r['strand']        ?? 'Unspecified',
+          'year_level'    => $r['year_level']    ?? 'Unspecified',
+          'student_count' => (int)($r['student_count'] ?? 0),
+        ];
+      }, $studentCounts);
+    }
+  }
 
   /* ---------- PhpSpreadsheet ---------- */
   $autoload = __DIR__ . '/vendor/autoload.php';
@@ -262,7 +320,6 @@ try {
   if (!extension_loaded('zip')) throw new RuntimeException('PHP extension "zip" is required. Enable it in php.ini and restart Apache.');
   require_once $autoload;
 
-  // Universal addSheet helper (Coordinate class used fully-qualified)
   $addSheet = function(\PhpOffice\PhpSpreadsheet\Spreadsheet $wb, string $title, array $rows): void {
     $sheet = $wb->createSheet();
     $sheet->setTitle(substr(preg_replace('/[\\\\\\/*?:\\[\\]]/', '_', $title), 0, 31));
@@ -270,13 +327,11 @@ try {
 
     $headers = array_keys($rows[0]);
 
-    // Header row
     foreach ($headers as $i => $h) {
       $col = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex($i + 1);
       $sheet->setCellValue("{$col}1", $h);
     }
 
-    // Data rows
     $r = 2;
     foreach ($rows as $row) {
       foreach ($headers as $i => $h) {
@@ -286,7 +341,6 @@ try {
       $r++;
     }
 
-    // Style
     $lastCol = \PhpOffice\PhpSpreadsheet\Cell\Coordinate::stringFromColumnIndex(count($headers));
     $sheet->getStyle("A1:{$lastCol}1")->getFont()->setBold(true);
     for ($i = 1; $i <= count($headers); $i++) {
@@ -296,11 +350,10 @@ try {
 
   log_line('PHPSPREADSHEET_READY');
 
-  // workbook
   $wb = new \PhpOffice\PhpSpreadsheet\Spreadsheet();
   $wb->getProperties()
      ->setCreator('SPCC Scheduling System')
-     ->setLastModifiedBy('SPCC Scheduling System')
+     ->setLastModifiedBy('SPcc Scheduling System')
      ->setTitle("Compiled Data $sy" . ($sem ? " - $sem" : ""))
      ->setSubject('Compiled Export')
      ->setDescription('All recorded data per school year');
@@ -316,11 +369,11 @@ try {
   $summary->getColumnDimension('A')->setAutoSize(true);
   $summary->getColumnDimension('B')->setAutoSize(true);
 
-  // Only the sheets you want:
-  $addSheet($wb, 'Sections',   $sections);
-  $addSheet($wb, 'Subjects',   $subjects);
-  $addSheet($wb, 'Professors', $professors);
-  $addSheet($wb, 'Schedules',  $schedules);
+  $addSheet($wb, 'Sections',      $sections);
+  $addSheet($wb, 'Subjects',      $subjects);
+  $addSheet($wb, 'Professors',    $professors);
+  $addSheet($wb, 'Schedules',     $schedules);
+  $addSheet($wb, 'StudentCounts', $studentCounts);
 
   log_line('WORKBOOK_BUILT');
 
