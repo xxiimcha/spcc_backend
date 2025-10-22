@@ -1,37 +1,33 @@
 <?php
-function handleCORS() {
-    $allowed_origins = [
-        'http://localhost:5174',
-        'http://127.0.0.1:5500',
-        'http://127.0.0.1:5501',
-        'http://localhost:3000',
-        'http://localhost:5173',
-        'http://localhost:8080',
-        'http://127.0.0.1:3000',
-        'http://localhost:4173',
-        'http://localhost:5000',
-        'https://spcc-web.vercel.app',
-        'https://spcc-smartsched.vercel.app',
-        'https://spcc-scheduler.site'
-    ];
+// cors_helper.php
 
-    $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
-    if (in_array($origin, $allowed_origins, true)) {
-        header('Access-Control-Allow-Origin: ' . $origin);
-        header('Access-Control-Allow-Credentials: true');
-    } else {
-        header('Access-Control-Allow-Origin: *');
-    }
+function handleCORS(): void {
+  // Accept any origin during development; tighten to your domain(s) in prod.
+  $origin = $_SERVER['HTTP_ORIGIN'] ?? '*';
 
-    // IMPORTANT: allow the custom headers you actually send
-    header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
-    header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, X-User-Role, X-Role');
-    header('Access-Control-Max-Age: 86400'); // cache preflight for a day
-    header('Vary: Origin');                  // for caches/CDNs
-    header('Content-Type: application/json; charset=utf-8');
+  // If you want to allow only specific origins, do it like:
+  // $allowed = ['http://localhost:5173', 'https://your-frontend.com'];
+  // $origin = in_array($origin, $allowed, true) ? $origin : 'https://your-frontend.com';
 
-    if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-        http_response_code(204);
-        exit();
-    }
+  header('Access-Control-Allow-Origin: ' . $origin);
+  header('Vary: Origin'); // so caches don't mix origins
+  header('Access-Control-Allow-Credentials: false');
+
+  // Methods your API supports
+  header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
+
+  // All headers you read in PHP or set from the client
+  header('Access-Control-Allow-Headers: Content-Type, Authorization, X-User-Role, X-Role');
+
+  // Keep preflight results for a while
+  header('Access-Control-Max-Age: 86400');
+
+  // Respond to preflight cleanly
+  if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(204);
+    // Send an explicit length and type (some proxies are picky)
+    header('Content-Length: 0');
+    header('Content-Type: text/plain; charset=utf-8');
+    exit();
+  }
 }
