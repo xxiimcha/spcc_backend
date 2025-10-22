@@ -25,28 +25,6 @@ function read_json_body(): array {
   return is_array($data) ? $data : [];
 }
 
-function esc(mysqli $conn, ?string $v): string {
-  return mysqli_real_escape_string($conn, (string)($v ?? ''));
-}
-
-function emailExists(mysqli $conn, string $email, ?int $excludeId = null): bool {
-  $email = esc($conn, $email);
-  $q = "SELECT user_id FROM users WHERE email='{$email}'"
-     . ($excludeId ? " AND user_id <> {$excludeId}" : "")
-     . " LIMIT 1";
-  $res = $conn->query($q);
-  return ($res && $res->num_rows > 0);
-}
-
-function usernameExists(mysqli $conn, string $username, ?int $excludeId = null): bool {
-  $username = esc($conn, $username);
-  $q = "SELECT user_id FROM users WHERE username='{$username}'"
-     . ($excludeId ? " AND user_id <> {$excludeId}" : "")
-     . " LIMIT 1";
-  $res = $conn->query($q);
-  return ($res && $res->num_rows > 0);
-}
-
 function send_account_email(string $toEmail, string $toName, string $username, ?string $password, string $role): bool {
   $mailer = new PHPMailer(true);
   try {
@@ -68,9 +46,12 @@ function send_account_email(string $toEmail, string $toName, string $username, ?
     $mailer->setFrom($fromEmail, $fromName);
     $mailer->addAddress($toEmail, $toName ?: $toEmail);
     $mailer->isHTML(true);
-    $mailer->Subject = 'Your SPCC Scheduler account';
-    $pwdLine = $password ? "<p><strong>Temporary Password:</strong> {$password}</p>" : "<p>Please set your password via the provided reset flow.</p>";
+
     $roleLabel = $role === 'acad_head' ? 'Academic Head' : ucfirst($role);
+    $pwdLine = $password ? "<p><strong>Temporary Password:</strong> " . htmlspecialchars($password) . "</p>"
+                         : "<p>Please set your password via the provided reset flow.</p>";
+
+    $mailer->Subject = 'Your SPCC Scheduler account';
     $mailer->Body = "
       <div style='font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#0B2333'>
         <p>Hello " . htmlspecialchars($toName ?: $username) . ",</p>
@@ -80,13 +61,40 @@ function send_account_email(string $toEmail, string $toName, string $username, ?
         <p>You can now sign in to the SPCC Scheduler.</p>
         <p>— SPCC Scheduler</p>
       </div>";
-    $mailer->AltBody = "Your {$roleLabel} account has been created.\nUsername: {$username}\n"
-      . ($password ? "Temporary Password: {$password}\n" : "Please set your password via the provided reset flow.\n")
-      . "You can now sign in to the SPCC Scheduler.";
+    $mailer->AltBody =
+      "Your {$roleLabel} account has been created.\n" .
+      "Username: {$username}\n" .
+      ($password ? "Temporary Password: {$password}\n" : "Please set your password via the provided reset flow.\n") .
+      "You can now sign in to the SPCC Scheduler.";
+
     return $mailer->send();
   } catch (Exception $e) {
     return false;
   }
+}
+
+function emailExists(mysqli $conn, string $email, ?int $excludeId = null): bool {
+  $sql = "SELECT user_id FROM users WHERE email = ? " . ($excludeId ? "AND user_id <> ?" : "") . " LIMIT 1";
+  $stmt = $conn->prepare($sql);
+  if ($excludeId) $stmt->bind_param('si', $email, $excludeId);
+  else $stmt->bind_param('s', $email);
+  $stmt->execute();
+  $stmt->store_result();
+  $exists = $stmt->num_rows > 0;
+  $stmt->close();
+  return $exists;
+}
+
+function usernameExists(mysqli $conn, string $username, ?int $excludeId = null): bool {
+  $sql = "SELECT user_id FROM users WHERE username = ? " . ($excludeId ? "AND user_id <> ?" : "") . " LIMIT 1";
+  $stmt = $conn->prepare($sql);
+  if ($excludeId) $stmt->bind_param('si', $username, $excludeId);
+  else $stmt->bind_param('s', $username);
+  $stmt->execute();
+  $stmt->store_result();
+  $exists = $stmt->num_rows > 0;
+  $stmt->close();
+  return $exists;
 }
 
 $method = $_SERVER['REQUEST_METHOD'];
@@ -94,11 +102,19 @@ $method = $_SERVER['REQUEST_METHOD'];
 switch ($method) {
   case 'GET': {
     $id = isset($_GET['id']) ? (int)$_GET['id'] : null;
+
     if ($id) {
-      $sql = "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
-              FROM users WHERE user_id = {$id} LIMIT 1";
-      $res = $conn->query($sql);
-      if ($res && $row = $res->fetch_assoc()) {
+      $stmt = $conn->prepare(
+        "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
+         FROM users WHERE user_id = ? LIMIT 1"
+      );
+      $stmt->bind_param('i', $id);
+      $stmt->execute();
+      $res = $stmt->get_result();
+      $row = $res->fetch_assoc();
+      $stmt->close();
+
+      if ($row) {
         echo json_encode($row);
       } else {
         http_response_code(404);
@@ -106,16 +122,18 @@ switch ($method) {
       }
       exit();
     }
-    $sql = "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
-            FROM users ORDER BY user_id DESC";
-    $res = $conn->query($sql);
+
+    $rows = [];
+    $res = $conn->query(
+      "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
+       FROM users ORDER BY user_id DESC"
+    );
     if (!$res) {
       http_response_code(500);
       echo json_encode(["status" => "error", "message" => "Query failed", "error" => $conn->error]);
       exit();
     }
-    $rows = [];
-    while ($r = $res->fetch_assoc()) { $rows[] = $r; }
+    while ($r = $res->fetch_assoc()) $rows[] = $r;
     echo json_encode($rows);
     exit();
   }
@@ -129,14 +147,15 @@ switch ($method) {
     }
 
     $data = read_json_body();
-    $name = trim((string)($data['name'] ?? ''));
-    $username = trim((string)($data['username'] ?? ''));
-    $email = trim((string)($data['email'] ?? ''));
-    $role = trim((string)($data['role'] ?? ''));
-    $status = trim((string)($data['status'] ?? 'active'));
-    $password = (string)($data['password'] ?? '');
+
+    $name       = trim((string)($data['name'] ?? ''));
+    $username   = trim((string)($data['username'] ?? ''));
+    $email      = trim((string)($data['email'] ?? ''));
+    $role       = trim((string)($data['role'] ?? ''));
+    $status     = trim((string)($data['status'] ?? 'active'));
+    $password   = (string)($data['password'] ?? '');
     $department = trim((string)($data['department'] ?? ''));
-    $phone = trim((string)($data['phone'] ?? ''));
+    $phone      = trim((string)($data['phone'] ?? ''));
 
     if ($username === '' || $email === '' || $role === '') {
       http_response_code(400);
@@ -161,54 +180,78 @@ switch ($method) {
       exit();
     }
 
-    $usernameEsc = esc($conn, $username);
-    $emailEsc = esc($conn, $email);
-    $roleEsc = esc($conn, $role);
-    $statusEsc = esc($conn, $status);
-    $pwdVal = $password !== '' ? esc($conn, $password) : null;
+    $conn->begin_transaction();
 
-    $sql = "INSERT INTO users (username, email, role, status, password, created_at, updated_at)
-            VALUES ('{$usernameEsc}', '{$emailEsc}', '{$roleEsc}', '{$statusEsc}', "
-            . ($pwdVal !== null ? "'{$pwdVal}'" : "NULL")
-            . ", NOW(), NOW())";
+    try {
+      $stmt = $conn->prepare(
+        "INSERT INTO users (username, email, role, status, password, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, NOW(), NOW())"
+      );
+      $pwdParam = $password !== '' ? $password : null;
+      $stmt->bind_param('sssss', $username, $email, $role, $status, $pwdParam);
+      $ok = $stmt->execute();
+      if (!$ok) throw new Exception("users insert failed: " . $stmt->error);
+      $newId = (int)$stmt->insert_id;
+      $stmt->close();
 
-    $ok = $conn->query($sql);
-    if (!$ok) {
+      if ($role === 'acad_head') {
+        $stmt2 = $conn->prepare(
+          "INSERT INTO school_heads (user_id, sh_name, sh_email, sh_phone, department, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, NOW(), NOW())"
+        );
+        $stmt2->bind_param('issss', $newId, $name, $email, $phone, $department);
+        $ok2 = $stmt2->execute();
+        if (!$ok2) throw new Exception("school_heads insert failed: " . $stmt2->error);
+        $stmt2->close();
+      }
+
+      if ($role === 'admin') {
+        $stmt3 = $conn->prepare(
+          "INSERT INTO admins (user_id, full_name, contact_number, department, created_at, updated_at)
+           VALUES (?, ?, ?, ?, NOW(), NOW())"
+        );
+        $stmt3->bind_param('issss', $newId, $name, $phone, $department);
+        $ok3 = $stmt3->execute();
+        if (!$ok3) throw new Exception("admins insert failed: " . $stmt3->error);
+        $stmt3->close();
+      }
+
+      $conn->commit();
+
+      $mailOk = send_account_email($email, $name, $username, $password !== '' ? $password : null, $role);
+      log_activity(
+        $conn,
+        'users',
+        'create',
+        "Created {$role} user {$username} (id={$newId})" . ($mailOk ? " + email sent" : " + email failed"),
+        $newId,
+        null
+      );
+
+      $stmt4 = $conn->prepare(
+        "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
+         FROM users WHERE user_id = ? LIMIT 1"
+      );
+      $stmt4->bind_param('i', $newId);
+      $stmt4->execute();
+      $res4 = $stmt4->get_result();
+      $row = $res4->fetch_assoc();
+      $stmt4->close();
+
+      echo json_encode([
+        "status" => "ok",
+        "message" => "User created",
+        "email_sent" => $mailOk,
+        "user" => $row
+      ]);
+      exit();
+
+    } catch (Exception $e) {
+      $conn->rollback();
       http_response_code(500);
-      echo json_encode(["status" => "error", "message" => "Insert failed", "error" => $conn->error]);
+      echo json_encode(["status" => "error", "message" => $e->getMessage()]);
       exit();
     }
-
-    $newId = (int)$conn->insert_id;
-
-    if ($role === 'acad_head') {
-      $q = "INSERT INTO school_heads (user_id, sh_name, sh_email, sh_phone, department)
-            VALUES ({$newId}, '{$name}', '{$emailEsc}', '{$phone}', '{$department}')";
-      $conn->query($q);
-    }
-
-    if ($role === 'admin') {
-      $q = "INSERT INTO admins (user_id, full_name, contact_number, department)
-            VALUES ({$newId}, '{$name}', '{$phone}', '{$department}')";
-      $conn->query($q);
-    }
-
-    $mailOk = send_account_email($email, $name, $username, $password !== '' ? $password : null, $role);
-    log_activity($conn, 'users', 'create', "Created {$role} user {$username} (id={$newId})" . ($mailOk ? " + email sent" : " + email failed"), $newId, null);
-
-    $sel = $conn->query(
-      "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
-       FROM users WHERE user_id = {$newId} LIMIT 1"
-    );
-    $row = $sel ? $sel->fetch_assoc() : null;
-
-    echo json_encode([
-      "status" => "ok",
-      "message" => "User created",
-      "email_sent" => $mailOk,
-      "user" => $row
-    ]);
-    exit();
   }
 
   default:
