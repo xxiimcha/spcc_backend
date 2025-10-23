@@ -248,71 +248,92 @@ try {
   }
   $schedules = $consolidated;
 
-  /* ---------- Report: Student Count per Strand / Year Level ---------- */
-  $studentCounts = [];
-  if ($colExists($conn, 'students', 'student_id') || $colExists($conn, 'students', 'id') || $colExists($conn, 'students', 'section_id')) {
+/* ---------- Report: Student Count per Strand (per School Year) ---------- */
+$studentCounts = [];
 
-    $stuStrandCol  = $firstExisting($conn, 'students',  ['strand','track','program','course_strand']);
-    $stuYearCol    = $firstExisting($conn, 'students',  ['year_level','yearlvl','grade_level','grade','year']);
-    $stuSectionCol = $firstExisting($conn, 'students',  ['section_id','sec_id','section']);
-    $stuSyCol      = $firstExisting($conn, 'students',  ['school_year','sy']);
+if (
+  $colExists($conn, 'students', 'student_id') || $colExists($conn, 'students', 'id') || $colExists($conn, 'students', 'section_id')
+) {
+  $stuStrandCol  = $firstExisting($conn, 'students',  ['strand','track','program','course_strand']);
+  $stuSectionCol = $firstExisting($conn, 'students',  ['section_id','sec_id','section']);
+  $stuSyCol      = $firstExisting($conn, 'students',  ['school_year','sy']);
 
-    $secPKRpt      = $firstExisting($conn, 'sections',  ['section_id','id']);
-    $secStrandCol  = $firstExisting($conn, 'sections',  ['strand','track','program']);
-    $secYearCol    = $firstExisting($conn, 'sections',  ['year_level','yearlvl','grade_level','grade','year']);
-    $secSyCol      = $firstExisting($conn, 'sections',  ['school_year','sy']);
+  $secPKRpt      = $firstExisting($conn, 'sections',  ['section_id','id']);
+  $secSyCol      = $firstExisting($conn, 'sections',  ['school_year','sy']);
 
-    $wherePartsRpt = [];
+  // Need a strand source to report by strand
+  if ($stuStrandCol) {
+    // Build FROM/JOIN depending on where the school_year lives
+    $fromJoin = "FROM students st";
+    $whereParts = [];
+
     if ($stuSyCol) {
-      $wherePartsRpt[] = "st.`$stuSyCol` = '".$esc($sy)."'";
-    } elseif ($secSyCol) {
-      $wherePartsRpt[] = "sec.`$secSyCol` = '".$esc($sy)."'";
-    }
-    $reportWhere = count($wherePartsRpt) ? (' WHERE '.implode(' AND ', $wherePartsRpt)) : '';
-
-    if ($stuStrandCol && $stuYearCol) {
-      $sql = "
-        SELECT
-          COALESCE(NULLIF(TRIM(st.`$stuStrandCol`),''), 'Unspecified') AS strand,
-          COALESCE(NULLIF(TRIM(st.`$stuYearCol`),''), 'Unspecified')   AS year_level,
-          COUNT(*) AS student_count
-        FROM students st
-        $reportWhere
-        GROUP BY 1,2
-        ORDER BY 1,2
-      ";
-      $studentCounts = $qAll($conn, $sql, 'report_students_strand_year');
-    } elseif ($stuSectionCol && $secPKRpt && ($secStrandCol || $secYearCol)) {
-      $selects = [];
-      $selects[] = $secStrandCol ? "COALESCE(NULLIF(TRIM(sec.`$secStrandCol`),''), 'Unspecified') AS strand"
-                                 : "'Unspecified' AS strand";
-      $selects[] = $secYearCol   ? "COALESCE(NULLIF(TRIM(sec.`$secYearCol`),''), 'Unspecified')   AS year_level"
-                                 : "'Unspecified' AS year_level";
-      $sql = "
-        SELECT
-          ".implode(",\n          ", $selects).",
-          COUNT(*) AS student_count
-        FROM students st
-        LEFT JOIN sections sec ON sec.`$secPKRpt` = st.`$stuSectionCol`
-        $reportWhere
-        GROUP BY 1,2
-        ORDER BY 1,2
-      ";
-      $studentCounts = $qAll($conn, $sql, 'report_students_via_sections');
+      $whereParts[] = "st.`$stuSyCol` = '".$esc($sy)."'";
+    } elseif ($stuSectionCol && $secPKRpt && $secSyCol) {
+      $fromJoin .= " LEFT JOIN sections sec ON sec.`$secPKRpt` = st.`$stuSectionCol`";
+      $whereParts[] = "sec.`$secSyCol` = '".$esc($sy)."'";
     }
 
-    if (empty($studentCounts)) {
-      $studentCounts = [];
-    } else {
-      $studentCounts = array_map(function($r){
+    $reportWhere = count($whereParts) ? (' WHERE '.implode(' AND ', $whereParts)) : '';
+
+    $sql = "
+      SELECT
+        COALESCE(NULLIF(TRIM(st.`$stuStrandCol`),''), 'Unspecified') AS strand,
+        COUNT(*) AS student_count
+      $fromJoin
+      $reportWhere
+      GROUP BY 1
+      ORDER BY 1
+    ";
+    $studentCounts = $qAll($conn, $sql, 'report_students_strand_only');
+
+    // Normalize & add explicit school_year column to the sheet
+    $studentCounts = array_map(function($r) use ($sy) {
+      return [
+        'school_year'   => $sy,
+        'strand'        => $r['strand'] ?? 'Unspecified',
+        'student_count' => (int)($r['student_count'] ?? 0),
+      ];
+    }, $studentCounts);
+  } else {
+    // No strand column on students — try via sections if sections carry a strand-like field
+    $secStrandCol = $firstExisting($conn, 'sections',  ['strand','track','program']);
+
+    if ($stuSectionCol && $secPKRpt && $secStrandCol) {
+      $fromJoin = "FROM students st LEFT JOIN sections sec ON sec.`$secPKRpt` = st.`$stuSectionCol`";
+
+      $whereParts = [];
+      if ($secSyCol) {
+        $whereParts[] = "sec.`$secSyCol` = '".$esc($sy)."'";
+      } elseif ($stuSyCol) {
+        $whereParts[] = "st.`$stuSyCol` = '".$esc($sy)."'";
+      }
+      $reportWhere = count($whereParts) ? (' WHERE '.implode(' AND ', $whereParts)) : '';
+
+      $sql = "
+        SELECT
+          COALESCE(NULLIF(TRIM(sec.`$secStrandCol`),''), 'Unspecified') AS strand,
+          COUNT(*) AS student_count
+        $fromJoin
+        $reportWhere
+        GROUP BY 1
+        ORDER BY 1
+      ";
+      $studentCounts = $qAll($conn, $sql, 'report_students_strand_via_sections');
+
+      $studentCounts = array_map(function($r) use ($sy) {
         return [
-          'strand'        => $r['strand']        ?? 'Unspecified',
-          'year_level'    => $r['year_level']    ?? 'Unspecified',
+          'school_year'   => $sy,
+          'strand'        => $r['strand'] ?? 'Unspecified',
           'student_count' => (int)($r['student_count'] ?? 0),
         ];
       }, $studentCounts);
+    } else {
+      $studentCounts = []; // cannot compute strand totals with available schema
     }
   }
+}
+
 
   /* ---------- PhpSpreadsheet ---------- */
   $autoload = __DIR__ . '/vendor/autoload.php';
