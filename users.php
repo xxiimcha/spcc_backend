@@ -1,18 +1,13 @@
 <?php
-ini_set('display_errors', 1);
-error_reporting(E_ALL);
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Authorization");
+header("Access-Control-Allow-Credentials: true");
+header("Content-Type: application/json");
 
-declare(strict_types=1);
-
-include 'cors_helper.php';
-handleCORS();
-
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-  http_response_code(204);
-  exit();
+if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
+    exit(0);
 }
-
-header('Content-Type: application/json; charset=utf-8');
 
 require_once __DIR__ . '/connect.php';
 require_once __DIR__ . '/activity_logger.php';
