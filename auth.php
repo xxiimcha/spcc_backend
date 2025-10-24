@@ -1,25 +1,20 @@
 <?php
-// auth.php — Unified authentication endpoint
-// Uses `users` for login and attaches profile details from role tables.
-
 declare(strict_types=1);
 
 header('Content-Type: application/json; charset=utf-8');
-header('Access-Control-Allow-Origin: *'); // tighten in production
+header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'OPTIONS') {
   http_response_code(204);
   exit();
 }
 
-require_once __DIR__ . '/connect.php'; // must define $conn (mysqli)
+require_once __DIR__ . '/connect.php';
 mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
 
-function jout(array $data): void {
-  echo json_encode($data, JSON_UNESCAPED_UNICODE);
-}
+function jout(array $data): void { echo json_encode($data, JSON_UNESCAPED_UNICODE); }
 
 function body_json(): array {
   $raw = file_get_contents('php://input');
@@ -29,8 +24,8 @@ function body_json(): array {
 
 function looks_hashed(string $s): bool {
   return strlen($s) >= 30
-      || str_starts_with($s, '$2y$')      // bcrypt
-      || str_starts_with($s, '$argon2');  // argon2
+      || str_starts_with($s, '$2y$')
+      || str_starts_with($s, '$argon2');
 }
 
 try {
@@ -48,7 +43,6 @@ try {
     exit();
   }
 
-  // 1) Look up in users by username OR email
   $sql = "SELECT user_id, username, email, password, role, status
           FROM users
           WHERE username = ? OR email = ?
@@ -64,12 +58,6 @@ try {
     exit();
   }
 
-  if (isset($user['status']) && $user['status'] !== 'active') {
-    jout(['success' => false, 'error' => 'Account is inactive.']);
-    exit();
-  }
-
-  // 2) Password verify (hashed or legacy plain)
   $stored = (string)$user['password'];
   $valid = looks_hashed($stored) ? password_verify($password, $stored) : hash_equals($stored, $password);
 
@@ -78,24 +66,37 @@ try {
     exit();
   }
 
+  $status = strtolower(trim((string)($user['status'] ?? '')));
+  if ($status !== 'active') {
+    http_response_code(403);
+    $msg = match ($status) {
+      'pending', 'pending_verification' => 'Account pending verification.',
+      'suspended' => 'Account is suspended.',
+      'disabled' => 'Account is disabled.',
+      'blocked', 'banned' => 'Account is blocked.',
+      'inactive' => 'Account is inactive.',
+      default => 'Account not allowed to sign in.',
+    };
+    jout([
+      'success' => false,
+      'error' => $msg,
+      'status' => $status ?: null,
+      'code' => 'account_status_denied'
+    ]);
+    exit();
+  }
+
   $userId = (int)$user['user_id'];
   $role   = (string)$user['role'];
-
-  // 3) Fetch role-specific profile using user_id
   $profile = null;
   $bestName = null;
 
   if ($role === 'admin' || $role === 'super_admin') {
-    // admins table: admin_id, user_id, full_name, contact_number, department, ...
-    $s = $conn->prepare("SELECT admin_id, full_name, contact_number, department
-                         FROM admins
-                         WHERE user_id = ?
-                         LIMIT 1");
+    $s = $conn->prepare("SELECT admin_id, full_name, contact_number, department FROM admins WHERE user_id = ? LIMIT 1");
     $s->bind_param('i', $userId);
     $s->execute();
     $row = $s->get_result()->fetch_assoc();
     $s->close();
-
     if ($row) {
       $profile = [
         'profile_type' => 'admin',
@@ -110,37 +111,27 @@ try {
       $bestName = $row['full_name'] ?? null;
     }
   } elseif ($role === 'acad_head') {
-    // school_heads table: sh_id, user_id, sh_name, sh_email, ...
-    $s = $conn->prepare("SELECT sh_id, sh_name, sh_email
-                         FROM school_heads
-                         WHERE user_id = ?
-                         LIMIT 1");
+    $s = $conn->prepare("SELECT sh_id, sh_name, sh_email FROM school_heads WHERE user_id = ? LIMIT 1");
     $s->bind_param('i', $userId);
     $s->execute();
     $row = $s->get_result()->fetch_assoc();
     $s->close();
-
     if ($row) {
       $profile = [
         'profile_type' => 'acad_head',
         'profile_id'   => (string)$row['sh_id'],
         'name'         => $row['sh_name'] ?? null,
         'email'        => $row['sh_email'] ?? $user['email'] ?? null,
-        'extra'        => new stdClass(), // placeholder
+        'extra'        => new stdClass(),
       ];
       $bestName = $row['sh_name'] ?? null;
     }
   } elseif ($role === 'professor') {
-    // professors table: prof_id, user_id, prof_name, prof_email, subj_count, school_year, ...
-    $s = $conn->prepare("SELECT prof_id, prof_name, prof_email, subj_count, school_year
-                         FROM professors
-                         WHERE user_id = ?
-                         LIMIT 1");
+    $s = $conn->prepare("SELECT prof_id, prof_name, prof_email, subj_count, school_year FROM professors WHERE user_id = ? LIMIT 1");
     $s->bind_param('i', $userId);
     $s->execute();
     $row = $s->get_result()->fetch_assoc();
     $s->close();
-
     if ($row) {
       $profile = [
         'profile_type' => 'professor',
@@ -156,10 +147,8 @@ try {
     }
   }
 
-  // Optional: issue a simple token (replace with JWT if you want)
-  $token = null; // e.g., bin2hex(random_bytes(16));
+  $token = null;
 
-  // 4) Respond
   $payload = [
     'success' => true,
     'user' => [
@@ -167,7 +156,8 @@ try {
       'username' => $user['username'],
       'role'     => $role,
       'email'    => $user['email'],
-      'name'     => $bestName, // prefer profile name if present
+      'name'     => $bestName,
+      'status'   => $status,
       'token'    => $token,
       'profile'  => $profile,
     ],
