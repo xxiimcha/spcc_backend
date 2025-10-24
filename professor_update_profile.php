@@ -77,7 +77,7 @@ try {
   mysqli_begin_transaction($conn);
 
   if (!empty($prof_sets)) {
-    $sql_prof = "UPDATE professors SET " . implode(', ', $prof_sets) . " WHERE prof_id = $prof_id";
+    $sql_prof = "UPDATE professors SET " . implode(', ', $prof_sets) . " WHERE user_id = $prof_id";
     if (!mysqli_query($conn, $sql_prof)) {
       mysqli_rollback($conn);
       http_response_code(500);
