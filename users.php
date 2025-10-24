@@ -60,6 +60,12 @@ function json_fail(int $code, string $msg, array $extra = []): void {
   exit();
 }
 
+function json_ok(array $payload = [], int $code = 200): void {
+  http_response_code($code);
+  echo json_encode(['success' => true, 'status' => 'success'] + $payload);
+  exit();
+}
+
 function random_password(int $len = 10): string {
   try {
     return substr(str_replace(['/', '+', '='], '', base64_encode(random_bytes(16))), 0, $len);
@@ -93,7 +99,7 @@ function findUserByEmail(mysqli $conn, string $email): ?array {
   return $row;
 }
 
-/** Case-insensitive username lookup */
+/** Case-insensitive username lookup (global uniqueness) */
 function findUserByUsername(mysqli $conn, string $username): ?array {
   $u = trim($username);
   $sql = "SELECT user_id AS id, username, email, role, status
@@ -102,6 +108,19 @@ function findUserByUsername(mysqli $conn, string $username): ?array {
           LIMIT 1";
   $stmt = $conn->prepare($sql);
   $stmt->bind_param('s', $u);
+  $stmt->execute();
+  $res = $stmt->get_result();
+  $row = $res->fetch_assoc() ?: null;
+  $stmt->close();
+  return $row;
+}
+
+/** Fetch by id (basic columns) */
+function findUserById(mysqli $conn, int $id): ?array {
+  $sql = "SELECT user_id AS id, username, email, role, status
+          FROM users WHERE user_id = ? LIMIT 1";
+  $stmt = $conn->prepare($sql);
+  $stmt->bind_param('i', $id);
   $stmt->execute();
   $res = $stmt->get_result();
   $row = $res->fetch_assoc() ?: null;
@@ -389,6 +408,154 @@ try {
       $conn->rollback();
       if ($GLOBALS['DEBUG']) json_fail(500, $e->getMessage(), ["trace" => $e->getTraceAsString()]);
       json_fail(500, "Create failed");
+    }
+  }
+
+  /* ---------- PUT /users.php?id=XX ---------- */
+  if ($method === 'PUT' || $method === 'PATCH') {
+    $reqRole = $_SERVER['HTTP_X_USER_ROLE'] ?? $_SERVER['HTTP_X_ROLE'] ?? '';
+    if (!in_array($reqRole, ['super_admin', 'admin'], true)) {
+      json_fail(403, "Only super_admin/admin can update users");
+    }
+
+    $id = isset($_GET['id']) ? (int)$_GET['id'] : 0;
+    if ($id <= 0) json_fail(400, "Missing or invalid id");
+
+    $target = findUserById($conn, $id);
+    if (!$target) json_fail(404, "User not found");
+
+    // Admin CANNOT modify admin/super_admin; may only modify acad_head
+    if ($reqRole === 'admin' && strtolower($target['role']) !== 'acad_head') {
+      json_fail(403, "Admins can only modify Academic Head accounts");
+    }
+
+    $data = read_json_body();
+    $newStatus       = isset($data['status']) ? trim((string)$data['status']) : null;
+    $newRole         = isset($data['role']) ? trim((string)$data['role']) : null;
+    $newEmail        = isset($data['email']) ? trim((string)$data['email']) : null;
+    $newUsername     = isset($data['username']) ? trim((string)$data['username']) : null; // not exposed in UI, but validated if sent
+    $resetPassword   = isset($data['reset_password']) ? (bool)$data['reset_password'] : false;
+
+    // Validate inputs
+    if ($newStatus !== null && !in_array($newStatus, ['active', 'inactive'], true)) {
+      json_fail(400, "Invalid status");
+    }
+    if ($newRole !== null && !in_array($newRole, ['admin', 'acad_head'], true)) {
+      json_fail(400, "Invalid role");
+    }
+    if ($reqRole === 'admin' && $newRole !== null && $newRole !== 'acad_head') {
+      json_fail(403, "Admins cannot change role to admin");
+    }
+
+    // Uniqueness checks if username/email are being changed
+    if ($newUsername !== null && strtolower($newUsername) !== strtolower($target['username'])) {
+      $du = findUserByUsername($conn, $newUsername);
+      if ($du && (int)$du['id'] !== $id) {
+        json_fail(409, "Username already exists", ["existing_user" => $du]);
+      }
+    }
+    if ($newEmail !== null && strtolower($newEmail) !== strtolower($target['email'])) {
+      $de = findUserByEmail($conn, $newEmail);
+      if ($de && (int)$de['id'] !== $id) {
+        json_fail(409, "Email already exists", ["existing_user" => $de]);
+      }
+    }
+
+    $conn->begin_transaction();
+    try {
+      // Build dynamic update for users table
+      $sets = [];
+      $params = [];
+      $types = '';
+
+      if ($newStatus !== null) { $sets[] = "status = ?";   $params[] = $newStatus; $types .= 's'; }
+      if ($newRole   !== null) { $sets[] = "role = ?";     $params[] = $newRole;   $types .= 's'; }
+      if ($newEmail  !== null) { $sets[] = "email = ?";    $params[] = $newEmail;  $types .= 's'; }
+      if ($newUsername !== null) { $sets[] = "username = ?"; $params[] = $newUsername; $types .= 's'; }
+
+      $tempPassword = null;
+      if ($resetPassword) {
+        $tempPassword = random_password(10);
+        $sets[] = "password = ?";
+        $params[] = $tempPassword;
+        $types .= 's';
+      }
+
+      if (!empty($sets)) {
+        $sql = "UPDATE users SET " . implode(', ', $sets) . ", updated_at = NOW() WHERE user_id = ?";
+        $stmt = safe_prepare($conn, $sql);
+        $types .= 'i';
+        $params[] = $id;
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $stmt->close();
+      }
+
+      // If role changed, ensure detail rows exist
+      $effectiveRole = $newRole !== null ? $newRole : $target['role'];
+      if ($effectiveRole === 'acad_head' && !schoolHeadRowExists($conn, $id)) {
+        $stmt2 = safe_prepare($conn,
+          "INSERT INTO school_heads (user_id, sh_name, sh_email, sh_phone, department)
+           VALUES (?,?,?,?,?)"
+        );
+        // We don't have name/phone/department in this endpoint; store minimal
+        $blank = '';
+        $emailForRow = $newEmail !== null ? $newEmail : $target['email'];
+        $stmt2->bind_param('issss', $id, $blank, $emailForRow, $blank, $blank);
+        $stmt2->execute();
+        $stmt2->close();
+      }
+      if ($effectiveRole === 'admin' && !adminRowExists($conn, $id)) {
+        $stmt3 = safe_prepare($conn,
+          "INSERT INTO admins (user_id, full_name, contact_number, department)
+           VALUES (?,?,?,?)"
+        );
+        $blank = '';
+        $stmt3->bind_param('isss', $id, $blank, $blank, $blank);
+        $stmt3->execute();
+        $stmt3->close();
+      }
+
+      $conn->commit();
+
+      // Reload and return
+      $updated = findUserById($conn, $id);
+
+      // Activity log
+      $action = $resetPassword ? 'reset_password' : 'update';
+      log_activity(
+        $conn,
+        'users',
+        $action,
+        ($resetPassword ? "Password reset for user id={$id}" : "Updated user id={$id}"),
+        $id,
+        null
+      );
+
+      $payload = [
+        "message" => $resetPassword ? "Password reset" : "User updated",
+        "data"    => [
+          "id"        => (int)$updated['id'],
+          "username"  => $updated['username'],
+          "email"     => $updated['email'],
+          "role"      => $updated['role'],
+          "status"    => $updated['status'],
+          "last_login"=> null,
+        ],
+      ];
+
+      // Optionally email the new password (kept off by default if $NOEMAIL true)
+      if ($resetPassword && !$NOEMAIL) {
+        // We don't have full name here; pass username as display
+        @send_account_email($updated['email'], $updated['username'], $updated['username'], $tempPassword, $updated['role']);
+        $payload["email_sent"] = true;
+      }
+
+      json_ok($payload);
+    } catch (Exception $e) {
+      $conn->rollback();
+      if ($GLOBALS['DEBUG']) json_fail(500, $e->getMessage(), ["trace" => $e->getTraceAsString()]);
+      json_fail(500, "Update failed");
     }
   }
 
