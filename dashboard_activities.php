@@ -1,17 +1,5 @@
 <?php
-// dashboard_activities.php - FIXED VERSION
-
-// Enable CORS
-header("Access-Control-Allow-Origin: *");
-header("Access-Control-Allow-Methods: GET, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization");
-header("Access-Control-Allow-Credentials: true");
-header("Content-Type: application/json");
-
-// Handle OPTIONS preflight request
-if($_SERVER['REQUEST_METHOD'] == 'OPTIONS'){
-    exit(0);
-}
+include 'cors_helper.php';
 
 ini_set('display_errors', 1);
 error_reporting(E_ALL);
