@@ -34,7 +34,7 @@ try {
     exit();
   }
 
-  // NOTE: Frontend sends prof_id but it is actually users.user_id
+  // You send prof_id but it's actually users.user_id
   $user_id = (int)($data['user_id'] ?? $data['prof_id'] ?? 0);
   if ($user_id <= 0) {
     http_response_code(400);
@@ -42,7 +42,7 @@ try {
     exit();
   }
 
-  // Find the linked professor row via user_id
+  // Find professor row by user_id
   $res = mysqli_query($conn, "SELECT prof_id FROM professors WHERE user_id = $user_id LIMIT 1");
   if (!$res || mysqli_num_rows($res) === 0) {
     http_response_code(404);
@@ -51,13 +51,14 @@ try {
   }
   $prof_id = (int)mysqli_fetch_assoc($res)['prof_id'];
 
-  // Sanitize inputs (empty string => treat as "no change")
+  // Sanitize
   $name     = mysqli_real_escape_string($conn, trim((string)($data['name'] ?? '')));
   $email    = mysqli_real_escape_string($conn, trim((string)($data['email'] ?? '')));
   $phone    = mysqli_real_escape_string($conn, trim((string)($data['phone'] ?? '')));
   $username = mysqli_real_escape_string($conn, trim((string)($data['username'] ?? '')));
   $password = mysqli_real_escape_string($conn, trim((string)($data['password'] ?? ''))); // plain text as requested
 
+  // Build updates
   $prof_sets = [];
   if ($name     !== '') $prof_sets[] = "prof_name = '$name'";
   if ($email    !== '') $prof_sets[] = "prof_email = '$email'";
@@ -65,10 +66,11 @@ try {
   if ($username !== '') $prof_sets[] = "prof_username = '$username'";
 
   $user_sets = [];
-  if ($name     !== '') $user_sets[] = "name = '$name'";
+  // NOTE: users table has no "name" column — do not include it
   if ($email    !== '') $user_sets[] = "email = '$email'";
   if ($username !== '') $user_sets[] = "username = '$username'";
   if ($password !== '') $user_sets[] = "password = '$password'";
+  // role/status untouched
 
   if (empty($prof_sets) && empty($user_sets)) {
     echo json_encode(['success' => false, 'message' => 'No changes detected']);
