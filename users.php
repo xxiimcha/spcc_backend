@@ -83,13 +83,27 @@ function safe_prepare(mysqli $conn, string $sql): mysqli_stmt {
   return $stmt;
 }
 
-/** Case-insensitive email lookup */
+/** SELECT list with name (admin/full_name or school_heads/sh_name) */
+function base_user_select(): string {
+  return "
+    SELECT
+      u.user_id AS id,
+      u.username,
+      u.email,
+      COALESCE(a.full_name, sh.sh_name) AS name,
+      u.role,
+      u.status,
+      NULL AS last_login
+    FROM users u
+    LEFT JOIN admins a ON a.user_id = u.user_id
+    LEFT JOIN school_heads sh ON sh.user_id = u.user_id
+  ";
+}
+
+/** Case-insensitive email lookup + name */
 function findUserByEmail(mysqli $conn, string $email): ?array {
   $email = trim($email);
-  $sql = "SELECT user_id AS id, username, email, role, status
-          FROM users
-          WHERE LOWER(email) = LOWER(?)
-          LIMIT 1";
+  $sql = base_user_select() . " WHERE LOWER(u.email) = LOWER(?) LIMIT 1";
   $stmt = $conn->prepare($sql);
   $stmt->bind_param('s', $email);
   $stmt->execute();
@@ -99,13 +113,10 @@ function findUserByEmail(mysqli $conn, string $email): ?array {
   return $row;
 }
 
-/** Case-insensitive username lookup (global uniqueness) */
+/** Case-insensitive username lookup + name (global uniqueness) */
 function findUserByUsername(mysqli $conn, string $username): ?array {
   $u = trim($username);
-  $sql = "SELECT user_id AS id, username, email, role, status
-          FROM users
-          WHERE LOWER(username) = LOWER(?)
-          LIMIT 1";
+  $sql = base_user_select() . " WHERE LOWER(u.username) = LOWER(?) LIMIT 1";
   $stmt = $conn->prepare($sql);
   $stmt->bind_param('s', $u);
   $stmt->execute();
@@ -115,10 +126,9 @@ function findUserByUsername(mysqli $conn, string $username): ?array {
   return $row;
 }
 
-/** Fetch by id (basic columns) */
+/** Fetch by id + name */
 function findUserById(mysqli $conn, int $id): ?array {
-  $sql = "SELECT user_id AS id, username, email, role, status
-          FROM users WHERE user_id = ? LIMIT 1";
+  $sql = base_user_select() . " WHERE u.user_id = ? LIMIT 1";
   $stmt = $conn->prepare($sql);
   $stmt->bind_param('i', $id);
   $stmt->execute();
@@ -179,14 +189,14 @@ function send_account_email(string $toEmail, string $toName, string $username, ?
     $mailer->Body = "
       <div style='font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#0B2333'>
         <p>Hello " . htmlspecialchars($toName ?: $username) . ",</p>
-        <p>Your {$roleLabel} account has been created.</p>
+        <p>Your {$roleLabel} account has been created/updated.</p>
         <p><strong>Username:</strong> " . htmlspecialchars($username) . "</p>
         {$pwdLine}
         <p>You can now sign in to the SPCC Scheduler.</p>
         <p>— SPCC Scheduler</p>
       </div>";
     $mailer->AltBody =
-      "Your {$roleLabel} account has been created.\n" .
+      "Your {$roleLabel} account has been created/updated.\n" .
       "Username: {$username}\n" .
       ($password ? "Temporary Password: {$password}\n" : "Please set your password via the provided reset flow.\n") .
       "You can now sign in to the SPCC Scheduler.";
@@ -209,10 +219,7 @@ try {
     $id = isset($_GET['id']) ? (int)$_GET['id'] : null;
 
     if ($id) {
-      $stmt = safe_prepare($conn,
-        "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
-         FROM users WHERE user_id = ? LIMIT 1"
-      );
+      $stmt = safe_prepare($conn, base_user_select() . " WHERE u.user_id = ? LIMIT 1");
       $stmt->bind_param('i', $id);
       $stmt->execute();
       $res = $stmt->get_result();
@@ -228,11 +235,8 @@ try {
     }
 
     $rows = [];
-    $res = $conn->query(
-      "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
-       FROM users
-       ORDER BY user_id DESC"
-    );
+    $sql = base_user_select() . " ORDER BY u.user_id DESC";
+    $res = $conn->query($sql);
     if (!$res) json_fail(500, "Query failed", ["error" => $conn->error]);
     while ($r = $res->fetch_assoc()) $rows[] = $r;
     echo json_encode($rows);
@@ -315,15 +319,7 @@ try {
         $conn->commit();
 
         // Return the (possibly updated) user
-        $stmt4 = safe_prepare($conn,
-          "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
-           FROM users WHERE user_id = ? LIMIT 1"
-        );
-        $stmt4->bind_param('i', $existingId);
-        $stmt4->execute();
-        $res4 = $stmt4->get_result();
-        $row = $res4->fetch_assoc();
-        $stmt4->close();
+        $row = findUserById($conn, $existingId);
 
         echo json_encode([
           "success" => true,
@@ -385,15 +381,7 @@ try {
         null
       );
 
-      $stmt4 = safe_prepare($conn,
-        "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
-         FROM users WHERE user_id = ? LIMIT 1"
-      );
-      $stmt4->bind_param('i', $newId);
-      $stmt4->execute();
-      $res4 = $stmt4->get_result();
-      $row = $res4->fetch_assoc();
-      $stmt4->close();
+      $row = findUserById($conn, $newId);
 
       echo json_encode([
         "success"    => true,
@@ -433,7 +421,7 @@ try {
     $newStatus       = isset($data['status']) ? trim((string)$data['status']) : null;
     $newRole         = isset($data['role']) ? trim((string)$data['role']) : null;
     $newEmail        = isset($data['email']) ? trim((string)$data['email']) : null;
-    $newUsername     = isset($data['username']) ? trim((string)$data['username']) : null; // not exposed in UI, but validated if sent
+    $newUsername     = isset($data['username']) ? trim((string)$data['username']) : null;
     $resetPassword   = isset($data['reset_password']) ? (bool)$data['reset_password'] : false;
 
     // Validate inputs
@@ -468,9 +456,9 @@ try {
       $params = [];
       $types = '';
 
-      if ($newStatus !== null) { $sets[] = "status = ?";   $params[] = $newStatus; $types .= 's'; }
-      if ($newRole   !== null) { $sets[] = "role = ?";     $params[] = $newRole;   $types .= 's'; }
-      if ($newEmail  !== null) { $sets[] = "email = ?";    $params[] = $newEmail;  $types .= 's'; }
+      if ($newStatus !== null)   { $sets[] = "status = ?";   $params[] = $newStatus;   $types .= 's'; }
+      if ($newRole   !== null)   { $sets[] = "role = ?";     $params[] = $newRole;     $types .= 's'; }
+      if ($newEmail  !== null)   { $sets[] = "email = ?";    $params[] = $newEmail;    $types .= 's'; }
       if ($newUsername !== null) { $sets[] = "username = ?"; $params[] = $newUsername; $types .= 's'; }
 
       $tempPassword = null;
@@ -498,7 +486,6 @@ try {
           "INSERT INTO school_heads (user_id, sh_name, sh_email, sh_phone, department)
            VALUES (?,?,?,?,?)"
         );
-        // We don't have name/phone/department in this endpoint; store minimal
         $blank = '';
         $emailForRow = $newEmail !== null ? $newEmail : $target['email'];
         $stmt2->bind_param('issss', $id, $blank, $emailForRow, $blank, $blank);
@@ -518,7 +505,7 @@ try {
 
       $conn->commit();
 
-      // Reload and return
+      // Reload with name
       $updated = findUserById($conn, $id);
 
       // Activity log
@@ -535,19 +522,25 @@ try {
       $payload = [
         "message" => $resetPassword ? "Password reset" : "User updated",
         "data"    => [
-          "id"        => (int)$updated['id'],
-          "username"  => $updated['username'],
-          "email"     => $updated['email'],
-          "role"      => $updated['role'],
-          "status"    => $updated['status'],
-          "last_login"=> null,
+          "id"         => (int)$updated['id'],
+          "username"   => $updated['username'],
+          "email"      => $updated['email'],
+          "name"       => $updated['name'],
+          "role"       => $updated['role'],
+          "status"     => $updated['status'],
+          "last_login" => null,
         ],
       ];
 
-      // Optionally email the new password (kept off by default if $NOEMAIL true)
+      // Optionally email the new password — now with the resolved name
       if ($resetPassword && !$NOEMAIL) {
-        // We don't have full name here; pass username as display
-        @send_account_email($updated['email'], $updated['username'], $updated['username'], $tempPassword, $updated['role']);
+        @send_account_email(
+          $updated['email'],
+          $updated['name'] ?: $updated['username'],
+          $updated['username'],
+          $tempPassword,
+          $updated['role']
+        );
         $payload["email_sent"] = true;
       }
 
