@@ -93,15 +93,20 @@ function findUserByEmail(mysqli $conn, string $email): ?array {
   return $row;
 }
 
-/** Username uniqueness check (case sensitive by default collation; adjust if needed) */
-function usernameExists(mysqli $conn, string $username, ?int $excludeId = null): bool {
-  $sql = "SELECT user_id FROM users WHERE username = ?" . ($excludeId ? " AND user_id <> ?" : "") . " LIMIT 1";
+/** Case-insensitive username lookup */
+function findUserByUsername(mysqli $conn, string $username): ?array {
+  $u = trim($username);
+  $sql = "SELECT user_id AS id, username, email, role, status
+          FROM users
+          WHERE LOWER(username) = LOWER(?)
+          LIMIT 1";
   $stmt = $conn->prepare($sql);
-  if ($excludeId) $stmt->bind_param('si', $username, $excludeId); else $stmt->bind_param('s', $username);
-  $stmt->execute(); $stmt->store_result();
-  $exists = $stmt->num_rows > 0;
+  $stmt->bind_param('s', $u);
+  $stmt->execute();
+  $res = $stmt->get_result();
+  $row = $res->fetch_assoc() ?: null;
   $stmt->close();
-  return $exists;
+  return $row;
 }
 
 function schoolHeadRowExists(mysqli $conn, int $userId): bool {
@@ -126,9 +131,10 @@ function adminRowExists(mysqli $conn, int $userId): bool {
 function send_account_email(string $toEmail, string $toName, string $username, ?string $password, string $role): bool {
   $mailer = new PHPMailer(true);
   try {
+    // TODO: move to environment/Hostinger secrets
     $smtpHost = 'smtp.gmail.com';
-    $smtpUser = 'ssassist028@gmail.com';
-    $smtpPass = 'qans jgft ggrl nplb';
+    $smtpUser = 'YOUR_GMAIL_APP_USER@example.com';
+    $smtpPass = 'YOUR_GMAIL_APP_PASSWORD';
     $smtpPort = '465';
     $fromEmail = 'no-reply@spcc.edu.ph';
     $fromName  = 'SPCC Scheduler';
@@ -216,7 +222,7 @@ try {
 
   /* ---------- POST /users.php[?upsert=1] ---------- */
   if ($method === 'POST') {
-    // Authorization via custom header (triggers preflight — already allowed by CORS above)
+    // Authorization via custom header (preflight allowed by CORS above)
     $reqRole = $_SERVER['HTTP_X_USER_ROLE'] ?? $_SERVER['HTTP_X_ROLE'] ?? '';
     if (!in_array($reqRole, ['super_admin', 'admin'], true)) {
       json_fail(403, "Only super_admin/admin can create users");
@@ -243,18 +249,24 @@ try {
       json_fail(403, "Admin can only create Academic Head");
     }
 
-    $existing = findUserByEmail($conn, $email);
+    // Duplicate checks (case-insensitive)
+    $existingByEmail    = findUserByEmail($conn, $email);
+    $existingByUsername = findUserByUsername($conn, $username);
+
+    // Username must be globally unique across all roles
+    if ($existingByUsername) {
+      json_fail(409, "Username already exists", ["existing_user" => $existingByUsername]);
+    }
 
     $finalPassword = $password !== '' ? $password : random_password(10);
 
     $conn->begin_transaction();
 
     try {
-      if ($existing && $UPSERT) {
-        // --- UPSERT: Update minimal fields on existing user
-        $existingId = (int)$existing['id'];
+      if ($existingByEmail && $UPSERT) {
+        // --- UPSERT path (email exists): update role/status and ensure detail rows
+        $existingId = (int)$existingByEmail['id'];
 
-        // Optionally update role/status
         $stmtU = safe_prepare($conn,
           "UPDATE users SET role = ?, status = ?, updated_at = NOW() WHERE user_id = ?"
         );
@@ -262,7 +274,6 @@ try {
         $stmtU->execute();
         $stmtU->close();
 
-        // Ensure detail row exists
         if ($role === 'acad_head' && !schoolHeadRowExists($conn, $existingId)) {
           $stmt2 = safe_prepare($conn,
             "INSERT INTO school_heads (user_id, sh_name, sh_email, sh_phone, department)
@@ -284,7 +295,7 @@ try {
 
         $conn->commit();
 
-        // Return current user row
+        // Return the (possibly updated) user
         $stmt4 = safe_prepare($conn,
           "SELECT user_id AS id, username, email, NULL AS name, role, status, NULL AS last_login
            FROM users WHERE user_id = ? LIMIT 1"
@@ -304,18 +315,13 @@ try {
         exit();
       }
 
-      // Strict create path (no upsert and email already exists)
-      if ($existing && !$UPSERT) {
+      // Strict create mode and email already exists -> 409 with details
+      if ($existingByEmail && !$UPSERT) {
         $conn->rollback();
-        json_fail(409, "Email already exists", ["existing_user" => $existing]);
+        json_fail(409, "Email already exists", ["existing_user" => $existingByEmail]);
       }
 
       // Create new user
-      if (usernameExists($conn, $username)) {
-        $conn->rollback();
-        json_fail(409, "Username already exists");
-      }
-
       $stmt = safe_prepare($conn,
         "INSERT INTO users (username, email, role, status, password, created_at, updated_at)
          VALUES (?,?,?,?,?,NOW(),NOW())"
