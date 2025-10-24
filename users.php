@@ -297,23 +297,64 @@ try {
         $stmtU->execute();
         $stmtU->close();
 
-        if ($role === 'acad_head' && !schoolHeadRowExists($conn, $existingId)) {
-          $stmt2 = safe_prepare($conn,
-            "INSERT INTO school_heads (user_id, sh_name, sh_email, sh_phone, department)
-             VALUES (?,?,?,?,?)"
-          );
-          $stmt2->bind_param('issss', $existingId, $name, $email, $phone, $department);
-          $stmt2->execute();
-          $stmt2->close();
+        // Ensure detail row exists AND update provided fields if present
+        if ($role === 'acad_head') {
+          if (!schoolHeadRowExists($conn, $existingId)) {
+            $stmt2 = safe_prepare($conn,
+              "INSERT INTO school_heads (user_id, sh_name, sh_email, sh_phone, department)
+               VALUES (?,?,?,?,?)"
+            );
+            $stmt2->bind_param('issss', $existingId, $name, $email, $phone, $department);
+            $stmt2->execute();
+            $stmt2->close();
+          } else {
+            $updates = [];
+            $typesU  = '';
+            $valsU   = [];
+            if ($name !== '')       { $updates[] = "sh_name = ?";   $typesU .= 's'; $valsU[] = $name; }
+            if ($email !== '')      { $updates[] = "sh_email = ?";  $typesU .= 's'; $valsU[] = $email; }
+            if ($phone !== '')      { $updates[] = "sh_phone = ?";  $typesU .= 's'; $valsU[] = $phone; }
+            if ($department !== '') { $updates[] = "department = ?";$typesU .= 's'; $valsU[] = $department; }
+
+            if (!empty($updates)) {
+              $sqlU = "UPDATE school_heads SET " . implode(', ', $updates) . " WHERE user_id = ?";
+              $stmtU = safe_prepare($conn, $sqlU);
+              $typesU .= 'i';
+              $valsU[] = $existingId;
+              $stmtU->bind_param($typesU, ...$valsU);
+              $stmtU->execute();
+              $stmtU->close();
+            }
+          }
         }
-        if ($role === 'admin' && !adminRowExists($conn, $existingId)) {
-          $stmt3 = safe_prepare($conn,
-            "INSERT INTO admins (user_id, full_name, contact_number, department)
-             VALUES (?,?,?,?)"
-          );
-          $stmt3->bind_param('isss', $existingId, $name, $phone, $department);
-          $stmt3->execute();
-          $stmt3->close();
+
+        if ($role === 'admin') {
+          if (!adminRowExists($conn, $existingId)) {
+            $stmt3 = safe_prepare($conn,
+              "INSERT INTO admins (user_id, full_name, contact_number, department)
+               VALUES (?,?,?,?)"
+            );
+            $stmt3->bind_param('isss', $existingId, $name, $phone, $department);
+            $stmt3->execute();
+            $stmt3->close();
+          } else {
+            $updates = [];
+            $typesU  = '';
+            $valsU   = [];
+            if ($name !== '')       { $updates[] = "full_name = ?";      $typesU .= 's'; $valsU[] = $name; }
+            if ($phone !== '')      { $updates[] = "contact_number = ?"; $typesU .= 's'; $valsU[] = $phone; }
+            if ($department !== '') { $updates[] = "department = ?";     $typesU .= 's'; $valsU[] = $department; }
+
+            if (!empty($updates)) {
+              $sqlU = "UPDATE admins SET " . implode(', ', $updates) . " WHERE user_id = ?";
+              $stmtU = safe_prepare($conn, $sqlU);
+              $typesU .= 'i';
+              $valsU[] = $existingId;
+              $stmtU->bind_param($typesU, ...$valsU);
+              $stmtU->execute();
+              $stmtU->close();
+            }
+          }
         }
 
         $conn->commit();
@@ -421,8 +462,13 @@ try {
     $newStatus       = isset($data['status']) ? trim((string)$data['status']) : null;
     $newRole         = isset($data['role']) ? trim((string)$data['role']) : null;
     $newEmail        = isset($data['email']) ? trim((string)$data['email']) : null;
-    $newUsername     = isset($data['username']) ? trim((string)$data['username']) : null;
+    $newUsername     = isset($data['username']) ? trim((string)$data['username']) : null; // optional
     $resetPassword   = isset($data['reset_password']) ? (bool)$data['reset_password'] : false;
+
+    // NEW: detail table fields that may be updated
+    $newName        = isset($data['name']) ? trim((string)$data['name']) : null;
+    $newDepartment  = isset($data['department']) ? trim((string)$data['department']) : null;
+    $newPhone       = isset($data['phone']) ? trim((string)$data['phone']) : null;
 
     // Validate inputs
     if ($newStatus !== null && !in_array($newStatus, ['active', 'inactive'], true)) {
@@ -456,10 +502,10 @@ try {
       $params = [];
       $types = '';
 
-      if ($newStatus !== null)   { $sets[] = "status = ?";   $params[] = $newStatus;   $types .= 's'; }
-      if ($newRole   !== null)   { $sets[] = "role = ?";     $params[] = $newRole;     $types .= 's'; }
-      if ($newEmail  !== null)   { $sets[] = "email = ?";    $params[] = $newEmail;    $types .= 's'; }
-      if ($newUsername !== null) { $sets[] = "username = ?"; $params[] = $newUsername; $types .= 's'; }
+      if ($newStatus !== null)     { $sets[] = "status = ?";   $params[] = $newStatus;     $types .= 's'; }
+      if ($newRole   !== null)     { $sets[] = "role = ?";     $params[] = $newRole;       $types .= 's'; }
+      if ($newEmail  !== null)     { $sets[] = "email = ?";    $params[] = $newEmail;      $types .= 's'; }
+      if ($newUsername !== null)   { $sets[] = "username = ?"; $params[] = $newUsername;   $types .= 's'; }
 
       $tempPassword = null;
       if ($resetPassword) {
@@ -479,28 +525,77 @@ try {
         $stmt->close();
       }
 
-      // If role changed, ensure detail rows exist
+      // If role changed or not, ensure detail row exists AND update provided fields
       $effectiveRole = $newRole !== null ? $newRole : $target['role'];
-      if ($effectiveRole === 'acad_head' && !schoolHeadRowExists($conn, $id)) {
-        $stmt2 = safe_prepare($conn,
-          "INSERT INTO school_heads (user_id, sh_name, sh_email, sh_phone, department)
-           VALUES (?,?,?,?,?)"
-        );
-        $blank = '';
-        $emailForRow = $newEmail !== null ? $newEmail : $target['email'];
-        $stmt2->bind_param('issss', $id, $blank, $emailForRow, $blank, $blank);
-        $stmt2->execute();
-        $stmt2->close();
+
+      if ($effectiveRole === 'acad_head') {
+        // Ensure row exists
+        if (!schoolHeadRowExists($conn, $id)) {
+          $stmt2 = safe_prepare($conn,
+            "INSERT INTO school_heads (user_id, sh_name, sh_email, sh_phone, department)
+             VALUES (?,?,?,?,?)"
+          );
+          $nameForRow   = $newName   !== null ? $newName   : '';
+          $emailForRow  = $newEmail  !== null ? $newEmail  : ($target['email'] ?? '');
+          $phoneForRow  = $newPhone  !== null ? $newPhone  : '';
+          $deptForRow   = $newDepartment !== null ? $newDepartment : '';
+          $stmt2->bind_param('issss', $id, $nameForRow, $emailForRow, $phoneForRow, $deptForRow);
+          $stmt2->execute();
+          $stmt2->close();
+        } else {
+          $updates = [];
+          $typesU  = '';
+          $valsU   = [];
+
+          if ($newName !== null)       { $updates[] = "sh_name = ?";   $typesU .= 's'; $valsU[] = $newName; }
+          if ($newEmail !== null)      { $updates[] = "sh_email = ?";  $typesU .= 's'; $valsU[] = $newEmail; }
+          if ($newPhone !== null)      { $updates[] = "sh_phone = ?";  $typesU .= 's'; $valsU[] = $newPhone; }
+          if ($newDepartment !== null) { $updates[] = "department = ?";$typesU .= 's'; $valsU[] = $newDepartment; }
+
+          if (!empty($updates)) {
+            $sqlU = "UPDATE school_heads SET " . implode(', ', $updates) . " WHERE user_id = ?";
+            $stmtU = safe_prepare($conn, $sqlU);
+            $typesU .= 'i';
+            $valsU[] = $id;
+            $stmtU->bind_param($typesU, ...$valsU);
+            $stmtU->execute();
+            $stmtU->close();
+          }
+        }
       }
-      if ($effectiveRole === 'admin' && !adminRowExists($conn, $id)) {
-        $stmt3 = safe_prepare($conn,
-          "INSERT INTO admins (user_id, full_name, contact_number, department)
-           VALUES (?,?,?,?)"
-        );
-        $blank = '';
-        $stmt3->bind_param('isss', $id, $blank, $blank, $blank);
-        $stmt3->execute();
-        $stmt3->close();
+
+      if ($effectiveRole === 'admin') {
+        // Ensure row exists
+        if (!adminRowExists($conn, $id)) {
+          $stmt3 = safe_prepare($conn,
+            "INSERT INTO admins (user_id, full_name, contact_number, department)
+             VALUES (?,?,?,?)"
+          );
+          $nameForRow  = $newName   !== null ? $newName   : '';
+          $phoneForRow = $newPhone  !== null ? $newPhone  : '';
+          $deptForRow  = $newDepartment !== null ? $newDepartment : '';
+          $stmt3->bind_param('isss', $id, $nameForRow, $phoneForRow, $deptForRow);
+          $stmt3->execute();
+          $stmt3->close();
+        } else {
+          $updates = [];
+          $typesU  = '';
+          $valsU   = [];
+
+          if ($newName !== null)       { $updates[] = "full_name = ?";      $typesU .= 's'; $valsU[] = $newName; }
+          if ($newPhone !== null)      { $updates[] = "contact_number = ?"; $typesU .= 's'; $valsU[] = $newPhone; }
+          if ($newDepartment !== null) { $updates[] = "department = ?";     $typesU .= 's'; $valsU[] = $newDepartment; }
+
+          if (!empty($updates)) {
+            $sqlU = "UPDATE admins SET " . implode(', ', $updates) . " WHERE user_id = ?";
+            $stmtU = safe_prepare($conn, $sqlU);
+            $typesU .= 'i';
+            $valsU[] = $id;
+            $stmtU->bind_param($typesU, ...$valsU);
+            $stmtU->execute();
+            $stmtU->close();
+          }
+        }
       }
 
       $conn->commit();
