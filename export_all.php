@@ -251,87 +251,68 @@ try {
 /* ---------- Report: Student Count per Strand (per School Year) ---------- */
 $studentCounts = [];
 
-if (
-  $colExists($conn, 'students', 'student_id') || $colExists($conn, 'students', 'id') || $colExists($conn, 'students', 'section_id')
-) {
-  $stuStrandCol  = $firstExisting($conn, 'students',  ['strand','track','program','course_strand']);
-  $stuSectionCol = $firstExisting($conn, 'students',  ['section_id','sec_id','section']);
-  $stuSyCol      = $firstExisting($conn, 'students',  ['school_year','sy']);
+$secStrandCol     = $firstExisting($conn, 'sections', ['strand','strand_name','track','track_name','program','course','course_strand']);
+$secYearLevelCol  = $firstExisting($conn, 'sections', ['year_level','grade_level','grade','year','level','yr_level']);
+$secSyCol         = $firstExisting($conn, 'sections', ['school_year','sy','schoolYear','schoolyear']);
+$secNumStudCol    = $firstExisting($conn, 'sections', ['number_of_students','no_of_students','num_students','students_count','total_students','headcount','population','enrolment','enrollment']);
 
-  $secPKRpt      = $firstExisting($conn, 'sections',  ['section_id','id']);
-  $secSyCol      = $firstExisting($conn, 'sections',  ['school_year','sy']);
+$canComputeFromSections = ($secNumStudCol !== null);  
 
-  // Need a strand source to report by strand
-  if ($stuStrandCol) {
-    // Build FROM/JOIN depending on where the school_year lives
-    $fromJoin = "FROM students st";
-    $whereParts = [];
+if ($canComputeFromSections) {
+  $fromJoin   = "FROM sections sec";
+  $whereParts = [];
 
-    if ($stuSyCol) {
-      $whereParts[] = "st.`$stuSyCol` = '".$esc($sy)."'";
-    } elseif ($stuSectionCol && $secPKRpt && $secSyCol) {
-      $fromJoin .= " LEFT JOIN sections sec ON sec.`$secPKRpt` = st.`$stuSectionCol`";
-      $whereParts[] = "sec.`$secSyCol` = '".$esc($sy)."'";
-    }
-
-    $reportWhere = count($whereParts) ? (' WHERE '.implode(' AND ', $whereParts)) : '';
-
-    $sql = "
-      SELECT
-        COALESCE(NULLIF(TRIM(st.`$stuStrandCol`),''), 'Unspecified') AS strand,
-        COUNT(*) AS student_count
-      $fromJoin
-      $reportWhere
-      GROUP BY 1
-      ORDER BY 1
-    ";
-    $studentCounts = $qAll($conn, $sql, 'report_students_strand_only');
-
-    // Normalize & add explicit school_year column to the sheet
-    $studentCounts = array_map(function($r) use ($sy) {
-      return [
-        'school_year'   => $sy,
-        'strand'        => $r['strand'] ?? 'Unspecified',
-        'student_count' => (int)($r['student_count'] ?? 0),
-      ];
-    }, $studentCounts);
+  if ($secSyCol) {
+    $whereParts[] = "sec.`$secSyCol` = '".$esc($sy)."'";
   } else {
-    // No strand column on students — try via sections if sections carry a strand-like field
-    $secStrandCol = $firstExisting($conn, 'sections',  ['strand','track','program']);
-
-    if ($stuSectionCol && $secPKRpt && $secStrandCol) {
-      $fromJoin = "FROM students st LEFT JOIN sections sec ON sec.`$secPKRpt` = st.`$stuSectionCol`";
-
-      $whereParts = [];
-      if ($secSyCol) {
-        $whereParts[] = "sec.`$secSyCol` = '".$esc($sy)."'";
-      } elseif ($stuSyCol) {
-        $whereParts[] = "st.`$stuSyCol` = '".$esc($sy)."'";
-      }
-      $reportWhere = count($whereParts) ? (' WHERE '.implode(' AND ', $whereParts)) : '';
-
-      $sql = "
-        SELECT
-          COALESCE(NULLIF(TRIM(sec.`$secStrandCol`),''), 'Unspecified') AS strand,
-          COUNT(*) AS student_count
-        $fromJoin
-        $reportWhere
-        GROUP BY 1
-        ORDER BY 1
-      ";
-      $studentCounts = $qAll($conn, $sql, 'report_students_strand_via_sections');
-
-      $studentCounts = array_map(function($r) use ($sy) {
-        return [
-          'school_year'   => $sy,
-          'strand'        => $r['strand'] ?? 'Unspecified',
-          'student_count' => (int)($r['student_count'] ?? 0),
-        ];
-      }, $studentCounts);
-    } else {
-      $studentCounts = []; // cannot compute strand totals with available schema
-    }
   }
+
+  $reportWhere = count($whereParts) ? (' WHERE '.implode(' AND ', $whereParts)) : '';
+
+  // Build select pieces with safe fallbacks
+  $strandExpr    = $secStrandCol
+    ? "COALESCE(NULLIF(TRIM(sec.`$secStrandCol`),''), 'Unspecified')"
+    : "'Unspecified'";
+  $yearLevelExpr = $secYearLevelCol
+    ? "COALESCE(NULLIF(TRIM(sec.`$secYearLevelCol`),''), 'Unspecified')"
+    : "'Unspecified'";
+
+  // For robustness, coerce possibly-text numbers by adding + 0
+  $sumExpr = "SUM( (CASE WHEN TRIM(COALESCE(sec.`$secNumStudCol`, '')) = '' THEN 0 ELSE sec.`$secNumStudCol` END) + 0 )";
+
+  $sql = "
+    SELECT
+      $strandExpr       AS strand,
+      $yearLevelExpr    AS year_level,
+      $sumExpr          AS student_count
+    $fromJoin
+    $reportWhere
+    GROUP BY 1, 2
+    ORDER BY 1, 2
+  ";
+
+  // Log the exact SQL used for debugging
+  log_line('REPORT_SECTIONS_STUDENTCOUNTS_SQL', ['sql' => $sql]);
+
+  $rows = $qAll($conn, $sql, 'report_sections_strand_yearlevel');
+
+  // Normalize output & attach requested school_year for the sheet
+  $studentCounts = array_map(function($r) use ($sy) {
+    return [
+      'school_year'   => $sy,
+      'strand'        => (string)($r['strand'] ?? 'Unspecified'),
+      'year_level'    => (string)($r['year_level'] ?? 'Unspecified'),
+      'student_count' => (int)($r['student_count'] ?? 0),
+    ];
+  }, $rows);
+
+} else {
+  // No numeric students column on sections → cannot compute as requested
+  log_line('REPORT_SECTIONS_STUDENTCOUNTS_SKIPPED', [
+    'reason' => 'sections.number_of_students-like column not found',
+    'candidates_checked' => ['number_of_students','no_of_students','num_students','students_count','total_students','headcount','population','enrolment','enrollment'],
+  ]);
+  $studentCounts = []; // leave empty; the sheet will show "No data"
 }
 
 
