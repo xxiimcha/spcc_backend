@@ -1,4 +1,6 @@
 <?php
+declare(strict_types=1);
+
 include 'cors_helper.php';
 
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'OPTIONS') {
@@ -32,30 +34,30 @@ try {
     exit();
   }
 
-  $prof_id = (int)($data['prof_id'] ?? 0);
-  if ($prof_id <= 0) {
+  // NOTE: Frontend sends prof_id but it is actually users.user_id
+  $user_id = (int)($data['user_id'] ?? $data['prof_id'] ?? 0);
+  if ($user_id <= 0) {
     http_response_code(400);
-    echo json_encode(['success' => false, 'message' => 'Missing prof_id']);
+    echo json_encode(['success' => false, 'message' => 'Missing user_id (or prof_id)']);
     exit();
   }
 
-  // Find linked user_id
-  $res = mysqli_query($conn, "SELECT user_id FROM professors WHERE prof_id = $prof_id LIMIT 1");
+  // Find the linked professor row via user_id
+  $res = mysqli_query($conn, "SELECT prof_id FROM professors WHERE user_id = $user_id LIMIT 1");
   if (!$res || mysqli_num_rows($res) === 0) {
     http_response_code(404);
-    echo json_encode(['success' => false, 'message' => 'Professor not found']);
+    echo json_encode(['success' => false, 'message' => 'Professor not found for this user_id']);
     exit();
   }
-  $user_id = (int)mysqli_fetch_assoc($res)['user_id'];
+  $prof_id = (int)mysqli_fetch_assoc($res)['prof_id'];
 
-  // Sanitize inputs
+  // Sanitize inputs (empty string => treat as "no change")
   $name     = mysqli_real_escape_string($conn, trim((string)($data['name'] ?? '')));
   $email    = mysqli_real_escape_string($conn, trim((string)($data['email'] ?? '')));
   $phone    = mysqli_real_escape_string($conn, trim((string)($data['phone'] ?? '')));
   $username = mysqli_real_escape_string($conn, trim((string)($data['username'] ?? '')));
   $password = mysqli_real_escape_string($conn, trim((string)($data['password'] ?? ''))); // plain text as requested
 
-  // Build update sets
   $prof_sets = [];
   if ($name     !== '') $prof_sets[] = "prof_name = '$name'";
   if ($email    !== '') $prof_sets[] = "prof_email = '$email'";
@@ -67,7 +69,6 @@ try {
   if ($email    !== '') $user_sets[] = "email = '$email'";
   if ($username !== '') $user_sets[] = "username = '$username'";
   if ($password !== '') $user_sets[] = "password = '$password'";
-  // keep roles/status untouched
 
   if (empty($prof_sets) && empty($user_sets)) {
     echo json_encode(['success' => false, 'message' => 'No changes detected']);
@@ -77,7 +78,7 @@ try {
   mysqli_begin_transaction($conn);
 
   if (!empty($prof_sets)) {
-    $sql_prof = "UPDATE professors SET " . implode(', ', $prof_sets) . " WHERE user_id = $prof_id";
+    $sql_prof = "UPDATE professors SET " . implode(', ', $prof_sets) . " WHERE prof_id = $prof_id";
     if (!mysqli_query($conn, $sql_prof)) {
       mysqli_rollback($conn);
       http_response_code(500);
