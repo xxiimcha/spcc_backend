@@ -1,6 +1,5 @@
 <?php
 include 'cors_helper.php';
-handleCORS();
 
 include 'connect.php';
 include 'activity_logger.php';
