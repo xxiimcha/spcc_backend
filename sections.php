@@ -39,10 +39,16 @@ function parseSubjectIds(?string $raw): array {
 
 $method = $_SERVER['REQUEST_METHOD'];
 
+/** NEW: parse expansions */
+$with = [];
+if (isset($_GET['with'])) {
+  $with = array_values(array_filter(array_map('trim', explode(',', (string)$_GET['with']))));
+}
+
 switch ($method) {
   case 'GET':
-    if (isset($_GET['id'])) { getSection($conn, (int)$_GET['id']); }
-    else { getAllSections($conn); }
+    if (isset($_GET['id'])) { getSection($conn, (int)$_GET['id'], $with); }
+    else { getAllSections($conn, $with); }
     break;
 
   case 'POST':
@@ -68,7 +74,7 @@ switch ($method) {
     break;
 }
 
-function getAllSections(mysqli $conn): void {
+function getAllSections(mysqli $conn, array $with = []): void {
   $requestedSY = isset($_GET['school_year']) ? trim((string)$_GET['school_year']) : '';
   $currentSY   = ss_get_current_school_year($conn);
 
@@ -109,11 +115,55 @@ function getAllSections(mysqli $conn): void {
     ];
   }
 
+  /** NEW: optional expansion for subjects on list endpoint */
+  if (in_array('subjects', $with, true) && !empty($sections)) {
+    // Collect unique subject ids
+    $allIds = [];
+    foreach ($sections as $s) {
+      foreach (($s['subject_ids'] ?? []) as $sid) {
+        $allIds[$sid] = true;
+      }
+    }
+    if (!empty($allIds)) {
+      $idsFlat = implode(',', array_map('intval', array_keys($allIds)));
+      $subjSql = "SELECT subj_id, subj_code, subj_name, subj_description, subj_units, subj_type, hours_per_week, grade_level, strand
+                  FROM subjects
+                  WHERE subj_id IN ($idsFlat)";
+      $map = [];
+      $subjRes = $conn->query($subjSql);
+      while ($s = $subjRes->fetch_assoc()) {
+        $map[(int)$s['subj_id']] = [
+          'id'            => (int)$s['subj_id'],
+          'code'          => (string)($s['subj_code'] ?? ''),
+          'name'          => (string)($s['subj_name'] ?? ''),
+          'description'   => $s['subj_description'] ?? null,
+          'units'         => isset($s['subj_units']) ? (int)$s['subj_units'] : null,
+          'type'          => $s['subj_type'] ?? null,
+          'hoursPerWeek'  => isset($s['hours_per_week']) ? (int)$s['hours_per_week'] : null,
+          'gradeLevel'    => $s['grade_level'] ?? null,
+          'strand'        => $s['strand'] ?? null,
+        ];
+      }
+      // Attach per section in the same order as subject_ids
+      foreach ($sections as &$sec) {
+        $sec['subjects'] = [];
+        foreach (($sec['subject_ids'] ?? []) as $sid) {
+          if (isset($map[(int)$sid])) $sec['subjects'][] = $map[(int)$sid];
+        }
+      }
+      unset($sec);
+    } else {
+      // Ensure key exists even if empty
+      foreach ($sections as &$sec) { $sec['subjects'] = []; }
+      unset($sec);
+    }
+  }
+
   @log_activity($conn, 'sections', 'read', 'Listed sections (count='.count($sections).', filter='.$requestedSY.')', null, null);
   ok(["success"=>true,"data"=>$sections,"current_school_year"=>$currentSY,"applied_school_year"=>$requestedSY===''?'(none)':$requestedSY]);
 }
 
-function getSection(mysqli $conn, int $id): void {
+function getSection(mysqli $conn, int $id, array $with = []): void {
   $sql = "SELECT s.*,
           (SELECT COUNT(*) FROM schedules WHERE section_id = s.section_id) AS schedule_count,
           GROUP_CONCAT(DISTINCT r.room_id, ':', r.room_number, ':', r.room_type, ':', r.room_capacity) AS rooms,
@@ -142,6 +192,33 @@ function getSection(mysqli $conn, int $id): void {
     'subject_ids'        => parseSubjectIds($row['subject_ids'] ?? null),
     'school_year'        => $row['school_year'] ?? null,
   ];
+
+  /** NEW: expand assigned subjects when requested */
+  if (in_array('subjects', $with, true)) {
+    $ids = $section['subject_ids'];
+    $subjects = [];
+    if (!empty($ids)) {
+      $in = implode(',', array_map('intval', $ids));
+      $subjSql = "SELECT subj_id, subj_code, subj_name, subj_description, subj_units, subj_type, hours_per_week, grade_level, strand
+                  FROM subjects
+                  WHERE subj_id IN ($in)";
+      $subjRes = $conn->query($subjSql);
+      while ($s = $subjRes->fetch_assoc()) {
+        $subjects[] = [
+          'id'            => (int)$s['subj_id'],
+          'code'          => (string)($s['subj_code'] ?? ''),
+          'name'          => (string)($s['subj_name'] ?? ''),
+          'description'   => $s['subj_description'] ?? null,
+          'units'         => isset($s['subj_units']) ? (int)$s['subj_units'] : null,
+          'type'          => $s['subj_type'] ?? null,
+          'hoursPerWeek'  => isset($s['hours_per_week']) ? (int)$s['hours_per_week'] : null,
+          'gradeLevel'    => $s['grade_level'] ?? null,
+          'strand'        => $s['strand'] ?? null,
+        ];
+      }
+    }
+    $section['subjects'] = $subjects; // may be empty
+  }
 
   $schedules_sql = "SELECT s.*, subj.subj_code, subj.subj_name,
                     p.prof_name AS professor_name, p.subj_count AS professor_subject_count,
