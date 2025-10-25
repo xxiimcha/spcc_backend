@@ -1,11 +1,5 @@
 <?php
-// get_subject_professors.php
-
-header("Access-Control-Allow-Origin: *");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With");
-header("Access-Control-Allow-Methods: GET, OPTIONS");
-header("Content-Type: application/json; charset=UTF-8");
-
+include 'cors_helper.php';
 include 'connect.php';
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
