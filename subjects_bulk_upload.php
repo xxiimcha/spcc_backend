@@ -1,9 +1,5 @@
 <?php
-require_once __DIR__ . '/cors_helper.php';
-handleCORS();
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(204); exit; }
-
-header('Content-Type: application/json; charset=utf-8');
+include 'cors_helper.php';
 
 require_once __DIR__ . '/connect.php';
 require_once __DIR__ . '/system_settings_helper.php';
