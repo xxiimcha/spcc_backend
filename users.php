@@ -27,9 +27,6 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'OPTIONS') {
   exit();
 }
 
-/* =========================
-   Includes / Setup
-   ========================= */
 ini_set('display_errors', '0'); // prod safe
 ini_set('log_errors', '1');
 
@@ -162,8 +159,8 @@ function send_account_email(string $toEmail, string $toName, string $username, ?
   try {
     // TODO: move to environment/Hostinger secrets
     $smtpHost = 'smtp.gmail.com';
-    $smtpUser = 'YOUR_GMAIL_APP_USER@example.com';
-    $smtpPass = 'YOUR_GMAIL_APP_PASSWORD';
+    $smtpUser = 'ssassist028@gmail.com';
+    $smtpPass = 'qans jgft ggrl nplb';
     $smtpPort = '465';
     $fromEmail = 'no-reply@spcc.edu.ph';
     $fromName  = 'SPCC Scheduler';
