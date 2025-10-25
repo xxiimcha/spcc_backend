@@ -1,31 +1,5 @@
 <?php
-declare(strict_types=1);
-
-/* =========================
-   CORS (must be FIRST)
-   ========================= */
-$origin  = $_SERVER['HTTP_ORIGIN'] ?? '';
-$allowed = [
-  'http://localhost:5173',
-  'http://127.0.0.1:5173',
-  'https://spcc-smartsched.vercel.app',
-  'https://spcc-scheduler.site',
-  'https://www.spcc-scheduler.site',
-];
-if ($origin && in_array($origin, $allowed, true)) {
-  header("Access-Control-Allow-Origin: {$origin}");
-  header("Vary: Origin");
-  header("Access-Control-Allow-Credentials: true");
-}
-header("Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, X-User-Role, X-Role");
-header("Access-Control-Max-Age: 86400");
-header("Content-Type: application/json; charset=utf-8");
-
-if (($_SERVER['REQUEST_METHOD'] ?? '') === 'OPTIONS') {
-  http_response_code(204);
-  exit();
-}
+include 'cors_helper.php';
 
 ini_set('display_errors', '0'); // prod safe
 ini_set('log_errors', '1');
@@ -36,6 +10,11 @@ require_once __DIR__ . '/activity_logger.php';
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\Exception;
 require __DIR__ . '/vendor/autoload.php';
+
+/* Sessions are required to identify current user for update_self */
+if (session_status() !== PHP_SESSION_ACTIVE) {
+  session_start();
+}
 
 $DEBUG   = isset($_GET['debug'])   && $_GET['debug']   === '1';
 $NOEMAIL = isset($_GET['noemail']) && $_GET['noemail'] === '1';
@@ -208,11 +187,12 @@ function send_account_email(string $toEmail, string $toName, string $username, ?
    Router
    ========================= */
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+$action = $_GET['action'] ?? '';
 
 try {
 
   /* ---------- GET /users.php or /users.php?id=XX ---------- */
-  if ($method === 'GET') {
+  if ($method === 'GET' && $action === '') {
     $id = isset($_GET['id']) ? (int)$_GET['id'] : null;
 
     if ($id) {
@@ -240,8 +220,175 @@ try {
     exit();
   }
 
+  /* ==========================================================
+     ==== SELF UPDATE (action=update_self) — POST only ========
+     ========================================================== */
+  if ($method === 'POST' && $action === 'update_self') {
+    // Must be logged in via PHP session
+    $selfId = (int)($_SESSION['user_id'] ?? 0);
+    if ($selfId <= 0) json_fail(401, "Not authenticated");
+
+    $current = findUserById($conn, $selfId);
+    if (!$current) json_fail(404, "User not found");
+
+    $data = read_json_body();
+
+    $name       = isset($data['name']) ? trim((string)$data['name']) : null;
+    $email      = isset($data['email']) ? trim((string)$data['email']) : null;
+    $username   = isset($data['username']) ? trim((string)$data['username']) : null;
+    $password   = isset($data['password']) ? (string)$data['password'] : null; // optional
+    $department = isset($data['department']) ? trim((string)$data['department']) : null; // optional
+    $phone      = isset($data['phone']) ? trim((string)$data['phone']) : null; // optional
+
+    // Minimal validation
+    if ($name !== null && $name === '')       json_fail(400, "Name is required");
+    if ($email !== null && $email === '')     json_fail(400, "Email is required");
+    if ($username !== null && $username === '') json_fail(400, "Username is required");
+
+    // Uniqueness checks if changed
+    if ($username !== null && strtolower($username) !== strtolower($current['username'])) {
+      $du = findUserByUsername($conn, $username);
+      if ($du && (int)$du['id'] !== $selfId) {
+        json_fail(409, "Username already exists", ["existing_user" => $du]);
+      }
+    }
+    if ($email !== null && strtolower($email) !== strtolower($current['email'])) {
+      $de = findUserByEmail($conn, $email);
+      if ($de && (int)$de['id'] !== $selfId) {
+        json_fail(409, "Email already exists", ["existing_user" => $de]);
+      }
+    }
+
+    $conn->begin_transaction();
+    try {
+      // Update users table dynamically
+      $sets = [];
+      $params = [];
+      $types = '';
+
+      if ($email !== null)    { $sets[] = "email = ?";    $params[] = $email;    $types .= 's'; }
+      if ($username !== null) { $sets[] = "username = ?"; $params[] = $username; $types .= 's'; }
+      if ($password !== null && $password !== '') {
+        // Store as-is (no hashing) per your current policy
+        $sets[] = "password = ?";
+        $params[] = $password;
+        $types .= 's';
+      }
+      if (!empty($sets)) {
+        $sql = "UPDATE users SET " . implode(', ', $sets) . ", updated_at = NOW() WHERE user_id = ?";
+        $stmt = safe_prepare($conn, $sql);
+        $types .= 'i';
+        $params[] = $selfId;
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $stmt->close();
+      }
+
+      // Update name/phone/department in role-specific table
+      $role = strtolower($current['role']);
+      if ($role === 'admin') {
+        if (!adminRowExists($conn, $selfId)) {
+          $stmtA = safe_prepare($conn,
+            "INSERT INTO admins (user_id, full_name, contact_number, department)
+             VALUES (?,?,?,?)"
+          );
+          $fullName = $name ?? ($current['name'] ?? '');
+          $ph = $phone ?? '';
+          $dept = $department ?? '';
+          $stmtA->bind_param('isss', $selfId, $fullName, $ph, $dept);
+          $stmtA->execute();
+          $stmtA->close();
+        } else {
+          $updates = [];
+          $typesU  = '';
+          $valsU   = [];
+          if ($name !== null)       { $updates[] = "full_name = ?";      $typesU .= 's'; $valsU[] = $name; }
+          if ($phone !== null)      { $updates[] = "contact_number = ?"; $typesU .= 's'; $valsU[] = $phone; }
+          if ($department !== null) { $updates[] = "department = ?";     $typesU .= 's'; $valsU[] = $department; }
+
+          if (!empty($updates)) {
+            $sqlU = "UPDATE admins SET " . implode(', ', $updates) . " WHERE user_id = ?";
+            $stmtU = safe_prepare($conn, $sqlU);
+            $typesU .= 'i';
+            $valsU[] = $selfId;
+            $stmtU->bind_param($typesU, ...$valsU);
+            $stmtU->execute();
+            $stmtU->close();
+          }
+        }
+      } elseif ($role === 'acad_head') {
+        if (!schoolHeadRowExists($conn, $selfId)) {
+          $stmtS = safe_prepare($conn,
+            "INSERT INTO school_heads (user_id, sh_name, sh_email, sh_phone, department)
+             VALUES (?,?,?,?,?)"
+          );
+          $n  = $name   ?? ($current['name'] ?? '');
+          $em = $email  ?? ($current['email'] ?? '');
+          $ph = $phone  ?? '';
+          $dp = $department ?? '';
+          $stmtS->bind_param('issss', $selfId, $n, $em, $ph, $dp);
+          $stmtS->execute();
+          $stmtS->close();
+        } else {
+          $updates = [];
+          $typesU  = '';
+          $valsU   = [];
+          if ($name !== null)       { $updates[] = "sh_name = ?";   $typesU .= 's'; $valsU[] = $name; }
+          if ($email !== null)      { $updates[] = "sh_email = ?";  $typesU .= 's'; $valsU[] = $email; }
+          if ($phone !== null)      { $updates[] = "sh_phone = ?";  $typesU .= 's'; $valsU[] = $phone; }
+          if ($department !== null) { $updates[] = "department = ?";$typesU .= 's'; $valsU[] = $department; }
+
+          if (!empty($updates)) {
+            $sqlU = "UPDATE school_heads SET " . implode(', ', $updates) . " WHERE user_id = ?";
+            $stmtU = safe_prepare($conn, $sqlU);
+            $typesU .= 'i';
+            $valsU[] = $selfId;
+            $stmtU->bind_param($typesU, ...$valsU);
+            $stmtU->execute();
+            $stmtU->close();
+          }
+        }
+      }
+
+      $conn->commit();
+
+      // Reload updated profile
+      $updated = findUserById($conn, $selfId);
+
+      // Optional: keep session in sync with changed username/email
+      if ($username !== null) $_SESSION['username'] = $updated['username'];
+      if ($email !== null)    $_SESSION['email']    = $updated['email'];
+
+      log_activity(
+        $conn,
+        'users',
+        'update_self',
+        "User self-updated id={$selfId}",
+        $selfId,
+        null
+      );
+
+      json_ok([
+        "message" => "Profile updated",
+        "data" => [
+          "id"         => (int)$updated['id'],
+          "username"   => $updated['username'],
+          "email"      => $updated['email'],
+          "name"       => $updated['name'],
+          "role"       => $updated['role'],
+          "status"     => $updated['status'],
+          "last_login" => null,
+        ],
+      ]);
+    } catch (Exception $e) {
+      $conn->rollback();
+      if ($DEBUG) json_fail(500, $e->getMessage(), ["trace" => $e->getTraceAsString()]);
+      json_fail(500, "Self update failed");
+    }
+  }
+
   /* ---------- POST /users.php[?upsert=1] ---------- */
-  if ($method === 'POST') {
+  if ($method === 'POST' && $action === '') {
     // Authorization via custom header (preflight allowed by CORS above)
     $reqRole = $_SERVER['HTTP_X_USER_ROLE'] ?? $_SERVER['HTTP_X_ROLE'] ?? '';
     if (!in_array($reqRole, ['super_admin', 'admin'], true)) {
@@ -432,13 +579,13 @@ try {
 
     } catch (Exception $e) {
       $conn->rollback();
-      if ($GLOBALS['DEBUG']) json_fail(500, $e->getMessage(), ["trace" => $e->getTraceAsString()]);
+      if ($DEBUG) json_fail(500, $e->getMessage(), ["trace" => $e->getTraceAsString()]);
       json_fail(500, "Create failed");
     }
   }
 
-  /* ---------- PUT /users.php?id=XX ---------- */
-  if ($method === 'PUT' || $method === 'PATCH') {
+  /* ---------- PUT/PATCH /users.php?id=XX ---------- */
+  if (($method === 'PUT' || $method === 'PATCH') && $action === '') {
     $reqRole = $_SERVER['HTTP_X_USER_ROLE'] ?? $_SERVER['HTTP_X_ROLE'] ?? '';
     if (!in_array($reqRole, ['super_admin', 'admin'], true)) {
       json_fail(403, "Only super_admin/admin can update users");
@@ -601,11 +748,11 @@ try {
       $updated = findUserById($conn, $id);
 
       // Activity log
-      $action = $resetPassword ? 'reset_password' : 'update';
+      $actionName = $resetPassword ? 'reset_password' : 'update';
       log_activity(
         $conn,
         'users',
-        $action,
+        $actionName,
         ($resetPassword ? "Password reset for user id={$id}" : "Updated user id={$id}"),
         $id,
         null
@@ -639,7 +786,7 @@ try {
       json_ok($payload);
     } catch (Exception $e) {
       $conn->rollback();
-      if ($GLOBALS['DEBUG']) json_fail(500, $e->getMessage(), ["trace" => $e->getTraceAsString()]);
+      if ($DEBUG) json_fail(500, $e->getMessage(), ["trace" => $e->getTraceAsString()]);
       json_fail(500, "Update failed");
     }
   }
