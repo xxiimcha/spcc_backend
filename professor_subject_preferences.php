@@ -13,19 +13,24 @@ header('Content-Type: application/json; charset=utf-8');
 include __DIR__ . '/connect.php';
 if (!isset($conn) || !($conn instanceof mysqli)) {
   http_response_code(500);
-  echo json_encode(["status"=>"error","message"=>"Database connection not available"]);
+  echo json_encode(["status" => "error", "message" => "Database connection not available"]);
   exit();
 }
 mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
 
-/** Resolve professor id from prof_id or user_id */
+/**
+ * Resolve professor id from prof_id or user_id (works with either)
+ */
 function resolve_prof_id(mysqli $conn, int $prof_id_in, int $user_id_in): int {
   if ($prof_id_in > 0) {
     $q = $conn->prepare("SELECT prof_id FROM professors WHERE prof_id = ? LIMIT 1");
     $q->bind_param("i", $prof_id_in);
     $q->execute();
     $r = $q->get_result();
-    if ($row = $r->fetch_assoc()) { $q->close(); return (int)$row['prof_id']; }
+    if ($row = $r->fetch_assoc()) {
+      $q->close();
+      return (int)$row['prof_id'];
+    }
     $q->close();
   }
 
@@ -34,17 +39,23 @@ function resolve_prof_id(mysqli $conn, int $prof_id_in, int $user_id_in): int {
     $q->bind_param("i", $user_id_in);
     $q->execute();
     $r = $q->get_result();
-    if ($row = $r->fetch_assoc()) { $q->close(); return (int)$row['prof_id']; }
+    if ($row = $r->fetch_assoc()) {
+      $q->close();
+      return (int)$row['prof_id'];
+    }
     $q->close();
   }
 
-  // try swapped
+  // fallback: maybe swapped
   if ($prof_id_in > 0) {
     $q = $conn->prepare("SELECT prof_id FROM professors WHERE user_id = ? LIMIT 1");
     $q->bind_param("i", $prof_id_in);
     $q->execute();
     $r = $q->get_result();
-    if ($row = $r->fetch_assoc()) { $q->close(); return (int)$row['prof_id']; }
+    if ($row = $r->fetch_assoc()) {
+      $q->close();
+      return (int)$row['prof_id'];
+    }
     $q->close();
   }
 
@@ -53,6 +64,9 @@ function resolve_prof_id(mysqli $conn, int $prof_id_in, int $user_id_in): int {
 
 $method = $_SERVER['REQUEST_METHOD'];
 
+/* ===========================================================
+   GET: Fetch subject preferences
+   =========================================================== */
 if ($method === 'GET') {
   $prof_id_in = isset($_GET['prof_id']) ? (int)$_GET['prof_id'] : 0;
   $user_id_in = isset($_GET['user_id']) ? (int)$_GET['user_id'] : 0;
@@ -60,16 +74,16 @@ if ($method === 'GET') {
   $prof_id = resolve_prof_id($conn, $prof_id_in, $user_id_in);
   if ($prof_id <= 0) {
     http_response_code(404);
-    echo json_encode(["status"=>"error","message"=>"Professor not found (provide prof_id or user_id)"]);
+    echo json_encode(["status" => "error", "message" => "Professor not found (provide prof_id or user_id)"]);
     exit();
   }
 
-  $res = $conn->prepare(
-    "SELECT prof_id, subj_id, proficiency, willingness
-     FROM professor_subject_preferences
-     WHERE prof_id = ?
-     ORDER BY subj_id"
-  );
+  $res = $conn->prepare("
+    SELECT prof_id, subj_id, proficiency, willingness
+    FROM professor_subject_preferences
+    WHERE prof_id = ?
+    ORDER BY subj_id
+  ");
   $res->bind_param("i", $prof_id);
   $res->execute();
   $result = $res->get_result();
@@ -85,10 +99,13 @@ if ($method === 'GET') {
   }
   $res->close();
 
-  echo json_encode(["status"=>"success","data"=>$out,"resolved_prof_id"=>$prof_id]);
+  echo json_encode(["status" => "success", "data" => $out, "resolved_prof_id" => $prof_id]);
   exit();
 }
 
+/* ===========================================================
+   POST: Save subject preferences
+   =========================================================== */
 if ($method === 'POST') {
   $raw  = file_get_contents('php://input');
   $data = json_decode($raw, true);
@@ -100,13 +117,13 @@ if ($method === 'POST') {
   $prof_id = resolve_prof_id($conn, $prof_id_in, $user_id_in);
   if ($prof_id <= 0) {
     http_response_code(404);
-    echo json_encode(["status"=>"error","message"=>"Professor not found (provide prof_id or user_id)"]);
+    echo json_encode(["status" => "error", "message" => "Professor not found (provide prof_id or user_id)"]);
     exit();
   }
 
   $prefs = isset($data['preferences']) && is_array($data['preferences']) ? $data['preferences'] : [];
-  $allowedProf = ['beginner','intermediate','advanced'];
-  $allowedWill = ['willing','maybe','not_willing'];
+  $allowedProf = ['beginner', 'intermediate', 'advanced'];
+  $allowedWill = ['willing', 'maybe', 'not_willing'];
 
   $wanted = [];           // subj_id => ['prof' => string, 'will' => string]
   $missingOrInvalid = []; // subj_id[]
@@ -119,7 +136,7 @@ if ($method === 'POST') {
 
     if ($sid > 0 && in_array($lvl, $allowedProf, true)) {
       if ($wil === null || !in_array($wil, $allowedWill, true)) {
-        $missingOrInvalid[] = $sid; // require valid willingness
+        $missingOrInvalid[] = $sid;
       } else {
         $wanted[$sid] = ['prof' => $lvl, 'will' => $wil];
       }
@@ -146,9 +163,54 @@ if ($method === 'POST') {
     }
   }
 
+  /* ===========================================================
+     NEW: Check if subjects are already assigned to professor
+     =========================================================== */
+  $alreadyAssigned = [];
+
+  // 1️⃣ check from professors.prof_subject_ids
+  $check = $conn->prepare("SELECT prof_subject_ids FROM professors WHERE prof_id = ? LIMIT 1");
+  $check->bind_param("i", $prof_id);
+  $check->execute();
+  $result = $check->get_result();
+  if ($row = $result->fetch_assoc()) {
+    $assigned = json_decode($row['prof_subject_ids'] ?? '[]', true) ?: [];
+    $assigned = array_map('intval', $assigned);
+    foreach (array_keys($wanted) as $sid) {
+      if (in_array($sid, $assigned, true)) {
+        $alreadyAssigned[] = $sid;
+      }
+    }
+  }
+  $check->close();
+
+  // 2️⃣ optionally check in schedules table
+  if (!empty($wanted)) {
+    $in = implode(',', array_map('intval', array_keys($wanted)));
+    $qry = $conn->query("SELECT DISTINCT subj_id FROM schedules WHERE prof_id = {$prof_id} AND subj_id IN ($in)");
+    while ($r = $qry->fetch_assoc()) {
+      $alreadyAssigned[] = (int)$r['subj_id'];
+    }
+  }
+
+  $alreadyAssigned = array_unique($alreadyAssigned);
+
+  if (!empty($alreadyAssigned)) {
+    http_response_code(400);
+    echo json_encode([
+      "status"  => "error",
+      "message" => "Some subjects are already assigned to this professor.",
+      "data"    => ["already_assigned_subj_ids" => $alreadyAssigned]
+    ]);
+    exit();
+  }
+
+  /* ===========================================================
+     Save preferences
+     =========================================================== */
   $conn->begin_transaction();
   try {
-    // wipe previous
+    // wipe previous preferences
     $del = $conn->prepare("DELETE FROM professor_subject_preferences WHERE prof_id = ?");
     $del->bind_param("i", $prof_id);
     $del->execute();
@@ -157,10 +219,10 @@ if ($method === 'POST') {
     $inserted = 0;
 
     if (!empty($wanted)) {
-      $stmt = $conn->prepare(
-        "INSERT INTO professor_subject_preferences (prof_id, subj_id, proficiency, willingness)
-         VALUES (?,?,?,?)"
-      );
+      $stmt = $conn->prepare("
+        INSERT INTO professor_subject_preferences (prof_id, subj_id, proficiency, willingness)
+        VALUES (?,?,?,?)
+      ");
       foreach ($wanted as $sid => $info) {
         if (!isset($validSubjIds[$sid])) continue;
         $sidInt = (int)$sid;
@@ -195,5 +257,8 @@ if ($method === 'POST') {
   exit();
 }
 
+/* ===========================================================
+   Invalid method
+   =========================================================== */
 http_response_code(405);
-echo json_encode(["status"=>"error","message"=>"Method not allowed"]);
+echo json_encode(["status" => "error", "message" => "Method not allowed"]);
