@@ -11,6 +11,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'OPTIONS') {
 header('Content-Type: application/json; charset=utf-8');
 
 include __DIR__ . '/connect.php';
+require_once __DIR__ . '/system_settings_helper.php'; // ← add helper for SY/Sem
+
 if (!isset($conn) || !($conn instanceof mysqli)) {
   http_response_code(500);
   echo json_encode(["status" => "error", "message" => "Database connection not available"]);
@@ -62,10 +64,77 @@ function resolve_prof_id(mysqli $conn, int $prof_id_in, int $user_id_in): int {
   return 0;
 }
 
+/**
+ * Normalize and decide the school_year and semester to use for GET filtering.
+ * - 'all' -> returns null (meaning "do not filter" for that dimension)
+ * - 'current' or ''/not set -> returns the current setting from DB
+ * - any other string -> returns that explicit value
+ */
+function resolve_filters_for_get(mysqli $conn): array {
+  $syParam  = isset($_GET['school_year']) ? trim((string)$_GET['school_year']) : '';
+  $semParam = isset($_GET['semester']) ? trim((string)$_GET['semester']) : '';
+
+  $currentSY  = ss_get_current_school_year($conn);
+  $currentSem = ss_get_current_semester($conn);
+
+  // SY
+  if ($syParam === '' || strtolower($syParam) === 'current') {
+    $filterSY = $currentSY;
+    $appliedSY = $currentSY;
+  } elseif (strtolower($syParam) === 'all') {
+    $filterSY = null; // no filter
+    $appliedSY = 'all';
+  } else {
+    $filterSY = $syParam;
+    $appliedSY = $syParam;
+  }
+
+  // Semester
+  if ($semParam === '' || strtolower($semParam) === 'current') {
+    $filterSem = $currentSem;
+    $appliedSem = $currentSem;
+  } elseif (strtolower($semParam) === 'all') {
+    $filterSem = null; // no filter
+    $appliedSem = 'all';
+  } else {
+    $filterSem = $semParam;
+    $appliedSem = $semParam;
+  }
+
+  return [
+    'filterSY'    => $filterSY,
+    'filterSem'   => $filterSem,
+    'currentSY'   => $currentSY,
+    'currentSem'  => $currentSem,
+    'appliedSY'   => $appliedSY,
+    'appliedSem'  => $appliedSem,
+  ];
+}
+
+/**
+ * Resolve SY+Sem to use for POST saving.
+ * - If payload has 'school_year' or 'semester':
+ *     - 'current' or '' -> map to current setting
+ *     - explicit value  -> use it
+ * - If missing entirely -> use current settings
+ */
+function resolve_sy_sem_for_post(mysqli $conn, array $data): array {
+  $currentSY  = ss_get_current_school_year($conn);
+  $currentSem = ss_get_current_semester($conn);
+
+  $syIn  = array_key_exists('school_year', $data) ? trim((string)$data['school_year']) : '';
+  $semIn = array_key_exists('semester', $data) ? trim((string)$data['semester']) : '';
+
+  $useSY = ($syIn === '' || strtolower($syIn) === 'current') ? $currentSY : $syIn;
+  $useSem = ($semIn === '' || strtolower($semIn) === 'current') ? $currentSem : $semIn;
+
+  return ['school_year' => $useSY, 'semester' => $useSem, 'currentSY' => $currentSY, 'currentSem' => $currentSem];
+}
+
 $method = $_SERVER['REQUEST_METHOD'];
 
 /* ===========================================================
-   GET: Fetch subject preferences
+   GET: Fetch subject preferences (now scoped by SY & Semester)
    =========================================================== */
 if ($method === 'GET') {
   $prof_id_in = isset($_GET['prof_id']) ? (int)$_GET['prof_id'] : 0;
@@ -78,13 +147,39 @@ if ($method === 'GET') {
     exit();
   }
 
-  $res = $conn->prepare("
-    SELECT prof_id, subj_id, proficiency, willingness
+  $f = resolve_filters_for_get($conn);
+  $wheres = ["prof_id = ?"];
+  $types = "i";
+  $params = [$prof_id];
+
+  if ($f['filterSY'] !== null) {
+    if ($f['filterSY'] === '') {
+      $wheres[] = "school_year IS NULL";
+    } else {
+      $wheres[] = "school_year = ?";
+      $types   .= "s";
+      $params[] = $f['filterSY'];
+    }
+  }
+  if ($f['filterSem'] !== null) {
+    if ($f['filterSem'] === '') {
+      $wheres[] = "semester IS NULL";
+    } else {
+      $wheres[] = "semester = ?";
+      $types   .= "s";
+      $params[] = $f['filterSem'];
+    }
+  }
+
+  $sql = "
+    SELECT prof_id, subj_id, proficiency, willingness, school_year, semester
     FROM professor_subject_preferences
-    WHERE prof_id = ?
+    WHERE " . implode(' AND ', $wheres) . "
     ORDER BY subj_id
-  ");
-  $res->bind_param("i", $prof_id);
+  ";
+
+  $res = $conn->prepare($sql);
+  $res->bind_param($types, ...$params);
   $res->execute();
   $result = $res->get_result();
 
@@ -95,16 +190,26 @@ if ($method === 'GET') {
       "subj_id"     => (int)$row["subj_id"],
       "proficiency" => (string)$row["proficiency"],
       "willingness" => isset($row["willingness"]) ? (string)$row["willingness"] : null,
+      "school_year" => $row["school_year"] ?? null,
+      "semester"    => $row["semester"] ?? null,
     ];
   }
   $res->close();
 
-  echo json_encode(["status" => "success", "data" => $out, "resolved_prof_id" => $prof_id]);
+  echo json_encode([
+    "status" => "success",
+    "data" => $out,
+    "resolved_prof_id"     => $prof_id,
+    "current_school_year"  => $f['currentSY'],
+    "current_semester"     => $f['currentSem'],
+    "applied_school_year"  => $f['appliedSY'],
+    "applied_semester"     => $f['appliedSem'],
+  ]);
   exit();
 }
 
 /* ===========================================================
-   POST: Save subject preferences
+   POST: Save subject preferences (scoped by SY & Semester)
    =========================================================== */
 if ($method === 'POST') {
   $raw  = file_get_contents('php://input');
@@ -120,6 +225,11 @@ if ($method === 'POST') {
     echo json_encode(["status" => "error", "message" => "Professor not found (provide prof_id or user_id)"]);
     exit();
   }
+
+  // Determine which SY/Sem to save into
+  $sysem = resolve_sy_sem_for_post($conn, $data);
+  $useSY   = $sysem['school_year'];   // may be null if not set in settings
+  $useSem  = $sysem['semester'];      // may be null if not set in settings
 
   $prefs = isset($data['preferences']) && is_array($data['preferences']) ? $data['preferences'] : [];
   $allowedProf = ['beginner', 'intermediate', 'advanced'];
@@ -170,20 +280,32 @@ if ($method === 'POST') {
   $chk->close();
 
   // 2) Assigned from schedules (current schedules with this prof)
+  // TODO (optional): If your schedules table has school_year/semester, add filters here.
   $qsch = $conn->query("SELECT DISTINCT subj_id FROM schedules WHERE prof_id = {$prof_id}");
   while ($r = $qsch->fetch_assoc()) {
     $assignedIds[] = (int)$r['subj_id'];
   }
   $assignedIds = array_values(array_unique(array_filter($assignedIds, fn($v)=>$v>0)));
 
-  // Previous preferences for assigned ids (to preserve levels/willingness where possible)
+  // Previous preferences for assigned ids (to preserve levels/willingness where possible) — scoped by SY/Sem
   $prevPref = [];
   if (!empty($assignedIds)) {
     $inAssigned = implode(',', array_map('intval', $assignedIds));
+
+    $where = "prof_id = {$prof_id} AND subj_id IN ({$inAssigned})";
+    if ($useSY !== null) {
+      $syEsc = $useSY === '' ? null : "'" . $conn->real_escape_string($useSY) . "'";
+      $where .= $useSY === '' ? " AND school_year IS NULL" : " AND school_year = {$syEsc}";
+    }
+    if ($useSem !== null) {
+      $semEsc = $useSem === '' ? null : "'" . $conn->real_escape_string($useSem) . "'";
+      $where .= $useSem === '' ? " AND semester IS NULL" : " AND semester = {$semEsc}";
+    }
+
     $qprev = $conn->query("
       SELECT subj_id, proficiency, willingness
       FROM professor_subject_preferences
-      WHERE prof_id = {$prof_id} AND subj_id IN ({$inAssigned})
+      WHERE {$where}
     ");
     while ($r = $qprev->fetch_assoc()) {
       $sid = (int)$r['subj_id'];
@@ -217,29 +339,63 @@ if ($method === 'POST') {
   }
 
   /* ===========================================================
-     Save preferences (wipe then insert finalWanted)
+     Save preferences (wipe then insert finalWanted) for THIS SY+Sem
      =========================================================== */
   $conn->begin_transaction();
   try {
-    // wipe previous preferences
-    $del = $conn->prepare("DELETE FROM professor_subject_preferences WHERE prof_id = ?");
-    $del->bind_param("i", $prof_id);
+    // wipe previous preferences only for this professor + SY + Sem
+    $delSql = "DELETE FROM professor_subject_preferences WHERE prof_id = ?";
+    $types  = "i";
+    $params = [$prof_id];
+
+    if ($useSY !== null) {
+      if ($useSY === '') {
+        $delSql .= " AND school_year IS NULL";
+      } else {
+        $delSql .= " AND school_year = ?";
+        $types  .= "s";
+        $params[] = $useSY;
+      }
+    }
+    if ($useSem !== null) {
+      if ($useSem === '') {
+        $delSql .= " AND semester IS NULL";
+      } else {
+        $delSql .= " AND semester = ?";
+        $types  .= "s";
+        $params[] = $useSem;
+      }
+    }
+
+    $del = $conn->prepare($delSql);
+    $del->bind_param($types, ...$params);
     $del->execute();
     $del->close();
 
     $inserted = 0;
 
     if (!empty($finalWanted)) {
+      // Insert includes school_year & semester columns
       $stmt = $conn->prepare("
-        INSERT INTO professor_subject_preferences (prof_id, subj_id, proficiency, willingness)
-        VALUES (?,?,?,?)
+        INSERT INTO professor_subject_preferences (prof_id, subj_id, proficiency, willingness, school_year, semester, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,NOW(),NOW())
       ");
       foreach ($finalWanted as $sid => $info) {
         if (!isset($validSubjIds[$sid])) continue; // skip unknown subject ids
         $sidInt = (int)$sid;
         $lvlStr = $info['prof'];
         $wilStr = $info['will'];
-        $stmt->bind_param("iiss", $prof_id, $sidInt, $lvlStr, $wilStr);
+
+        // bind: iissss (prof_id, subj_id, proficiency, willingness, school_year, semester)
+        $stmt->bind_param(
+          "iissss",
+          $prof_id,
+          $sidInt,
+          $lvlStr,
+          $wilStr,
+          $useSY,   // can be null; mysqli will send as NULL if variable is null & types 's' still acceptable
+          $useSem
+        );
         $stmt->execute();
         if ($stmt->affected_rows > 0) $inserted++;
       }
@@ -253,7 +409,11 @@ if ($method === 'POST') {
       "data"    => [
         "resolved_prof_id" => $prof_id,
         "inserted_count"   => $inserted,
-        "kept_assigned"    => array_values($assignedIds) // FYI
+        "kept_assigned"    => array_values($assignedIds),
+        "school_year"      => $useSY,
+        "semester"         => $useSem,
+        "current_school_year" => $sysem['currentSY'],
+        "current_semester"    => $sysem['currentSem'],
       ]
     ]);
   } catch (Throwable $e) {
