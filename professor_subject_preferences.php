@@ -129,10 +129,10 @@ if ($method === 'POST') {
   $missingOrInvalid = []; // subj_id[]
 
   foreach ($prefs as $p) {
-    $sid   = isset($p['subj_id']) ? (int)$p['subj_id'] : 0;
-    $lvl   = isset($p['proficiency']) ? strtolower(trim((string)$p['proficiency'])) : '';
+    $sid    = isset($p['subj_id']) ? (int)$p['subj_id'] : 0;
+    $lvl    = isset($p['proficiency']) ? strtolower(trim((string)$p['proficiency'])) : '';
     $wilRaw = array_key_exists('willingness', $p) ? $p['willingness'] : null;
-    $wil   = is_null($wilRaw) ? null : strtolower(trim((string)$wilRaw));
+    $wil    = is_null($wilRaw) ? null : strtolower(trim((string)$wilRaw));
 
     if ($sid > 0 && in_array($lvl, $allowedProf, true)) {
       if ($wil === null || !in_array($wil, $allowedWill, true)) {
@@ -153,60 +153,71 @@ if ($method === 'POST') {
     exit();
   }
 
-  // verify subject ids exist
+  /* ===========================================================
+     Assigned subjects: must always be kept (cannot be removed)
+     =========================================================== */
+
+  // 1) Assigned from professors.prof_subject_ids
+  $assignedIds = [];
+  $chk = $conn->prepare("SELECT prof_subject_ids FROM professors WHERE prof_id = ? LIMIT 1");
+  $chk->bind_param("i", $prof_id);
+  $chk->execute();
+  $rs = $chk->get_result();
+  if ($row = $rs->fetch_assoc()) {
+    $arr = json_decode($row['prof_subject_ids'] ?? '[]', true) ?: [];
+    foreach ($arr as $x) { $assignedIds[] = (int)$x; }
+  }
+  $chk->close();
+
+  // 2) Assigned from schedules (current schedules with this prof)
+  $qsch = $conn->query("SELECT DISTINCT subj_id FROM schedules WHERE prof_id = {$prof_id}");
+  while ($r = $qsch->fetch_assoc()) {
+    $assignedIds[] = (int)$r['subj_id'];
+  }
+  $assignedIds = array_values(array_unique(array_filter($assignedIds, fn($v)=>$v>0)));
+
+  // Previous preferences for assigned ids (to preserve levels/willingness where possible)
+  $prevPref = [];
+  if (!empty($assignedIds)) {
+    $inAssigned = implode(',', array_map('intval', $assignedIds));
+    $qprev = $conn->query("
+      SELECT subj_id, proficiency, willingness
+      FROM professor_subject_preferences
+      WHERE prof_id = {$prof_id} AND subj_id IN ({$inAssigned})
+    ");
+    while ($r = $qprev->fetch_assoc()) {
+      $sid = (int)$r['subj_id'];
+      $prevPref[$sid] = [
+        'prof' => (string)$r['proficiency'],
+        'will' => (string)$r['willingness'],
+      ];
+    }
+  }
+
+  // Validate subject ids of payload + assigned exist in subjects table
   $validSubjIds = [];
-  if (!empty($wanted)) {
-    $in = implode(',', array_map('intval', array_keys($wanted)));
+  $allCheckIds  = array_values(array_unique(array_merge(array_keys($wanted), $assignedIds)));
+  if (!empty($allCheckIds)) {
+    $in = implode(',', array_map('intval', $allCheckIds));
     $rs = $conn->query("SELECT subj_id FROM subjects WHERE subj_id IN ($in)");
     while ($row = $rs->fetch_assoc()) {
       $validSubjIds[(int)$row['subj_id']] = true;
     }
   }
 
-  /* ===========================================================
-     NEW: Check if subjects are already assigned to professor
-     =========================================================== */
-  $alreadyAssigned = [];
+  // Final to save = client $wanted UNION auto-kept assigned
+  $finalWanted = $wanted;
 
-  // 1️⃣ check from professors.prof_subject_ids
-  $check = $conn->prepare("SELECT prof_subject_ids FROM professors WHERE prof_id = ? LIMIT 1");
-  $check->bind_param("i", $prof_id);
-  $check->execute();
-  $result = $check->get_result();
-  if ($row = $result->fetch_assoc()) {
-    $assigned = json_decode($row['prof_subject_ids'] ?? '[]', true) ?: [];
-    $assigned = array_map('intval', $assigned);
-    foreach (array_keys($wanted) as $sid) {
-      if (in_array($sid, $assigned, true)) {
-        $alreadyAssigned[] = $sid;
-      }
-    }
-  }
-  $check->close();
-
-  // 2️⃣ optionally check in schedules table
-  if (!empty($wanted)) {
-    $in = implode(',', array_map('intval', array_keys($wanted)));
-    $qry = $conn->query("SELECT DISTINCT subj_id FROM schedules WHERE prof_id = {$prof_id} AND subj_id IN ($in)");
-    while ($r = $qry->fetch_assoc()) {
-      $alreadyAssigned[] = (int)$r['subj_id'];
+  foreach ($assignedIds as $sid) {
+    if (!isset($finalWanted[$sid])) {
+      $profLvl = $prevPref[$sid]['prof'] ?? 'beginner';
+      $will    = $prevPref[$sid]['will'] ?? 'willing';
+      $finalWanted[$sid] = ['prof' => $profLvl, 'will' => $will];
     }
   }
 
-  $alreadyAssigned = array_unique($alreadyAssigned);
-
-  if (!empty($alreadyAssigned)) {
-    http_response_code(400);
-    echo json_encode([
-      "status"  => "error",
-      "message" => "Some subjects are already assigned to this professor.",
-      "data"    => ["already_assigned_subj_ids" => $alreadyAssigned]
-    ]);
-    exit();
-  }
-
   /* ===========================================================
-     Save preferences
+     Save preferences (wipe then insert finalWanted)
      =========================================================== */
   $conn->begin_transaction();
   try {
@@ -218,13 +229,13 @@ if ($method === 'POST') {
 
     $inserted = 0;
 
-    if (!empty($wanted)) {
+    if (!empty($finalWanted)) {
       $stmt = $conn->prepare("
         INSERT INTO professor_subject_preferences (prof_id, subj_id, proficiency, willingness)
         VALUES (?,?,?,?)
       ");
-      foreach ($wanted as $sid => $info) {
-        if (!isset($validSubjIds[$sid])) continue;
+      foreach ($finalWanted as $sid => $info) {
+        if (!isset($validSubjIds[$sid])) continue; // skip unknown subject ids
         $sidInt = (int)$sid;
         $lvlStr = $info['prof'];
         $wilStr = $info['will'];
@@ -242,7 +253,7 @@ if ($method === 'POST') {
       "data"    => [
         "resolved_prof_id" => $prof_id,
         "inserted_count"   => $inserted,
-        "skipped_count"    => max(0, count($wanted) - $inserted)
+        "kept_assigned"    => array_values($assignedIds) // FYI
       ]
     ]);
   } catch (Throwable $e) {
