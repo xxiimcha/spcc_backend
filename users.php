@@ -209,6 +209,14 @@ function send_account_email(string $toEmail, string $toName, string $username, ?
   }
 }
 
+/* Small helpers for role/session (used by action=update) */
+function req_role(): string {
+  return $_SERVER['HTTP_X_USER_ROLE'] ?? $_SERVER['HTTP_X_ROLE'] ?? '';
+}
+function session_user_id(): int {
+  return (int)($_SESSION['user_id'] ?? 0);
+}
+
 /* =========================
    Router
    ========================= */
@@ -410,6 +418,191 @@ try {
       $conn->rollback();
       if ($DEBUG) json_fail(500, $e->getMessage(), ["trace" => $e->getTraceAsString()]);
       json_fail(500, "Self update failed");
+    }
+  }
+
+  /* ---------- NEW: POST /users.php?action=update&id=XX ---------- */
+  if ($method === 'POST' && $action === 'update') {
+    $id = isset($_GET['id']) ? (int)$_GET['id'] : 0;
+    if ($id <= 0) json_fail(400, "Missing or invalid id");
+
+    $target = findUserById($conn, $id);
+    if (!$target) json_fail(404, "User not found");
+
+    $reqRole = req_role();        // header X-User-Role / X-Role
+    $selfId  = session_user_id(); // session uid if logged in
+    $isSelf  = $selfId > 0 && $selfId === $id;
+
+    // Authorization
+    // - self can update own account
+    // - super_admin can update anyone
+    // - admin can update only acad_head accounts
+    if (!$isSelf) {
+      if (!in_array($reqRole, ['super_admin', 'admin'], true)) {
+        json_fail(403, "Not allowed to update this account");
+      }
+      if ($reqRole === 'admin' && strtolower($target['role']) !== 'acad_head') {
+        json_fail(403, "Admins can only modify Academic Head accounts");
+      }
+    }
+
+    $data = read_json_body();
+
+    // Accept same fields as update_self
+    $name       = array_key_exists('name', $data) ? trim((string)$data['name']) : null;
+    $email      = array_key_exists('email', $data) ? trim((string)$data['email']) : null;
+    $username   = array_key_exists('username', $data) ? trim((string)$data['username']) : null;
+    $password   = array_key_exists('password', $data) ? (string)$data['password'] : null; // optional
+    $department = array_key_exists('department', $data) ? trim((string)$data['department']) : null; // optional
+    $phone      = array_key_exists('phone', $data) ? trim((string)$data['phone']) : null; // optional
+
+    // Minimal validation
+    if ($name !== null && $name === '')         json_fail(400, "Name is required");
+    if ($email !== null && $email === '')       json_fail(400, "Email is required");
+    if ($username !== null && $username === '') json_fail(400, "Username is required");
+
+    // Uniqueness checks if changed
+    if ($username !== null && strtolower($username) !== strtolower($target['username'])) {
+      $du = findUserByUsername($conn, $username);
+      if ($du && (int)$du['id'] !== $id) {
+        json_fail(409, "Username already exists", ["existing_user" => $du]);
+      }
+    }
+    if ($email !== null && strtolower($email) !== strtolower($target['email'])) {
+      $de = findUserByEmail($conn, $email);
+      if ($de && (int)$de['id'] !== $id) {
+        json_fail(409, "Email already exists", ["existing_user" => $de]);
+      }
+    }
+
+    $conn->begin_transaction();
+    try {
+      // Update users table dynamically
+      $sets   = [];
+      $params = [];
+      $types  = '';
+
+      if ($email !== null)    { $sets[] = "email = ?";    $params[] = $email;    $types .= 's'; }
+      if ($username !== null) { $sets[] = "username = ?"; $params[] = $username; $types .= 's'; }
+      if ($password !== null && $password !== '') {
+        // Store as-is (no hashing) per current policy
+        $sets[] = "password = ?";
+        $params[] = $password;
+        $types .= 's';
+      }
+      if (!empty($sets)) {
+        $sql = "UPDATE users SET " . implode(', ', $sets) . ", updated_at = NOW() WHERE user_id = ?";
+        $stmt = safe_prepare($conn, $sql);
+        $types .= 'i';
+        $params[] = $id;
+        $stmt->bind_param($types, ...$params);
+        $stmt->execute();
+        $stmt->close();
+      }
+
+      // Update detail tables (match role)
+      $effectiveRole = strtolower($target['role']);
+
+      if ($effectiveRole === 'admin') {
+        if (!adminRowExists($conn, $id)) {
+          $stmtA = safe_prepare($conn,
+            "INSERT INTO admins (user_id, full_name, contact_number, department)
+             VALUES (?,?,?,?)"
+          );
+          $fullName = $name ?? ($target['name'] ?? '');
+          $ph = $phone ?? '';
+          $dept = $department ?? '';
+          $stmtA->bind_param('isss', $id, $fullName, $ph, $dept);
+          $stmtA->execute();
+          $stmtA->close();
+        } else {
+          $updates = [];
+          $typesU  = '';
+          $valsU   = [];
+          if ($name !== null)       { $updates[] = "full_name = ?";      $typesU .= 's'; $valsU[] = $name; }
+          if ($phone !== null)      { $updates[] = "contact_number = ?"; $typesU .= 's'; $valsU[] = $phone; }
+          if ($department !== null) { $updates[] = "department = ?";     $typesU .= 's'; $valsU[] = $department; }
+
+          if (!empty($updates)) {
+            $sqlU = "UPDATE admins SET " . implode(', ', $updates) . " WHERE user_id = ?";
+            $stmtU = safe_prepare($conn, $sqlU);
+            $typesU .= 'i';
+            $valsU[] = $id;
+            $stmtU->bind_param($typesU, ...$valsU);
+            $stmtU->execute();
+            $stmtU->close();
+          }
+        }
+      } elseif ($effectiveRole === 'acad_head') {
+        if (!schoolHeadRowExists($conn, $id)) {
+          $stmtS = safe_prepare($conn,
+            "INSERT INTO school_heads (user_id, sh_name, sh_email, sh_phone, department)
+             VALUES (?,?,?,?,?)"
+          );
+          $n  = $name   ?? ($target['name'] ?? '');
+          $em = $email  ?? ($target['email'] ?? '');
+          $ph = $phone  ?? '';
+          $dp = $department ?? '';
+          $stmtS->bind_param('issss', $id, $n, $em, $ph, $dp);
+          $stmtS->execute();
+          $stmtS->close();
+        } else {
+          $updates = [];
+          $typesU  = '';
+          $valsU   = [];
+          if ($name !== null)       { $updates[] = "sh_name = ?";   $typesU .= 's'; $valsU[] = $name; }
+          if ($email !== null)      { $updates[] = "sh_email = ?";  $typesU .= 's'; $valsU[] = $email; }
+          if ($phone !== null)      { $updates[] = "sh_phone = ?";  $typesU .= 's'; $valsU[] = $phone; }
+          if ($department !== null) { $updates[] = "department = ?";$typesU .= 's'; $valsU[] = $department; }
+
+          if (!empty($updates)) {
+            $sqlU = "UPDATE school_heads SET " . implode(', ', $updates) . " WHERE user_id = ?";
+            $stmtU = safe_prepare($conn, $sqlU);
+            $typesU .= 'i';
+            $valsU[] = $id;
+            $stmtU->bind_param($typesU, ...$valsU);
+            $stmtU->execute();
+            $stmtU->close();
+          }
+        }
+      }
+
+      $conn->commit();
+
+      // Reload updated profile
+      $updated = findUserById($conn, $id);
+
+      // If self-changed, keep session in sync (like update_self)
+      if ($isSelf) {
+        if ($username !== null) $_SESSION['username'] = $updated['username'];
+        if ($email !== null)    $_SESSION['email']    = $updated['email'];
+      }
+
+      log_activity(
+        $conn,
+        'users',
+        'update',
+        "Updated (POST action=update) user id={$id}" . ($isSelf ? " (self)" : ""),
+        $id,
+        null
+      );
+
+      json_ok([
+        "message" => "User updated",
+        "data" => [
+          "id"         => (int)$updated['id'],
+          "username"   => $updated['username'],
+          "email"      => $updated['email'],
+          "name"       => $updated['name'],
+          "role"       => $updated['role'],
+          "status"     => $updated['status'],
+          "last_login" => null,
+        ],
+      ]);
+    } catch (Exception $e) {
+      $conn->rollback();
+      if ($DEBUG) json_fail(500, $e->getMessage(), ["trace" => $e->getTraceAsString()]);
+      json_fail(500, "Update failed");
     }
   }
 
