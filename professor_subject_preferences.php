@@ -1,5 +1,15 @@
 <?php
+declare(strict_types=1);
+
 include 'cors_helper.php';
+
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'OPTIONS') {
+  http_response_code(204);
+  exit();
+}
+
+header('Content-Type: application/json; charset=utf-8');
+
 include __DIR__ . '/connect.php';
 if (!isset($conn) || !($conn instanceof mysqli)) {
   http_response_code(500);
@@ -8,6 +18,7 @@ if (!isset($conn) || !($conn instanceof mysqli)) {
 }
 mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
 
+/** Resolve professor id from prof_id or user_id */
 function resolve_prof_id(mysqli $conn, int $prof_id_in, int $user_id_in): int {
   if ($prof_id_in > 0) {
     $q = $conn->prepare("SELECT prof_id FROM professors WHERE prof_id = ? LIMIT 1");
@@ -27,6 +38,7 @@ function resolve_prof_id(mysqli $conn, int $prof_id_in, int $user_id_in): int {
     $q->close();
   }
 
+  // try swapped
   if ($prof_id_in > 0) {
     $q = $conn->prepare("SELECT prof_id FROM professors WHERE user_id = ? LIMIT 1");
     $q->bind_param("i", $prof_id_in);
@@ -37,15 +49,6 @@ function resolve_prof_id(mysqli $conn, int $prof_id_in, int $user_id_in): int {
   }
 
   return 0;
-}
-
-function ensure_prof_exists(mysqli $conn, int $prof_id): bool {
-  $q = $conn->prepare("SELECT 1 FROM professors WHERE prof_id = ? LIMIT 1");
-  $q->bind_param("i", $prof_id);
-  $q->execute();
-  $ok = $q->get_result()->num_rows > 0;
-  $q->close();
-  return $ok;
 }
 
 $method = $_SERVER['REQUEST_METHOD'];
@@ -62,7 +65,7 @@ if ($method === 'GET') {
   }
 
   $res = $conn->prepare(
-    "SELECT prof_id, subj_id, proficiency
+    "SELECT prof_id, subj_id, proficiency, willingness
      FROM professor_subject_preferences
      WHERE prof_id = ?
      ORDER BY subj_id"
@@ -77,6 +80,7 @@ if ($method === 'GET') {
       "prof_id"     => (int)$row["prof_id"],
       "subj_id"     => (int)$row["subj_id"],
       "proficiency" => (string)$row["proficiency"],
+      "willingness" => isset($row["willingness"]) ? (string)$row["willingness"] : null,
     ];
   }
   $res->close();
@@ -101,17 +105,28 @@ if ($method === 'POST') {
   }
 
   $prefs = isset($data['preferences']) && is_array($data['preferences']) ? $data['preferences'] : [];
-  $allowed = ['beginner','intermediate','advanced'];
+  $allowedProf   = ['beginner','intermediate','advanced'];
+  $allowedWill   = ['willing','maybe','not_willing'];
 
-  $wanted = []; // subj_id => proficiency
+  // normalize & validate
+  //   wanted: subj_id => ['prof' => ..., 'will' => (string|null)]
+  $wanted = [];
   foreach ($prefs as $p) {
     $sid = isset($p['subj_id']) ? (int)$p['subj_id'] : 0;
     $lvl = isset($p['proficiency']) ? strtolower(trim((string)$p['proficiency'])) : '';
-    if ($sid > 0 && in_array($lvl, $allowed, true)) {
-      $wanted[$sid] = $lvl;
+    $wil = isset($p['willingness']) && $p['willingness'] !== null
+      ? strtolower(trim((string)$p['willingness']))
+      : null;
+
+    if ($sid > 0 && in_array($lvl, $allowedProf, true)) {
+      if ($wil !== null && !in_array($wil, $allowedWill, true)) {
+        $wil = null; // ignore invalid willingness silently
+      }
+      $wanted[$sid] = ['prof' => $lvl, 'will' => $wil];
     }
   }
 
+  // verify subject ids exist
   $validSubjIds = [];
   if (!empty($wanted)) {
     $in = implode(',', array_map('intval', array_keys($wanted)));
@@ -123,26 +138,43 @@ if ($method === 'POST') {
 
   $conn->begin_transaction();
   try {
+    // wipe previous
     $del = $conn->prepare("DELETE FROM professor_subject_preferences WHERE prof_id = ?");
     $del->bind_param("i", $prof_id);
     $del->execute();
     $del->close();
 
     $inserted = 0;
+
     if (!empty($wanted)) {
-      $stmt = $conn->prepare(
-        "INSERT INTO professor_subject_preferences (prof_id, subj_id, proficiency)
-         VALUES (?,?,?)"
+      // Prepare two statements: with willingness and without (NULL)
+      $stmtWith = $conn->prepare(
+        "INSERT INTO professor_subject_preferences (prof_id, subj_id, proficiency, willingness)
+         VALUES (?,?,?,?)"
       );
-      foreach ($wanted as $sid => $lvl) {
+      $stmtNoWill = $conn->prepare(
+        "INSERT INTO professor_subject_preferences (prof_id, subj_id, proficiency, willingness)
+         VALUES (?,?,?,NULL)"
+      );
+
+      foreach ($wanted as $sid => $info) {
         if (!isset($validSubjIds[$sid])) continue;
         $sidInt = (int)$sid;
-        $lvlStr = $lvl;
-        $stmt->bind_param("iis", $prof_id, $sidInt, $lvlStr);
-        $stmt->execute();
-        if ($stmt->affected_rows > 0) $inserted++;
+        $lvlStr = $info['prof'];
+        $wilStr = $info['will']; // string|null
+
+        if ($wilStr !== null) {
+          $stmtWith->bind_param("iiss", $prof_id, $sidInt, $lvlStr, $wilStr);
+          $stmtWith->execute();
+          if ($stmtWith->affected_rows > 0) $inserted++;
+        } else {
+          $stmtNoWill->bind_param("iis", $prof_id, $sidInt, $lvlStr);
+          $stmtNoWill->execute();
+          if ($stmtNoWill->affected_rows > 0) $inserted++;
+        }
       }
-      $stmt->close();
+      $stmtWith->close();
+      $stmtNoWill->close();
     }
 
     $conn->commit();
