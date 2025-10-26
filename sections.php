@@ -39,7 +39,7 @@ function parseSubjectIds(?string $raw): array {
 
 $method = $_SERVER['REQUEST_METHOD'];
 
-/** NEW: parse expansions */
+/** parse expansions */
 $with = [];
 if (isset($_GET['with'])) {
   $with = array_values(array_filter(array_map('trim', explode(',', (string)$_GET['with']))));
@@ -75,16 +75,31 @@ switch ($method) {
 }
 
 function getAllSections(mysqli $conn, array $with = []): void {
-  $requestedSY = isset($_GET['school_year']) ? trim((string)$_GET['school_year']) : '';
-  $currentSY   = ss_get_current_school_year($conn);
+  $requestedSY   = isset($_GET['school_year']) ? trim((string)$_GET['school_year']) : '';
+  $requestedSem  = isset($_GET['semester']) ? trim((string)$_GET['semester']) : '';
+  $currentSY     = ss_get_current_school_year($conn);
+  $currentSem    = ss_get_current_semester($conn); // e.g., "First Semester" / "Second Semester"
 
-  $where = '';
+  $clauses = [];
+
+  // school_year filter
   if ($requestedSY !== '') {
     if (strtolower($requestedSY)==='current') { $val = $currentSY; }
     elseif (strtolower($requestedSY)==='all')  { $val = null; }
     else                                       { $val = $requestedSY; }
-    if ($val !== null) $where = "WHERE s.school_year ".($val==='' ? "IS NULL" : "= ".q($conn,$val));
+    if ($val !== null) { $clauses[] = "s.school_year ".($val==='' ? "IS NULL" : "= ".q($conn,$val)); }
   }
+
+  // semester filter (optional)
+  if ($requestedSem !== '') {
+    if (strtolower($requestedSem)==='current') { $semVal = $currentSem; }
+    elseif (strtolower($requestedSem)==='all')  { $semVal = null; }
+    else                                        { $semVal = $requestedSem; }
+    if ($semVal !== null) { $clauses[] = "s.semester ".($semVal==='' ? "IS NULL" : "= ".q($conn,$semVal)); }
+  }
+
+  $where = '';
+  if (!empty($clauses)) { $where = "WHERE ".implode(' AND ', $clauses); }
 
   $sql = "SELECT s.*,
           (SELECT COUNT(*) FROM schedules WHERE section_id = s.section_id) AS schedule_count,
@@ -112,17 +127,15 @@ function getAllSections(mysqli $conn, array $with = []): void {
       'subject_ids_raw'    => $row['subject_ids'] ?? null,
       'subject_ids'        => parseSubjectIds($row['subject_ids'] ?? null),
       'school_year'        => $row['school_year'] ?? null,
+      'semester'           => $row['semester'] ?? null, // <-- include
     ];
   }
 
-  /** NEW: optional expansion for subjects on list endpoint */
+  /** optional expansion for subjects on list endpoint */
   if (in_array('subjects', $with, true) && !empty($sections)) {
-    // Collect unique subject ids
     $allIds = [];
     foreach ($sections as $s) {
-      foreach (($s['subject_ids'] ?? []) as $sid) {
-        $allIds[$sid] = true;
-      }
+      foreach (($s['subject_ids'] ?? []) as $sid) { $allIds[$sid] = true; }
     }
     if (!empty($allIds)) {
       $idsFlat = implode(',', array_map('intval', array_keys($allIds)));
@@ -144,7 +157,6 @@ function getAllSections(mysqli $conn, array $with = []): void {
           'strand'        => $s['strand'] ?? null,
         ];
       }
-      // Attach per section in the same order as subject_ids
       foreach ($sections as &$sec) {
         $sec['subjects'] = [];
         foreach (($sec['subject_ids'] ?? []) as $sid) {
@@ -153,14 +165,20 @@ function getAllSections(mysqli $conn, array $with = []): void {
       }
       unset($sec);
     } else {
-      // Ensure key exists even if empty
       foreach ($sections as &$sec) { $sec['subjects'] = []; }
       unset($sec);
     }
   }
 
-  @log_activity($conn, 'sections', 'read', 'Listed sections (count='.count($sections).', filter='.$requestedSY.')', null, null);
-  ok(["success"=>true,"data"=>$sections,"current_school_year"=>$currentSY,"applied_school_year"=>$requestedSY===''?'(none)':$requestedSY]);
+  @log_activity($conn, 'sections', 'read', 'Listed sections (count='.count($sections).', sy='.$requestedSY.', sem='.$requestedSem.')', null, null);
+  ok([
+    "success"=>true,
+    "data"=>$sections,
+    "current_school_year"=>$currentSY,
+    "current_semester"=>$currentSem,
+    "applied_school_year"=>$requestedSY===''?'(none)':$requestedSY,
+    "applied_semester"=>$requestedSem===''?'(none)':$requestedSem
+  ]);
 }
 
 function getSection(mysqli $conn, int $id, array $with = []): void {
@@ -191,9 +209,10 @@ function getSection(mysqli $conn, int $id, array $with = []): void {
     'subject_ids_raw'    => $row['subject_ids'] ?? null,
     'subject_ids'        => parseSubjectIds($row['subject_ids'] ?? null),
     'school_year'        => $row['school_year'] ?? null,
+    'semester'           => $row['semester'] ?? null, // <-- include
   ];
 
-  /** NEW: expand assigned subjects when requested */
+  /** expand assigned subjects when requested */
   if (in_array('subjects', $with, true)) {
     $ids = $section['subject_ids'];
     $subjects = [];
@@ -267,7 +286,7 @@ function createSection(mysqli $conn, array $data): void {
     $numberOfStudents = isset($data['number_of_students']) ? (int)$data['number_of_students'] : null;
     $strand           = isset($data['strand']) ? (string)$data['strand'] : null;
     $roomIds          = isset($data['room_ids']) ? $data['room_ids'] : [];
-    $subjectIds       = isset($data['subject_ids']) ? $data['subject_ids'] : []; // <-- NEW
+    $subjectIds       = isset($data['subject_ids']) ? $data['subject_ids'] : [];
 
     if (isset($data['number_of_students']) && (!is_numeric($data['number_of_students']) || $data['number_of_students'] < 0)) {
       throw new Exception("Number of students must be a non-negative integer");
@@ -287,16 +306,19 @@ function createSection(mysqli $conn, array $data): void {
     $subjectIdsJson = json_encode($subjectIds, JSON_UNESCAPED_UNICODE);
 
     $schoolYear    = ss_get_current_school_year($conn);
+    $semester      = ss_get_current_semester($conn); // <-- current semester from settings
     $schoolYearSQL = $schoolYear !== null ? q($conn, $schoolYear) : "NULL";
+    $semesterSQL   = $semester !== null ? q($conn, $semester) : "NULL";
 
-    $sql = "INSERT INTO sections (section_name, grade_level, number_of_students, strand, subject_ids, school_year)
+    $sql = "INSERT INTO sections (section_name, grade_level, number_of_students, strand, subject_ids, school_year, semester)
             VALUES (
               " . q($conn, $name) . ",
               " . ($gradeLevel === null ? "NULL" : q($conn, $gradeLevel)) . ",
               " . ($numberOfStudents === null ? "NULL" : (int)$numberOfStudents) . ",
               " . ($strand === null ? "NULL" : q($conn, $strand)) . ",
               " . q($conn, $subjectIdsJson) . ",
-              " . $schoolYearSQL . "
+              " . $schoolYearSQL . ",
+              " . $semesterSQL . "
             )";
 
     $conn->query($sql);
@@ -318,10 +340,11 @@ function createSection(mysqli $conn, array $data): void {
       'number_of_students' => isset($row['number_of_students']) ? (int)$row['number_of_students'] : 0,
       'subject_ids'        => parseSubjectIds($row['subject_ids'] ?? null),
       'school_year'        => $row['school_year'] ?? null,
+      'semester'           => $row['semester'] ?? null, // <-- include
     ];
 
     $conn->commit();
-    @log_activity($conn, 'sections', 'create', 'Created section: ' . $name . ' (ID: ' . $sectionId . ') | SY: ' . ($schoolYear ?? 'NULL'), $sectionId, null);
+    @log_activity($conn, 'sections', 'create', 'Created section: ' . $name . ' (ID: ' . $sectionId . ') | SY: ' . ($schoolYear ?? 'NULL') . ' | SEM: ' . ($semester ?? 'NULL'), $sectionId, null);
     ok([
       "status" => "success",
       "message" => "Section added successfully",
@@ -389,6 +412,12 @@ function updateSection(mysqli $conn, int $id, array $data): void {
       $sets[] = "school_year = ".($sy==='' ? "NULL" : q($conn,$sy));
     }
 
+    // NEW: allow semester update on PUT
+    if (array_key_exists('semester', $data)) {
+      $sem = trim((string)$data['semester']);
+      $sets[] = "semester = ".($sem==='' ? "NULL" : q($conn,$sem));
+    }
+
     $updateRooms = false;
     $roomIds = [];
     if (array_key_exists('room_ids', $data)) {
@@ -426,6 +455,7 @@ function updateSection(mysqli $conn, int $id, array $data): void {
       "subject_ids_raw"    => $subject_ids_raw,
       "subject_ids"        => parseSubjectIds($subject_ids_raw),
       "school_year"        => $row["school_year"] ?? null,
+      "semester"           => $row["semester"] ?? null, // <-- include
     ];
 
     $conn->commit();
@@ -439,7 +469,7 @@ function updateSection(mysqli $conn, int $id, array $data): void {
 }
 
 function deleteSection(mysqli $conn, int $id): void {
-  // 1) Ensure the section exists
+  // Ensure the section exists
   $exists = $conn->query("SELECT section_id FROM sections WHERE section_id = $id")->num_rows > 0;
   if (!$exists) {
     @log_activity($conn,'sections','delete','FAILED delete: section not found (ID '.$id.')',$id,null);
@@ -448,20 +478,19 @@ function deleteSection(mysqli $conn, int $id): void {
     return;
   }
 
-  // 2) Count schedules (just for reporting)
+  // Count schedules (reporting)
   $cRow = $conn->query("SELECT COUNT(*) AS c FROM schedules WHERE section_id = $id")->fetch_assoc();
   $schedCount = (int)($cRow['c'] ?? 0);
 
   $conn->begin_transaction();
   try {
-
-    // 4) Delete schedules under this section
+    // Delete schedules under this section
     $conn->query("DELETE FROM schedules WHERE section_id = $id");
 
-    // 5) Remove room assignments
+    // Remove room assignments
     $conn->query("DELETE FROM section_room_assignments WHERE section_id = $id");
 
-    // 6) Finally delete the section
+    // Delete section
     $conn->query("DELETE FROM sections WHERE section_id = $id");
 
     $conn->commit();
