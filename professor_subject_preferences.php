@@ -51,48 +51,6 @@ function resolve_prof_id(mysqli $conn, int $prof_id_in, int $user_id_in): int {
   return 0;
 }
 
-/** Check if a table exists */
-function table_exists(mysqli $conn, string $table): bool {
-  $stmt = $conn->prepare("SHOW TABLES LIKE ?");
-  $stmt->bind_param("s", $table);
-  $stmt->execute();
-  $res = $stmt->get_result();
-  $exists = (bool)$res->fetch_row();
-  $stmt->close();
-  return $exists;
-}
-
-/**
- * Return DISTINCT subj_id that are already assigned to the professor.
- * Prefers schedules(prof_id, subj_id). Falls back to professor_assigned_subjects(prof_id, subj_id) if present.
- */
-function get_locked_assigned_subj_ids(mysqli $conn, int $prof_id): array {
-  $locked = [];
-
-  if (table_exists($conn, 'schedules')) {
-    // Minimal check: assume subj_id & prof_id columns exist in schedules
-    $stmt = $conn->prepare("SELECT DISTINCT subj_id FROM schedules WHERE prof_id = ?");
-    $stmt->bind_param("i", $prof_id);
-    $stmt->execute();
-    $res = $stmt->get_result();
-    while ($row = $res->fetch_assoc()) {
-      $locked[(int)$row['subj_id']] = true;
-    }
-    $stmt->close();
-  } elseif (table_exists($conn, 'professor_assigned_subjects')) {
-    $stmt = $conn->prepare("SELECT DISTINCT subj_id FROM professor_assigned_subjects WHERE prof_id = ?");
-    $stmt->bind_param("i", $prof_id);
-    $stmt->execute();
-    $res = $stmt->get_result();
-    while ($row = $res->fetch_assoc()) {
-      $locked[(int)$row['subj_id']] = true;
-    }
-    $stmt->close();
-  }
-
-  return array_keys($locked); // list of ints
-}
-
 $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'GET') {
@@ -106,7 +64,6 @@ if ($method === 'GET') {
     exit();
   }
 
-  // current preferences
   $res = $conn->prepare(
     "SELECT prof_id, subj_id, proficiency, willingness
      FROM professor_subject_preferences
@@ -128,15 +85,7 @@ if ($method === 'GET') {
   }
   $res->close();
 
-  // include locked subjects (for UI convenience)
-  $locked_ids = get_locked_assigned_subj_ids($conn, $prof_id);
-
-  echo json_encode([
-    "status" => "success",
-    "data" => $out,
-    "resolved_prof_id" => $prof_id,
-    "locked_subj_ids" => $locked_ids
-  ]);
+  echo json_encode(["status"=>"success","data"=>$out,"resolved_prof_id"=>$prof_id]);
   exit();
 }
 
@@ -157,7 +106,7 @@ if ($method === 'POST') {
 
   $prefs = isset($data['preferences']) && is_array($data['preferences']) ? $data['preferences'] : [];
   $allowedProf = ['beginner','intermediate','advanced'];
-  $allowedWill = ['willing','not_willing']; // align with UI
+  $allowedWill = ['willing','maybe','not_willing'];
 
   $wanted = [];           // subj_id => ['prof' => string, 'will' => string]
   $missingOrInvalid = []; // subj_id[]
@@ -187,12 +136,7 @@ if ($method === 'POST') {
     exit();
   }
 
-  // Fetch locked/assigned subject IDs that must be preserved
-  $locked_ids = get_locked_assigned_subj_ids($conn, $prof_id);
-  $locked_set = [];
-  foreach ($locked_ids as $lid) { $locked_set[(int)$lid] = true; }
-
-  // Verify incoming subject ids exist
+  // verify subject ids exist
   $validSubjIds = [];
   if (!empty($wanted)) {
     $in = implode(',', array_map('intval', array_keys($wanted)));
@@ -202,99 +146,41 @@ if ($method === 'POST') {
     }
   }
 
-  // Get existing preferences (to reuse for locked subjects if the client omitted them)
-  $prevPrefs = []; // subj_id => ['prof'=>..., 'will'=>...]
-  $stmtPrev = $conn->prepare("
-    SELECT subj_id, proficiency, willingness
-    FROM professor_subject_preferences
-    WHERE prof_id = ?
-  ");
-  $stmtPrev->bind_param("i", $prof_id);
-  $stmtPrev->execute();
-  $resPrev = $stmtPrev->get_result();
-  while ($row = $resPrev->fetch_assoc()) {
-    $sid = (int)$row['subj_id'];
-    $prevPrefs[$sid] = [
-      'prof' => (string)$row['proficiency'],
-      'will' => (string)$row['willingness'],
-    ];
-  }
-  $stmtPrev->close();
-
-  // Ensure all locked subjects are kept — if client omitted, re-add from previous or default
-  foreach ($locked_set as $sid => $_) {
-    if (!isset($wanted[$sid])) {
-      $fallbackProf = isset($prevPrefs[$sid]['prof']) ? $prevPrefs[$sid]['prof'] : 'beginner';
-      $fallbackWill = isset($prevPrefs[$sid]['will']) ? $prevPrefs[$sid]['will'] : 'willing';
-      if (!in_array($fallbackProf, $allowedProf, true)) $fallbackProf = 'beginner';
-      if (!in_array($fallbackWill, $allowedWill, true)) $fallbackWill = 'willing';
-      $wanted[$sid] = ['prof' => $fallbackProf, 'will' => $fallbackWill];
-      $validSubjIds[$sid] = true;
-    }
-  }
-
-  if (empty($wanted)) {
-    http_response_code(400);
-    echo json_encode([
-      "status"  => "error",
-      "message" => "Nothing to save.",
-    ]);
-    exit();
-  }
-
   $conn->begin_transaction();
   try {
-    // Delete ONLY non-locked rows for this professor
-    if (!empty($locked_set)) {
-      $placeholders = implode(',', array_fill(0, count($locked_set), '?'));
-      $types = 'i' . str_repeat('i', count($locked_set));
-      $sql = "DELETE FROM professor_subject_preferences WHERE prof_id = ? AND subj_id NOT IN ($placeholders)";
-      $stmtDel = $conn->prepare($sql);
+    // wipe previous
+    $del = $conn->prepare("DELETE FROM professor_subject_preferences WHERE prof_id = ?");
+    $del->bind_param("i", $prof_id);
+    $del->execute();
+    $del->close();
 
-      $params = [ $prof_id ];
-      foreach (array_keys($locked_set) as $sid) $params[] = (int)$sid;
-      $stmtDel->bind_param($types, ...$params);
-      $stmtDel->execute();
-      $stmtDel->close();
-    } else {
-      // No locked subjects — delete all
-      $del = $conn->prepare("DELETE FROM professor_subject_preferences WHERE prof_id = ?");
-      $del->bind_param("i", $prof_id);
-      $del->execute();
-      $del->close();
-    }
-
-    // Insert/Upsert merged set (locked + requested)
     $inserted = 0;
-    $stmt = $conn->prepare("
-      INSERT INTO professor_subject_preferences (prof_id, subj_id, proficiency, willingness)
-      VALUES (?,?,?,?)
-      ON DUPLICATE KEY UPDATE
-        proficiency = VALUES(proficiency),
-        willingness = VALUES(willingness)
-    ");
 
-    foreach ($wanted as $sid => $info) {
-      if (!isset($validSubjIds[$sid])) continue; // skip invalid subject IDs
-      $sidInt = (int)$sid;
-      $lvlStr = $info['prof'];
-      $wilStr = $info['will'];
-      $stmt->bind_param("iiss", $prof_id, $sidInt, $lvlStr, $wilStr);
-      $stmt->execute();
-      if ($stmt->affected_rows >= 0) $inserted++; // upsert path can be 0 changes
+    if (!empty($wanted)) {
+      $stmt = $conn->prepare(
+        "INSERT INTO professor_subject_preferences (prof_id, subj_id, proficiency, willingness)
+         VALUES (?,?,?,?)"
+      );
+      foreach ($wanted as $sid => $info) {
+        if (!isset($validSubjIds[$sid])) continue;
+        $sidInt = (int)$sid;
+        $lvlStr = $info['prof'];
+        $wilStr = $info['will'];
+        $stmt->bind_param("iiss", $prof_id, $sidInt, $lvlStr, $wilStr);
+        $stmt->execute();
+        if ($stmt->affected_rows > 0) $inserted++;
+      }
+      $stmt->close();
     }
-    $stmt->close();
 
     $conn->commit();
-
     echo json_encode([
       "status"  => "success",
       "message" => "Preferences saved",
       "data"    => [
         "resolved_prof_id" => $prof_id,
         "inserted_count"   => $inserted,
-        "locked_subj_ids"  => array_keys($locked_set),
-        "note"             => "Assigned subjects are preserved even if omitted in the request."
+        "skipped_count"    => max(0, count($wanted) - $inserted)
       ]
     ]);
   } catch (Throwable $e) {
