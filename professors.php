@@ -38,9 +38,9 @@ function emailExists(mysqli $conn, string $email, int $excludeId = 0): bool {
     $safeEmail = mysqli_real_escape_string($conn, $email);
     if ($excludeId > 0) {
         $id = (int)$excludeId;
-        $sql = "SELECT 1 FROM professors WHERE prof_email='$safeEmail' AND prof_id<>$id LIMIT 1";
+        $sql = "SELECT 1 FROM professors WHERE prof_email='{$safeEmail}' AND prof_id<>$id LIMIT 1";
     } else {
-        $sql = "SELECT 1 FROM professors WHERE prof_email='$safeEmail' LIMIT 1";
+        $sql = "SELECT 1 FROM professors WHERE prof_email='{$safeEmail}' LIMIT 1";
     }
     $res = $conn->query($sql);
     return $res && $res->num_rows > 0;
@@ -51,9 +51,9 @@ function userUsernameExists(mysqli $conn, string $username, int $excludeUserId =
     $u = mysqli_real_escape_string($conn, $username);
     if ($excludeUserId > 0) {
         $id = (int)$excludeUserId;
-        $sql = "SELECT 1 FROM users WHERE username='$u' AND user_id<>$id LIMIT 1";
+        $sql = "SELECT 1 FROM users WHERE username='{$u}' AND user_id<>$id LIMIT 1";
     } else {
-        $sql = "SELECT 1 FROM users WHERE username='$u' LIMIT 1";
+        $sql = "SELECT 1 FROM users WHERE username='{$u}' LIMIT 1";
     }
     $res = $conn->query($sql);
     return $res && $res->num_rows > 0;
@@ -64,9 +64,9 @@ function userEmailExists(mysqli $conn, string $email, int $excludeUserId = 0): b
     $e = mysqli_real_escape_string($conn, $email);
     if ($excludeUserId > 0) {
         $id = (int)$excludeUserId;
-        $sql = "SELECT 1 FROM users WHERE email='$e' AND user_id<>$id LIMIT 1";
+        $sql = "SELECT 1 FROM users WHERE email='{$e}' AND user_id<>$id LIMIT 1";
     } else {
-        $sql = "SELECT 1 FROM users WHERE email='$e' LIMIT 1";
+        $sql = "SELECT 1 FROM users WHERE email='{$e}' LIMIT 1";
     }
     $res = $conn->query($sql);
     return $res && $res->num_rows > 0;
@@ -184,49 +184,42 @@ function sendWelcomeProfessorEmail($toEmail, $toName, $username, $plainPassword,
 }
 
 /**
- * Resolve a usable prof_id from an incoming identifier.
+ * Resolve a usable prof_id from incoming identifier (no prepared stmts).
  * Priority:
- *   1) If ?user_id is present and matches, return its prof_id
- *   2) Else, if ?id is present: try interpreting it as user_id first, then as prof_id
+ *   1) If ?user_id matches, return its prof_id
+ *   2) Else, if ?id is present: try as user_id first, then as prof_id
  * Returns 0 if nothing matches.
  */
 function resolve_prof_id_from_user_or_prof(mysqli $conn): int {
     $user_id_in = isset($_GET['user_id']) ? (int)$_GET['user_id'] : 0;
     $id_in      = isset($_GET['id']) ? (int)$_GET['id'] : 0;
 
-    // If explicit user_id is provided, use that
     if ($user_id_in > 0) {
-        $q = $conn->prepare("SELECT prof_id FROM professors WHERE user_id = ? LIMIT 1");
-        $q->bind_param("i", $user_id_in);
-        $q->execute();
-        $r = $q->get_result();
-        if ($row = $r->fetch_assoc()) { $q->close(); return (int)$row['prof_id']; }
-        $q->close();
+        $q = $conn->query("SELECT prof_id FROM professors WHERE user_id = {$user_id_in} LIMIT 1");
+        if ($q && $q->num_rows > 0) {
+            $row = $q->fetch_assoc();
+            return (int)$row['prof_id'];
+        }
         return 0;
     }
 
-    // Otherwise, if id is provided, prefer treating it as user_id first
     if ($id_in > 0) {
-        // Try as user_id
-        $q1 = $conn->prepare("SELECT prof_id FROM professors WHERE user_id = ? LIMIT 1");
-        $q1->bind_param("i", $id_in);
-        $q1->execute();
-        $r1 = $q1->get_result();
-        if ($row1 = $r1->fetch_assoc()) { $q1->close(); return (int)$row1['prof_id']; }
-        $q1->close();
-
-        // Fallback: treat id as prof_id
-        $q2 = $conn->prepare("SELECT prof_id FROM professors WHERE prof_id = ? LIMIT 1");
-        $q2->bind_param("i", $id_in);
-        $q2->execute();
-        $r2 = $q2->get_result();
-        if ($row2 = $r2->fetch_assoc()) { $q2->close(); return (int)$row2['prof_id']; }
-        $q2->close();
+        $q1 = $conn->query("SELECT prof_id FROM professors WHERE user_id = {$id_in} LIMIT 1");
+        if ($q1 && $q1->num_rows > 0) {
+            $row1 = $q1->fetch_assoc();
+            return (int)$row1['prof_id'];
+        }
+        $q2 = $conn->query("SELECT prof_id FROM professors WHERE prof_id = {$id_in} LIMIT 1");
+        if ($q2 && $q2->num_rows > 0) {
+            $row2 = $q2->fetch_assoc();
+            return (int)$row2['prof_id'];
+        }
     }
 
     return 0;
 }
 
+/** ---------- DB CONNECT ---------- */
 $conn = new mysqli($host, $user, $password, $database);
 if ($conn->connect_error) {
     log_activity($conn, 'professors', 'error', 'DB connection failed: '.$conn->connect_error, null, null);
@@ -235,6 +228,7 @@ if ($conn->connect_error) {
     exit();
 }
 
+/** ---------- METHOD ROUTER ---------- */
 $method = $_SERVER['REQUEST_METHOD'];
 $payload = read_json_body();
 $methodOverride = null;
@@ -257,15 +251,12 @@ switch ($effectiveMethod) {
         createProfessor($conn, $payload);
         break;
     case 'PUT':
-        // For update/delete we keep accepting prof_id in ?id= for now.
-        // (If you want to send user_id instead, add similar resolver here.)
         updateProfessor($conn, (int)($_GET['id'] ?? 0), $payload);
         break;
     case 'DELETE':
         deleteProfessor($conn, (int)($_GET['id'] ?? 0));
         break;
     default:
-        // READ
         if (isset($_GET['id']) || isset($_GET['user_id'])) {
             $resolvedProfId = resolve_prof_id_from_user_or_prof($conn);
             if ($resolvedProfId <= 0) {
@@ -280,6 +271,26 @@ switch ($effectiveMethod) {
         }
         break;
 }
+
+/** ---------- HELPERS FOR CASCADE (no stmt) ---------- */
+
+/** Check if table exists */
+function table_exists(mysqli $conn, string $table): bool {
+    $t = $conn->real_escape_string($table);
+    $res = $conn->query("SHOW TABLES LIKE '{$t}'");
+    return $res && $res->num_rows > 0;
+}
+
+/** Delete by prof_id on a given table/column (no stmt). Returns affected rows. */
+function cascade_delete_where_prof(mysqli $conn, string $table, string $whereCol, int $profId): int {
+    if (!table_exists($conn, $table)) return 0;
+    $profId = (int)$profId;
+    $sql = "DELETE FROM `{$table}` WHERE {$whereCol} = {$profId}";
+    $conn->query($sql);
+    return (int)$conn->affected_rows;
+}
+
+/** ---------- CRUD ---------- */
 
 function createProfessor(mysqli $conn, array $data) {
     $name      = mysqli_real_escape_string($conn, (string)($data['name'] ?? ''));
@@ -560,34 +571,61 @@ function deleteProfessor(mysqli $conn, int $id) {
     }
 
     $res = $conn->query("SELECT user_id FROM professors WHERE prof_id=".(int)$id." LIMIT 1");
-    $userId = 0;
-    if ($res && $res->num_rows > 0) {
-        $row = $res->fetch_assoc();
-        $userId = (int)($row['user_id'] ?? 0);
-    }
-
-    $sql = "DELETE FROM professors WHERE prof_id=".(int)$id;
-    if (!$conn->query($sql)) {
-        log_activity($conn, 'professors', 'delete', "FAILED delete ID {$id}: ".$conn->error, $id, $userId);
-        http_response_code(500);
-        echo json_encode(["status"=>"error","message"=>$conn->error]);
+    if (!$res || $res->num_rows === 0) {
+        http_response_code(404);
+        echo json_encode(["status"=>"error","message"=>"Professor not found"]);
         return;
     }
+    $row    = $res->fetch_assoc();
+    $userId = (int)($row['user_id'] ?? 0);
 
-    if ($userId > 0) {
-        $conn->query("DELETE FROM users WHERE user_id=".$userId." LIMIT 1");
+    $conn->begin_transaction();
+    try {
+        // 1) Delete child/related rows first (only if those tables exist).
+        $deleted = [
+            'professor_subject_preferences' => cascade_delete_where_prof($conn, 'professor_subject_preferences', 'prof_id', $id),
+            'schedules'                     => cascade_delete_where_prof($conn, 'schedules', 'prof_id', $id),
+
+            // Optional tables — attempted only if present.
+            'professor_sections'            => cascade_delete_where_prof($conn, 'professor_sections', 'prof_id', $id),
+            'professor_load_requests'       => cascade_delete_where_prof($conn, 'professor_load_requests', 'prof_id', $id),
+            'professor_notifications'       => cascade_delete_where_prof($conn, 'professor_notifications', 'prof_id', $id),
+            'professor_availability'        => cascade_delete_where_prof($conn, 'professor_availability', 'prof_id', $id),
+            'professor_assignments'         => cascade_delete_where_prof($conn, 'professor_assignments', 'prof_id', $id),
+        ];
+
+        // 2) Delete the professor row.
+        $sqlProf = "DELETE FROM professors WHERE prof_id = ".(int)$id." LIMIT 1";
+        if (!$conn->query($sqlProf)) {
+            throw new Exception("Failed deleting professor: ".$conn->error);
+        }
+
+        // 3) Delete the linked user row (if any).
+        if ($userId > 0) {
+            $conn->query("DELETE FROM users WHERE user_id = ".(int)$userId." LIMIT 1");
+        }
+
+        $conn->commit();
+
+        // 4) Firebase clean-up
+        $syncResult = firebaseSync($conn)->deleteProfessorInFirebase($id);
+
+        $desc = "Deleted professor ID: {$id} (linked user_id: {$userId})";
+        log_activity($conn, 'professors', 'delete', $desc, $id, $userId);
+
+        echo json_encode([
+            "status"   => "success",
+            "message"  => "Professor and related data deleted",
+            "deleted"  => $deleted,
+            "firebase_sync" => $syncResult
+        ]);
+    } catch (Throwable $e) {
+        $conn->rollback();
+        log_activity($conn, 'professors', 'delete', "FAILED delete ID {$id}: ".$e->getMessage(), $id, $userId);
+        http_response_code(500);
+        echo json_encode(["status"=>"error","message"=>$e->getMessage()]);
+        return;
     }
-
-    $syncResult = firebaseSync($conn)->deleteProfessorInFirebase($id);
-
-    $desc = "Deleted professor ID: {$id}";
-    log_activity($conn, 'professors', 'delete', $desc, $id, $userId);
-
-    echo json_encode([
-        "status"=>"success",
-        "message"=>"Professor deleted",
-        "firebase_sync"=>$syncResult
-    ]);
 }
 
 function getAllProfessors(mysqli $conn) {
