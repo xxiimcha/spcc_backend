@@ -105,25 +105,35 @@ if ($method === 'POST') {
   }
 
   $prefs = isset($data['preferences']) && is_array($data['preferences']) ? $data['preferences'] : [];
-  $allowedProf   = ['beginner','intermediate','advanced'];
-  $allowedWill   = ['willing','maybe','not_willing'];
+  $allowedProf = ['beginner','intermediate','advanced'];
+  $allowedWill = ['willing','maybe','not_willing'];
 
-  // normalize & validate
-  //   wanted: subj_id => ['prof' => ..., 'will' => (string|null)]
-  $wanted = [];
+  $wanted = [];           // subj_id => ['prof' => string, 'will' => string]
+  $missingOrInvalid = []; // subj_id[]
+
   foreach ($prefs as $p) {
-    $sid = isset($p['subj_id']) ? (int)$p['subj_id'] : 0;
-    $lvl = isset($p['proficiency']) ? strtolower(trim((string)$p['proficiency'])) : '';
-    $wil = isset($p['willingness']) && $p['willingness'] !== null
-      ? strtolower(trim((string)$p['willingness']))
-      : null;
+    $sid   = isset($p['subj_id']) ? (int)$p['subj_id'] : 0;
+    $lvl   = isset($p['proficiency']) ? strtolower(trim((string)$p['proficiency'])) : '';
+    $wilRaw = array_key_exists('willingness', $p) ? $p['willingness'] : null;
+    $wil   = is_null($wilRaw) ? null : strtolower(trim((string)$wilRaw));
 
     if ($sid > 0 && in_array($lvl, $allowedProf, true)) {
-      if ($wil !== null && !in_array($wil, $allowedWill, true)) {
-        $wil = null; // ignore invalid willingness silently
+      if ($wil === null || !in_array($wil, $allowedWill, true)) {
+        $missingOrInvalid[] = $sid; // require valid willingness
+      } else {
+        $wanted[$sid] = ['prof' => $lvl, 'will' => $wil];
       }
-      $wanted[$sid] = ['prof' => $lvl, 'will' => $wil];
     }
+  }
+
+  if (!empty($missingOrInvalid)) {
+    http_response_code(400);
+    echo json_encode([
+      "status"  => "error",
+      "message" => "Willingness is required for all selected subjects.",
+      "data"    => ["invalid_subj_ids" => $missingOrInvalid]
+    ]);
+    exit();
   }
 
   // verify subject ids exist
@@ -147,34 +157,20 @@ if ($method === 'POST') {
     $inserted = 0;
 
     if (!empty($wanted)) {
-      // Prepare two statements: with willingness and without (NULL)
-      $stmtWith = $conn->prepare(
+      $stmt = $conn->prepare(
         "INSERT INTO professor_subject_preferences (prof_id, subj_id, proficiency, willingness)
          VALUES (?,?,?,?)"
       );
-      $stmtNoWill = $conn->prepare(
-        "INSERT INTO professor_subject_preferences (prof_id, subj_id, proficiency, willingness)
-         VALUES (?,?,?,NULL)"
-      );
-
       foreach ($wanted as $sid => $info) {
         if (!isset($validSubjIds[$sid])) continue;
         $sidInt = (int)$sid;
         $lvlStr = $info['prof'];
-        $wilStr = $info['will']; // string|null
-
-        if ($wilStr !== null) {
-          $stmtWith->bind_param("iiss", $prof_id, $sidInt, $lvlStr, $wilStr);
-          $stmtWith->execute();
-          if ($stmtWith->affected_rows > 0) $inserted++;
-        } else {
-          $stmtNoWill->bind_param("iis", $prof_id, $sidInt, $lvlStr);
-          $stmtNoWill->execute();
-          if ($stmtNoWill->affected_rows > 0) $inserted++;
-        }
+        $wilStr = $info['will'];
+        $stmt->bind_param("iiss", $prof_id, $sidInt, $lvlStr, $wilStr);
+        $stmt->execute();
+        if ($stmt->affected_rows > 0) $inserted++;
       }
-      $stmtWith->close();
-      $stmtNoWill->close();
+      $stmt->close();
     }
 
     $conn->commit();
