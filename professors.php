@@ -183,6 +183,50 @@ function sendWelcomeProfessorEmail($toEmail, $toName, $username, $plainPassword,
     }
 }
 
+/**
+ * Resolve a usable prof_id from an incoming identifier.
+ * Priority:
+ *   1) If ?user_id is present and matches, return its prof_id
+ *   2) Else, if ?id is present: try interpreting it as user_id first, then as prof_id
+ * Returns 0 if nothing matches.
+ */
+function resolve_prof_id_from_user_or_prof(mysqli $conn): int {
+    $user_id_in = isset($_GET['user_id']) ? (int)$_GET['user_id'] : 0;
+    $id_in      = isset($_GET['id']) ? (int)$_GET['id'] : 0;
+
+    // If explicit user_id is provided, use that
+    if ($user_id_in > 0) {
+        $q = $conn->prepare("SELECT prof_id FROM professors WHERE user_id = ? LIMIT 1");
+        $q->bind_param("i", $user_id_in);
+        $q->execute();
+        $r = $q->get_result();
+        if ($row = $r->fetch_assoc()) { $q->close(); return (int)$row['prof_id']; }
+        $q->close();
+        return 0;
+    }
+
+    // Otherwise, if id is provided, prefer treating it as user_id first
+    if ($id_in > 0) {
+        // Try as user_id
+        $q1 = $conn->prepare("SELECT prof_id FROM professors WHERE user_id = ? LIMIT 1");
+        $q1->bind_param("i", $id_in);
+        $q1->execute();
+        $r1 = $q1->get_result();
+        if ($row1 = $r1->fetch_assoc()) { $q1->close(); return (int)$row1['prof_id']; }
+        $q1->close();
+
+        // Fallback: treat id as prof_id
+        $q2 = $conn->prepare("SELECT prof_id FROM professors WHERE prof_id = ? LIMIT 1");
+        $q2->bind_param("i", $id_in);
+        $q2->execute();
+        $r2 = $q2->get_result();
+        if ($row2 = $r2->fetch_assoc()) { $q2->close(); return (int)$row2['prof_id']; }
+        $q2->close();
+    }
+
+    return 0;
+}
+
 $conn = new mysqli($host, $user, $password, $database);
 if ($conn->connect_error) {
     log_activity($conn, 'professors', 'error', 'DB connection failed: '.$conn->connect_error, null, null);
@@ -213,14 +257,24 @@ switch ($effectiveMethod) {
         createProfessor($conn, $payload);
         break;
     case 'PUT':
+        // For update/delete we keep accepting prof_id in ?id= for now.
+        // (If you want to send user_id instead, add similar resolver here.)
         updateProfessor($conn, (int)($_GET['id'] ?? 0), $payload);
         break;
     case 'DELETE':
         deleteProfessor($conn, (int)($_GET['id'] ?? 0));
         break;
     default:
-        if (isset($_GET['id'])) {
-            getProfessor($conn, (int)$_GET['id']);
+        // READ
+        if (isset($_GET['id']) || isset($_GET['user_id'])) {
+            $resolvedProfId = resolve_prof_id_from_user_or_prof($conn);
+            if ($resolvedProfId <= 0) {
+                http_response_code(404);
+                echo json_encode(["status"=>"error","message"=>"Professor not found for the provided identifier."]);
+                $conn->close();
+                exit();
+            }
+            getProfessor($conn, $resolvedProfId);
         } else {
             getAllProfessors($conn);
         }
