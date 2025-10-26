@@ -62,56 +62,17 @@ function table_exists(mysqli $conn, string $table): bool {
   return $exists;
 }
 
-/** Check if a table has a specific column */
-function column_exists(mysqli $conn, string $table, string $column): bool {
-  $stmt = $conn->prepare("
-    SELECT 1
-    FROM INFORMATION_SCHEMA.COLUMNS
-    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
-    LIMIT 1
-  ");
-  $stmt->bind_param("ss", $table, $column);
-  $stmt->execute();
-  $res = $stmt->get_result();
-  $exists = (bool)$res->fetch_row();
-  $stmt->close();
-  return $exists;
-}
-
 /**
  * Return DISTINCT subj_id that are already assigned to the professor.
- * Prefers schedules(prof_id, subj_id[, school_year, semester]).
- * Falls back to professor_assigned_subjects(prof_id, subj_id) if present.
+ * Prefers schedules(prof_id, subj_id). Falls back to professor_assigned_subjects(prof_id, subj_id) if present.
  */
-function get_locked_assigned_subj_ids(
-  mysqli $conn,
-  int $prof_id,
-  ?string $school_year = null,
-  ?string $semester = null
-): array {
+function get_locked_assigned_subj_ids(mysqli $conn, int $prof_id): array {
   $locked = [];
 
-  if (table_exists($conn, 'schedules') && column_exists($conn, 'schedules', 'subj_id') && column_exists($conn, 'schedules', 'prof_id')) {
-    $hasSY = column_exists($conn, 'schedules', 'school_year');
-    $hasSem = column_exists($conn, 'schedules', 'semester');
-
-    $sql = "SELECT DISTINCT subj_id FROM schedules WHERE prof_id = ?";
-    $types = "i";
-    $args  = [$prof_id];
-
-    if ($hasSY && $school_year !== null && $school_year !== '') {
-      $sql .= " AND school_year = ?";
-      $types .= "s";
-      $args[] = $school_year;
-    }
-    if ($hasSem && $semester !== null && $semester !== '') {
-      $sql .= " AND semester = ?";
-      $types .= "s";
-      $args[] = $semester;
-    }
-
-    $stmt = $conn->prepare($sql);
-    $stmt->bind_param($types, ...$args);
+  if (table_exists($conn, 'schedules')) {
+    // Minimal check: assume subj_id & prof_id columns exist in schedules
+    $stmt = $conn->prepare("SELECT DISTINCT subj_id FROM schedules WHERE prof_id = ?");
+    $stmt->bind_param("i", $prof_id);
     $stmt->execute();
     $res = $stmt->get_result();
     while ($row = $res->fetch_assoc()) {
@@ -119,7 +80,6 @@ function get_locked_assigned_subj_ids(
     }
     $stmt->close();
   } elseif (table_exists($conn, 'professor_assigned_subjects')) {
-    // fallback mapping table
     $stmt = $conn->prepare("SELECT DISTINCT subj_id FROM professor_assigned_subjects WHERE prof_id = ?");
     $stmt->bind_param("i", $prof_id);
     $stmt->execute();
@@ -138,10 +98,6 @@ $method = $_SERVER['REQUEST_METHOD'];
 if ($method === 'GET') {
   $prof_id_in = isset($_GET['prof_id']) ? (int)$_GET['prof_id'] : 0;
   $user_id_in = isset($_GET['user_id']) ? (int)$_GET['user_id'] : 0;
-
-  // optional filters to scope "locked" detection
-  $school_year = isset($_GET['school_year']) ? trim((string)$_GET['school_year']) : null;
-  $semester    = isset($_GET['semester'])    ? trim((string)$_GET['semester'])    : null;
 
   $prof_id = resolve_prof_id($conn, $prof_id_in, $user_id_in);
   if ($prof_id <= 0) {
@@ -173,7 +129,7 @@ if ($method === 'GET') {
   $res->close();
 
   // include locked subjects (for UI convenience)
-  $locked_ids = get_locked_assigned_subj_ids($conn, $prof_id, $school_year, $semester);
+  $locked_ids = get_locked_assigned_subj_ids($conn, $prof_id);
 
   echo json_encode([
     "status" => "success",
@@ -191,10 +147,6 @@ if ($method === 'POST') {
 
   $prof_id_in = isset($data['prof_id']) ? (int)$data['prof_id'] : 0;
   $user_id_in = isset($data['user_id']) ? (int)$data['user_id'] : 0;
-
-  // optional scope for lock detection
-  $school_year = isset($data['school_year']) ? trim((string)$data['school_year']) : null;
-  $semester    = isset($data['semester'])    ? trim((string)$data['semester'])    : null;
 
   $prof_id = resolve_prof_id($conn, $prof_id_in, $user_id_in);
   if ($prof_id <= 0) {
@@ -236,7 +188,7 @@ if ($method === 'POST') {
   }
 
   // Fetch locked/assigned subject IDs that must be preserved
-  $locked_ids = get_locked_assigned_subj_ids($conn, $prof_id, $school_year, $semester);
+  $locked_ids = get_locked_assigned_subj_ids($conn, $prof_id);
   $locked_set = [];
   foreach ($locked_ids as $lid) { $locked_set[(int)$lid] = true; }
 
@@ -274,16 +226,13 @@ if ($method === 'POST') {
     if (!isset($wanted[$sid])) {
       $fallbackProf = isset($prevPrefs[$sid]['prof']) ? $prevPrefs[$sid]['prof'] : 'beginner';
       $fallbackWill = isset($prevPrefs[$sid]['will']) ? $prevPrefs[$sid]['will'] : 'willing';
-      // normalize just in case
       if (!in_array($fallbackProf, $allowedProf, true)) $fallbackProf = 'beginner';
       if (!in_array($fallbackWill, $allowedWill, true)) $fallbackWill = 'willing';
       $wanted[$sid] = ['prof' => $fallbackProf, 'will' => $fallbackWill];
-      // also mark as valid even if not in the earlier validation list
       $validSubjIds[$sid] = true;
     }
   }
 
-  // If, after merging, nothing to save, return early
   if (empty($wanted)) {
     http_response_code(400);
     echo json_encode([
@@ -332,7 +281,7 @@ if ($method === 'POST') {
       $wilStr = $info['will'];
       $stmt->bind_param("iiss", $prof_id, $sidInt, $lvlStr, $wilStr);
       $stmt->execute();
-      if ($stmt->affected_rows >= 0) $inserted++; // >=0 because of upsert
+      if ($stmt->affected_rows >= 0) $inserted++; // upsert path can be 0 changes
     }
     $stmt->close();
 
